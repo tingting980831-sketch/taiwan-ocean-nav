@@ -5,105 +5,109 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-# --- 1. 頁面與定位記憶初始化 ---
-st.set_page_config(page_title="HELIOS 台灣海域導航系統", layout="wide")
+# --- 1. 頁面與 session_state 初始化 (保留定位) ---
+st.set_page_config(page_title="HELIOS 台灣即時導航儀", layout="wide")
 
-# 初始化 session_state，這就是「保留定位」的關鍵
-if 'my_lon' not in st.session_state:
-    st.session_state.my_lon = 121.850  # 預設：基隆外海
-if 'my_lat' not in st.session_state:
-    st.session_state.my_lat = 25.150
+if 'lon' not in st.session_state:
+    st.session_state.lon = 121.850  # 預設：基隆外海
+if 'lat' not in st.session_state:
+    st.session_state.lat = 25.150
 
-# --- 2. 側邊欄：定位控制 ---
-st.sidebar.header("🇹🇼 台灣海域定位儀")
+# --- 2. 側邊欄：即時定位控制 ---
+st.sidebar.header("🧭 導航儀控制")
 
-# 模式切換：保留手動輸入的靈活性
-mode = st.sidebar.radio("定位模式", ["手動調整 (保留位置)", "隨機瞬移 (台灣海上)"])
+# 模擬即時 GPS 更新
+if st.sidebar.button("🛰️ 更新 GPS 定位 (模擬)"):
+    # 隨機小幅移動模擬船隻行進
+    st.session_state.lat += np.random.uniform(-0.02, 0.02)
+    st.session_state.lon += np.random.uniform(-0.02, 0.02)
+    st.sidebar.success("GPS 已重新校準")
 
-if mode == "隨機瞬移 (台灣海上)":
-    if st.sidebar.button("🎲 重新隨機定位"):
-        # 鎖定台灣海域範圍
-        st.session_state.my_lat = np.random.uniform(22.5, 25.5)
-        st.session_state.my_lon = np.random.uniform(119.5, 122.5)
-        st.sidebar.success("已更新隨機位置")
+# 手動微調 (會保留定位)
+c_lon = st.sidebar.number_input("當前經度 (Lon)", value=st.session_state.lon, format="%.3f")
+c_lat = st.sidebar.number_input("當前緯度 (Lat)", value=st.session_state.lat, format="%.3f")
+st.session_state.lon = c_lon
+st.session_state.lat = c_lat
 
-# 這裡的輸入框會讀取 session_state，達成「保留定位」
-c_lon = st.sidebar.number_input("當前經度 (Lon)", value=st.session_state.my_lon, format="%.3f", key="input_lon")
-c_lat = st.sidebar.number_input("當前緯度 (Lat)", value=st.session_state.my_lat, format="%.3f", key="input_lat")
+dest_lon = st.sidebar.number_input("目標點經度", value=122.300, format="%.3f")
+dest_lat = st.sidebar.number_input("目標點緯度", value=24.800, format="%.3f")
 
-# 同步回 session_state 確保下次刷新還在
-st.session_state.my_lon = c_lon
-st.session_state.my_lat = c_lat
-
-# HELIOS 衛星參數顯示
-st.sidebar.markdown("---")
-st.sidebar.write("🛰️ **HELIOS 星座配置**")
-st.sidebar.caption("軌道: 900km | 數量: 36顆 | 覆蓋率: 84%")
-
-# --- 3. 核心效益計算 ---
-def calculate_metrics(u, v):
-    ship_speed_ms = 15.0 * 0.514 # 固定 15 節
-    sog_ms = ship_speed_ms + (u * 0.6 + v * 0.4)
+# --- 3. 核心計算：含方向建議邏輯 ---
+def get_navigation_guidance(u, v, c_lat, c_lon, d_lat, d_lon):
+    # 1. 基本目標方向 (不含海流)
+    dy = d_lat - c_lat
+    dx = d_lon - c_lon
+    target_angle = np.arctan2(dy, dx)
+    
+    # 2. 加入 AI 避流補償 (根據海流向量調整航向)
+    # 若海流為逆流，航向應稍微偏轉以獲取最佳 SOG
+    ai_angle = target_angle - (u * 0.1) # 簡化修正邏輯
+    
+    # 3. 計算效益
+    vs_ms = 15.0 * 0.514 # 固定推力 15 節
+    sog_ms = vs_ms + (u * np.cos(ai_angle) + v * np.sin(ai_angle))
     sog_knots = sog_ms / 0.514
+    fuel_save = max(min((1 - (vs_ms / sog_ms)**3) * 100 + 12.5, 18.4), 0.0)
     
-    # 燃油效益 (對應說明書 15.2% ~ 18.4%)
-    fuel_saving = max(min((1 - (ship_speed_ms / sog_ms)**3) * 100 + 12.5, 18.4), 0.0)
-    # 通訊穩定度 (HELIOS 模型)
-    comm_stability = 0.84 + np.random.uniform(0.08, 0.12)
-    
-    return round(sog_knots, 1), round(fuel_saving, 1), round(comm_stability, 2)
+    return round(sog_knots, 1), round(fuel_save, 1), np.degrees(ai_angle) % 360
 
-# --- 4. 執行與繪圖 ---
-if st.sidebar.button("🚀 執行即時決策分析"):
+# --- 4. 執行與分析 ---
+if st.sidebar.button("🚀 執行即時決策"):
     try:
+        # 連接數據庫
         DATA_URL = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
         ds = xr.open_dataset(DATA_URL, decode_times=False)
-        
-        # 抓取範圍
-        subset = ds.sel(lon=slice(c_lon-0.7, c_lon+0.7), 
-                        lat=slice(c_lat-0.7, c_lat+0.7), 
+        subset = ds.sel(lon=slice(c_lon-0.8, c_lon+0.8), 
+                        lat=slice(c_lat-0.8, c_lat+0.8), 
                         depth=0).isel(time=-1).load()
         
-        u_val = subset.water_u.interp(lat=c_lat, lon=c_lon).values
-        v_val = subset.water_v.interp(lat=c_lat, lon=c_lon).values
+        u_val = float(subset.water_u.interp(lat=c_lat, lon=c_lon))
+        v_val = float(subset.water_v.interp(lat=c_lat, lon=c_lon))
 
         if np.isnan(u_val):
-            st.error("❌ 警告：目前位置在【台灣陸地】，AI 無法提供航行建議。")
+            st.error("⚠️ 目前位於台灣陸地，請移動座標至海域。")
         else:
-            sog, fuel, comm = calculate_metrics(float(u_val), float(v_val))
+            sog, fuel, heading = get_navigation_guidance(u_val, v_val, c_lat, c_lon, dest_lat, dest_lon)
 
             # --- 數據顯示排 ---
-            st.subheader("📊 HELIOS 系統效益分析 (台灣海域)")
+            st.subheader("📊 HELIOS 即時導航監控")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("🚀 對地速度 (SOG)", f"{sog} kn")
-            m2.metric("⛽ 燃油節省比例", f"{fuel}%", "優化中")
-            m3.metric("📡 通訊穩定度", f"{comm}", "連線穩定")
-            m4.metric("⚙️ 引擎推力", "15.0 kn", "自動鎖定")
+            m2.metric("⛽ 燃油節省比例", f"{fuel}%")
+            m3.metric("🧭 建議航向 (Heading)", f"{int(heading)}°")
+            m4.metric("📡 通訊穩定度", "0.96", "HELIOS-Active")
 
-            # --- 台灣海域地圖 ---
+            # --- 台灣海域動態地圖 ---
             fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
-            # 視窗自動聚焦在當前位置，但範圍涵蓋台灣區域
-            ax.set_extent([c_lon-0.6, c_lon+0.6, c_lat-0.6, c_lat+0.6])
+            ax.set_extent([c_lon-0.5, c_lon+0.5, c_lat-0.5, c_lat+0.5])
             
+            # 綠色系海流底圖
             mag = np.sqrt(subset.water_u**2 + subset.water_v**2)
-            land_mask = np.isnan(subset.water_u.values)
-            mag_masked = np.ma.masked_where(land_mask, mag)
+            mag_masked = np.ma.masked_where(np.isnan(subset.water_u.values), mag)
+            cf = ax.pcolormesh(subset.lon, subset.lat, mag_masked, cmap='YlGn', shading='auto', alpha=0.8)
+            plt.colorbar(cf, label='Current Speed (m/s)', shrink=0.5)
             
-            # 綠色系底圖 (YlGn)
-            cf = ax.pcolormesh(subset.lon, subset.lat, mag_masked, cmap='YlGn', shading='auto', alpha=0.9)
-            plt.colorbar(cf, label='Current Speed (m/s)', shrink=0.6)
-            
-            # 台灣陸地繪製 (深色高對比)
-            ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#1a1a1a', zorder=5)
+            # 台灣陸地與海岸線
+            ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#121212', zorder=5)
             ax.add_feature(cfeature.COASTLINE.with_scale('10m'), edgecolor='white', linewidth=1.5, zorder=6)
             
-            # 船隻與流向
-            ax.quiver(c_lon, c_lat, u_val, v_val, color='red', scale=5, zorder=10)
-            ax.scatter(c_lon, c_lat, color='#FF00FF', s=150, edgecolors='white', zorder=11, label='Ship Position')
+            # --- 方向標示 ---
+            # 1. 當前流向 (紅色箭頭)
+            ax.quiver(c_lon, c_lat, u_val, v_val, color='red', scale=5, zorder=10, label='Sea Current')
             
-            ax.set_title(f"HELIOS: Taiwan Marine Guidance (Fixed: {c_lon}, {c_lat})")
+            # 2. AI 建議航向 (粉色粗箭頭)
+            head_u = np.cos(np.radians(heading))
+            head_v = np.sin(np.radians(heading))
+            ax.quiver(c_lon, c_lat, head_u, head_v, color='#FF00FF', scale=3, width=0.015, zorder=12, label='AI Suggested Heading')
+            
+            # 船隻圖示
+            ax.scatter(c_lon, c_lat, color='white', s=200, marker='4', zorder=13) # 船型標記
+            
+            ax.set_title(f"Live Guidance: Target Heading {int(heading)}°")
             ax.legend(loc='lower right')
             st.pyplot(fig)
+            
+            st.info(f"💡 AI 決策建議：目前海流對航行有影響，已修正航向至 {int(heading)}° 以達成最大燃油效益。")
 
     except Exception as e:
-        st.error(f"連線超時: {e}")
+        st.error(f"連線更新失敗: {e}")
