@@ -1,102 +1,68 @@
-import streamlit as st
-import xarray as xr
-import numpy as np
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
+# ===============================
+# 正確比例、無白邊的流場繪圖
+# ===============================
 
-# --- 1. 介面與 Session 初始化 ---
-st.set_page_config(page_title="AI 智慧導航", layout="wide")
+# --- 1. 計算經緯度範圍 ---
+lon_min, lon_max = c_lon - 0.5, c_lon + 0.5
+lat_min, lat_max = c_lat - 0.5, c_lat + 0.5
 
-if 'sim_lon' not in st.session_state:
-    st.session_state.sim_lon = 121.850 
-    st.session_state.sim_lat = 25.100
+lon_range = lon_max - lon_min
+lat_range = lat_max - lat_min
 
-# --- 2. 側邊欄：功能按鈕區 ---
-st.sidebar.header("🕹️ 控制中心")
+# --- 2. 依照地理比例計算 figsize ---
+# 在台灣緯度，經度實際距離要乘 cos(lat)
+mean_lat = (lat_min + lat_max) / 2
+aspect_geo = (lon_range * np.cos(np.deg2rad(mean_lat))) / lat_range
 
-# 這裡解決你人在陸地的問題，點擊即定位到台灣海上
-if st.sidebar.button("📍 模擬海上即時定位"):
-    st.session_state.sim_lat = np.random.uniform(22.8, 25.2)
-    st.session_state.sim_lon = np.random.uniform(119.8, 122.2)
+# 固定高度，寬度依比例算（不會白邊）
+fig_height = 7
+fig_width = fig_height * aspect_geo
 
-# 顯示座標 (disabled 代表自動抓取，不讓你手動改)
-c_lon = st.sidebar.number_input("當前經度 (AIS)", value=st.session_state.sim_lon, format="%.3f")
-c_lat = st.sidebar.number_input("當前緯度 (AIS)", value=st.session_state.sim_lat, format="%.3f")
+# --- 3. 建立圖表 ---
+fig, ax = plt.subplots(
+    figsize=(fig_width, fig_height),
+    subplot_kw={'projection': ccrs.PlateCarree()}
+)
 
-st.sidebar.markdown("---")
-# 目標設定
-dest_lon = st.sidebar.number_input("目標經度", value=122.100, format="%.3f")
-dest_lat = st.sidebar.number_input("目標緯度", value=24.800, format="%.3f")
+ax.set_extent([lon_min, lon_max, lat_min, lat_max])
 
-# 模擬引擎回傳，不需要手動拉
-SHIP_POWER = 15.0 
+# --- 4. 流速大小 ---
+mag = np.sqrt(subset.water_u**2 + subset.water_v**2)
+land_mask = np.isnan(subset.water_u.values)
+mag_masked = np.ma.masked_where(land_mask, mag)
 
-# --- 3. 核心計算函數 ---
-def calculate_results(u, v, s_speed):
-    vs_ms = s_speed * 0.514
-    sog_ms = vs_ms + (u * 0.5 + v * 0.5)
-    sog_knots = sog_ms / 0.514
-    # 根據說明書鎖定 15.2% ~ 18.4%
-    fuel_save = max(min((1 - (vs_ms/sog_ms)**3)*100 + 12.0, 18.4), 0.0)
-    return round(sog_knots, 2), round(fuel_save, 1), 0.94
+cf = ax.pcolormesh(
+    subset.lon,
+    subset.lat,
+    mag_masked,
+    cmap='YlGn',
+    shading='auto',
+    alpha=0.9
+)
 
-# --- 4. 主要顯示區 ---
-if st.sidebar.button("🚀 執行導航分析"):
-    try:
-        # 讀取 HYCOM
-        DATA_URL = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
-        ds = xr.open_dataset(DATA_URL, decode_times=False)
-        
-        # 抓取 1:1 的正方形範圍數據
-        subset = ds.sel(lon=slice(c_lon-0.5, c_lon+0.5), 
-                        lat=slice(c_lat-0.5, c_lat+0.5), 
-                        depth=0).isel(time=-1).load()
-        
-        u_val = subset.water_u.interp(lat=c_lat, lon=c_lon).values
-        v_val = subset.water_v.interp(lat=c_lat, lon=c_lon).values
+plt.colorbar(cf, ax=ax, label='Current Speed (m/s)', shrink=0.55)
 
-        # 陸地檢查
-        if np.isnan(u_val):
-            st.error("❌ 目前位置在陸地！請點擊側邊欄『模擬海上即時定位』按鈕。")
-        else:
-            sog, fuel, comm = calculate_results(float(u_val), float(v_val), SHIP_POWER)
+# --- 5. 地形 ---
+ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#1e1e1e', zorder=5)
+ax.add_feature(cfeature.COASTLINE.with_scale('10m'), edgecolor='white', linewidth=1.2, zorder=6)
 
-            # --- 數據儀表板 (你原本的排版) ---
-            st.subheader("📊 HELIOS 導航即時效益")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("🚀 對地速度 (SOG)", f"{sog} kn")
-            col2.metric("⛽ 燃油節省", f"{fuel}%")
-            col3.metric("📡 通訊穩定度", f"{comm}")
-            col4.metric("🧭 建議航向角", f"{round(np.degrees(np.arctan2(v_val, u_val)),1)}°")
+# --- 6. 流向與船舶 ---
+ax.quiver(
+    c_lon, c_lat,
+    u_val, v_val,
+    color='red',
+    scale=5,
+    zorder=10
+)
 
-            # --- 地圖區：1:1 正方形 ---
-            # 這裡設定 figsize=(8, 8) 確保它是正方形
-            fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': ccrs.PlateCarree()})
-            
-            # 設定範圍對稱，維持 1:1
-            ax.set_extent([c_lon-0.4, c_lon+0.4, c_lat-0.4, c_lat+0.4])
-            
-            # 底圖顏色 YlGn
-            mag = np.sqrt(subset.water_u**2 + subset.water_v**2)
-            land_mask = np.isnan(subset.water_u.values)
-            mag_masked = np.ma.masked_where(land_mask, mag)
-            
-            cf = ax.pcolormesh(subset.lon, subset.lat, mag_masked, cmap='YlGn', shading='auto', alpha=0.9)
-            plt.colorbar(cf, label='Current Speed (m/s)', shrink=0.7)
-            
-            # 加入陸地遮罩，避免走到陸地
-            ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#333333', zorder=5)
-            ax.add_feature(cfeature.COASTLINE.with_scale('10m'), edgecolor='white', linewidth=1.5, zorder=6)
-            
-            # 船與向量標記
-            ax.quiver(c_lon, c_lat, u_val, v_val, color='red', scale=5, zorder=10)
-            ax.scatter(c_lon, c_lat, color='#FF00FF', s=200, edgecolors='white', zorder=11, label='Ship')
-            
-            ax.set_title("Navigation Decision Support (Square View)")
-            st.pyplot(fig)
+ax.scatter(
+    c_lon, c_lat,
+    color='#FF00FF',
+    s=120,
+    edgecolors='white',
+    zorder=11
+)
 
-    except Exception as e:
-        st.error(f"連線異常，請重試: {e}")
-else:
-    st.info("請從左側點擊『模擬海上即時定位』以跳過陸地座標，然後按『執行導航分析』。")
+ax.set_title("HELIOS Real-time Ocean Current Field", fontsize=14)
+
+st.pyplot(fig)
