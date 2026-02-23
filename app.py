@@ -97,10 +97,14 @@ if btn_analyze or btn_move:
             c5.metric("📡 衛星延遲", f"{l_ms} ms")
 
             # 地圖繪製
-            fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
-            ax.set_extent([min(c_lon, d_lon)-0.6, max(c_lon, d_lon)+0.6, 
-                           min(c_lat, d_lat)-0.6, max(c_lat, d_lat)+0.6])
-            
+            # --- 在地圖繪製部分進行優化 ---
+fig, ax = plt.subplots(figsize=(10, 10), subplot_kw={'projection': ccrs.PlateCarree()})
+
+# 加入這行強制維持 1:1 比例
+ax.set_aspect('equal', adjustable='datalim') 
+
+ax.set_extent([min(c_lon, d_lon)-0.6, max(c_lon, d_lon)+0.6, 
+               min(c_lat, d_lat)-0.6, max(c_lat, d_lat)+0.6])
             mag = np.sqrt(subset.water_u**2 + subset.water_v**2)
             ax.pcolormesh(subset.lon, subset.lat, mag, cmap='YlGn', alpha=0.8)
             ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#121212')
