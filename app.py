@@ -1,21 +1,22 @@
 # ===============================
-# 正確比例、無白邊的流場繪圖
+# 正確比例、無白邊（A* 航線版）
 # ===============================
 
-# --- 1. 計算經緯度範圍 ---
-lon_min, lon_max = c_lon - 0.5, c_lon + 0.5
-lat_min, lat_max = c_lat - 0.5, c_lat + 0.5
+# --- 1. 以起訖點中心作為顯示中心 ---
+center_lon = (s_lon + e_lon) / 2
+center_lat = (s_lat + e_lat) / 2
+
+lon_min, lon_max = center_lon - 0.5, center_lon + 0.5
+lat_min, lat_max = center_lat - 0.5, center_lat + 0.5
 
 lon_range = lon_max - lon_min
 lat_range = lat_max - lat_min
 
-# --- 2. 依照地理比例計算 figsize ---
-# 在台灣緯度，經度實際距離要乘 cos(lat)
+# --- 2. 計算地理比例（避免胖矮） ---
 mean_lat = (lat_min + lat_max) / 2
 aspect_geo = (lon_range * np.cos(np.deg2rad(mean_lat))) / lat_range
 
-# 固定高度，寬度依比例算（不會白邊）
-fig_height = 7
+fig_height = 8
 fig_width = fig_height * aspect_geo
 
 # --- 3. 建立圖表 ---
@@ -26,43 +27,34 @@ fig, ax = plt.subplots(
 
 ax.set_extent([lon_min, lon_max, lat_min, lat_max])
 
-# --- 4. 流速大小 ---
-mag = np.sqrt(subset.water_u**2 + subset.water_v**2)
+# --- 4. 流場 ---
+speed = np.sqrt(subset.water_u**2 + subset.water_v**2)
 land_mask = np.isnan(subset.water_u.values)
-mag_masked = np.ma.masked_where(land_mask, mag)
+speed_masked = np.ma.masked_where(land_mask, speed)
 
 cf = ax.pcolormesh(
     subset.lon,
     subset.lat,
-    mag_masked,
-    cmap='YlGn',
+    speed_masked,
+    cmap='viridis',
     shading='auto',
-    alpha=0.9
+    alpha=0.8
 )
 
 plt.colorbar(cf, ax=ax, label='Current Speed (m/s)', shrink=0.55)
 
 # --- 5. 地形 ---
-ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#1e1e1e', zorder=5)
+ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#222222', zorder=5)
 ax.add_feature(cfeature.COASTLINE.with_scale('10m'), edgecolor='white', linewidth=1.2, zorder=6)
 
-# --- 6. 流向與船舶 ---
-ax.quiver(
-    c_lon, c_lat,
-    u_val, v_val,
-    color='red',
-    scale=5,
-    zorder=10
-)
+# --- 6. 航線 ---
+ax.plot(path_lon, path_lat, color='magenta', linewidth=3, label='AI Path', zorder=10)
+ax.scatter(s_lon, s_lat, color='yellow', s=100, label='Start', zorder=11)
+ax.scatter(e_lon, e_lat, color='red', marker='*', s=200, label='Goal', zorder=11)
 
-ax.scatter(
-    c_lon, c_lat,
-    color='#FF00FF',
-    s=120,
-    edgecolors='white',
-    zorder=11
-)
+ax.set_title("AI Marine Navigation & Obstacle Avoidance", fontsize=14)
+ax.legend(loc='lower right')
 
-ax.set_title("HELIOS Real-time Ocean Current Field", fontsize=14)
+st.pyplot(fig)fontsize=14)
 
 st.pyplot(fig)
