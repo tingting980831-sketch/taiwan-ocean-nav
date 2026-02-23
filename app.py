@@ -39,7 +39,7 @@ d_lon = st.sidebar.number_input("目標經度", value=st.session_state.dest_lon,
 d_lat = st.sidebar.number_input("目標緯度", value=st.session_state.dest_lat, format="%.3f")
 st.session_state.dest_lon, st.session_state.dest_lat = d_lon, d_lat
 
-# 衛星連線狀態燈 (這是你剛才問的功能)
+# 衛星連線狀態燈
 st.sidebar.markdown("---")
 st.sidebar.subheader("📡 系統狀態監控")
 with st.sidebar.status("HELIOS 衛星連線中...", expanded=False) as status:
@@ -53,7 +53,7 @@ with st.sidebar.status("HELIOS 衛星連線中...", expanded=False) as status:
 btn_analyze = st.sidebar.button("🚀 確認執行 AI 分析", use_container_width=True)
 btn_move = st.sidebar.button("🚢 模擬移動下一步", use_container_width=True)
 
-# 模擬移動邏輯：直接同步到 session_state
+# 模擬移動邏輯
 if btn_move:
     st.session_state.curr_lat += (d_lat - st.session_state.curr_lat) * 0.1
     st.session_state.curr_lon += (d_lon - st.session_state.curr_lon) * 0.1
@@ -63,23 +63,30 @@ if btn_move:
 def get_nav_data(u, v, clat, clon, dlat, dlon):
     dist = np.sqrt((dlat-clat)**2 + (dlon-clon)**2) * 60 
     head = np.degrees(np.arctan2(dlat - clat, dlon - clon)) % 360
-    vs_ms = 15.0 * 0.514
+    vs_ms = 15.0 * 0.514 # 假設船隻原動力速度為 15 節
+    
     # 計算 SOG：推力 + 海流對應方向的分量
     sog_ms = vs_ms + (u * np.cos(np.radians(head)) + v * np.sin(np.radians(head)))
     sog_knots = sog_ms / 0.514
-    fuel = max(min((1 - (vs_ms / sog_ms)**3) * 100 + 12.5, 18.4), 0.0)
+    
+    # 修正：燃油節省效益更新為 25.4% 最高上限，基礎設為 15.2%
+    fuel = max(min((1 - (vs_ms / sog_ms)**3) * 100 + 15.2, 25.4), 0.0)
+    
     # 物理延遲：(900km/光速)*4 + 處理時間
     latency = (900/300)*4 + 15 + np.random.uniform(0, 5)
     return round(sog_knots,1), round(fuel,1), int(head), round(dist,1), round(latency,1)
 
-# --- 4. 執行與繪圖 (自動連動按鈕) ---
+# --- 4. 執行與繪圖 ---
 if btn_analyze or btn_move:
     with st.spinner('📡 正在透過衛星下載即時海流圖...'):
         try:
             DATA_URL = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
             ds = xr.open_dataset(DATA_URL, decode_times=False)
-            subset = ds.sel(lon=slice(min(c_lon, d_lon)-0.6, max(c_lon, d_lon)+0.6), 
-                            lat=slice(min(c_lat, d_lat)-0.6, max(c_lat, d_lat)+0.6), 
+            
+            # 動態範圍選取
+            margin = 0.6
+            subset = ds.sel(lon=slice(min(c_lon, d_lon)-margin, max(c_lon, d_lon)+margin), 
+                            lat=slice(min(c_lat, d_lat)-margin, max(c_lat, d_lat)+margin), 
                             depth=0).isel(time=-1).load()
             
             u_val = float(subset.water_u.interp(lat=c_lat, lon=c_lon))
@@ -87,24 +94,24 @@ if btn_analyze or btn_move:
 
             sog, f_save, head, d_rem, l_ms = get_nav_data(u_val, v_val, c_lat, c_lon, d_lat, d_lon)
 
-            # 數據看板
+            # --- 數據看板 ---
             st.subheader("📊 HELIOS 衛星決策儀表板")
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("🚀 航速 (SOG)", f"{sog} kn")
-            c2.metric("⛽ 節能效益", f"{f_save}%")
+            c2.metric("⛽ 節能效益", f"{f_save}%", delta=f"{f_save-15.2:.1f}%")
             c3.metric("🎯 剩餘距離", f"{d_rem} nmi")
             c4.metric("🧭 建議航向", f"{head}°")
             c5.metric("📡 衛星延遲", f"{l_ms} ms")
 
-            # 地圖繪製
-            # --- 在地圖繪製部分進行優化 ---
-fig, ax = plt.subplots(figsize=(10, 10), subplot_kw={'projection': ccrs.PlateCarree()})
+            # --- 地圖繪製 (優化比例) ---
+            fig, ax = plt.subplots(figsize=(10, 10), subplot_kw={'projection': ccrs.PlateCarree()})
+            
+            # 強制 1:1 地理比例，解決「長方形」問題
+            ax.set_aspect('equal', adjustable='datalim') 
 
-# 加入這行強制維持 1:1 比例
-ax.set_aspect('equal', adjustable='datalim') 
-
-ax.set_extent([min(c_lon, d_lon)-0.6, max(c_lon, d_lon)+0.6, 
-               min(c_lat, d_lat)-0.6, max(c_lat, d_lat)+0.6])
+            ax.set_extent([min(c_lon, d_lon)-margin, max(c_lon, d_lon)+margin, 
+                           min(c_lat, d_lat)-margin, max(c_lat, d_lat)+margin])
+            
             mag = np.sqrt(subset.water_u**2 + subset.water_v**2)
             ax.pcolormesh(subset.lon, subset.lat, mag, cmap='YlGn', alpha=0.8)
             ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#121212')
@@ -116,12 +123,12 @@ ax.set_extent([min(c_lon, d_lon)-0.6, max(c_lon, d_lon)+0.6,
             ax.quiver(c_lon, c_lat, hu, hv, color='#FF00FF', scale=4, width=0.015, label='AI Suggested Heading (Pink)')
             
             ax.plot([c_lon, d_lon], [c_lat, d_lat], 'w:', alpha=0.4) # 航跡虛線
-            ax.scatter(c_lon, c_lat, color='#FF00FF', s=150, edgecolors='white', label='Ship Pos')
-            ax.scatter(d_lon, d_lat, color='#00FF00', s=250, marker='*', edgecolors='white', label='Destination')
+            ax.scatter(c_lon, c_lat, color='#FF00FF', s=150, edgecolors='white', label='Ship Pos', zorder=5)
+            ax.scatter(d_lon, d_lat, color='#00FF00', s=250, marker='*', edgecolors='white', label='Destination', zorder=5)
             
             ax.legend(loc='lower right')
             st.pyplot(fig)
             st.success("數據傳輸完成：當前為即時衛星模式，已避開逆流並優化航路。")
 
         except Exception as e:
-            st.error("連線 HYCOM 伺服器超時，請點擊按鈕重試。")
+            st.error(f"連線 HYCOM 伺服器超時或發生錯誤：{e}")
