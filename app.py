@@ -4,125 +4,117 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-from datetime import datetime
 
-# --- 1. 系統初始化與狀態管理 ---
+# --- 1. 系統初始化 ---
 st.set_page_config(page_title="HELIOS 智慧導航決策系統", layout="wide")
 
-# 初始化 Session State
 if 'ship_lat' not in st.session_state: st.session_state.ship_lat = 23.184
 if 'ship_lon' not in st.session_state: st.session_state.ship_lon = 121.739
-if 'history_path' not in st.session_state: st.session_state.history_path = [] # 儲存走過的紅線
-if 'planned_path' not in st.session_state: st.session_state.planned_path = [] # 儲存預測的虛線
+if 'history_path' not in st.session_state: st.session_state.history_path = [] 
+if 'planned_path' not in st.session_state: st.session_state.planned_path = []
 
-# --- 2. 側邊欄控制台 ---
+# --- 2. 側邊欄控制 ---
 st.sidebar.header("🧭 HELIOS 導航控制中心")
-
-# 起始點選擇
 loc_mode = st.sidebar.radio("起始定位模式", ["立即定位 (GPS 模擬)", "手動輸入座標"])
 
 if loc_mode == "立即定位 (GPS 模擬)":
-    # 模擬一個固定的 GPS 起點
-    start_lat, start_lon = 23.184, 121.739
-    st.sidebar.success(f"📍 GPS 定位成功: {start_lat}, {start_lon}")
+    s_lat, s_lon = 23.184, 121.739
+    st.sidebar.info(f"📍 GPS 定位: {s_lat}, {s_lon}")
 else:
-    start_lat = st.sidebar.number_input("輸入起始緯度", value=23.184, format="%.3f")
-    start_lon = st.sidebar.number_input("輸入起始經度", value=121.739, format="%.3f")
+    s_lat = st.sidebar.number_input("起始緯度", value=23.184)
+    s_lon = st.sidebar.number_input("起始經度", value=121.739)
 
-# 終點設定
-dest_lat = st.sidebar.number_input("目標緯度", value=25.500, format="%.3f")
-dest_lon = st.sidebar.number_input("目標經度", value=121.800, format="%.3f")
+d_lat = st.sidebar.number_input("目標緯度", value=25.500)
+d_lon = st.sidebar.number_input("目標經度", value=121.800)
 
-# --- 3. 路徑規劃與避障演算法 ---
-def plan_full_route(s_lat, s_lon, d_lat, d_lon):
-    """生成完整路徑並避開台灣陸地"""
-    steps = 20
-    lats = np.linspace(s_lat, d_lat, steps)
-    lons = np.linspace(s_lon, d_lon, steps)
+# --- 3. 避障與路徑規劃 ---
+def plan_route(slat, slon, dlat, dlon):
+    steps = 15
+    lats = np.linspace(slat, dlat, steps)
+    lons = np.linspace(slon, dlon, steps)
     path = []
-    for lat, lon in zip(lats, lons):
-        # 避障邏輯：如果是台灣陸地範圍，強制向東繞行到黑潮區
-        if 120.0 < lon < 122.2 and 21.9 < lat < 25.3:
-            lon = 122.6 
-        path.append((lat, lon))
+    for la, lo in zip(lats, lons):
+        if 120.0 < lo < 122.2 and 21.9 < la < 25.3: # 陸地避障
+            lo = 122.6
+        path.append((la, lo))
     return path
 
-# 按下分析按鈕
-if st.sidebar.button("🚀 執行 AI 路徑分析", use_container_width=True):
-    # 重設船隻位置到起點
-    st.session_state.ship_lat = start_lat
-    st.session_state.ship_lon = start_lon
-    # 生成完整預測路徑（虛線）
-    st.session_state.planned_path = plan_full_route(start_lat, start_lon, dest_lat, dest_lon)
-    # 重設歷史路徑（紅線）
-    st.session_state.history_path = [(start_lat, start_lon)]
-    st.sidebar.balloons()
+if st.sidebar.button("🚀 執行 AI 路徑分析"):
+    st.session_state.ship_lat, st.session_state.ship_lon = s_lat, s_lon
+    st.session_state.planned_path = plan_route(s_lat, s_lon, d_lat, d_lon)
+    st.session_state.history_path = [(s_lat, s_lon)]
 
-# --- 4. 核心數據獲取 (HYCOM) ---
+# --- 4. 獲取 HYCOM 海流數據 (包含底圖用的格子資料) ---
 @st.cache_data(ttl=3600)
-def fetch_ocean_data():
-    DATA_URL = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
-    return xr.open_dataset(DATA_URL, decode_times=False)
+def get_hycom_data():
+    url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
+    return xr.open_dataset(url, decode_times=False)
 
 try:
-    ds = fetch_ocean_data()
-    # 抓取當前位置的流場
-    curr_ds = ds.isel(time=-1, depth=0).interp(lat=st.session_state.ship_lat, lon=st.session_state.ship_lon)
-    u_val = float(curr_ds.water_u)
-    v_val = float(curr_ds.water_v)
+    ds = get_hycom_data()
+    # 擷取台灣周邊局部區域數據，提升效能
+    subset = ds.sel(lat=slice(20, 27), lon=slice(118, 126), depth=0).isel(time=-1).load()
     
-    # 儀表板計算
-    sog = 15.0 + (u_val * 1.94) # 節
-    fuel_efficiency = 25.4 if u_val > 0.4 else 12.0
-except:
-    u_val, v_val, sog, fuel_efficiency = 0.1, 0.1, 15.0, 0.0
+    # 計算流速大小 (Speed) 作為底圖格子顏色
+    speed = np.sqrt(subset.water_u**2 + subset.water_v**2)
+    
+    # 船隻當前位置插值
+    curr_data = subset.interp(lat=st.session_state.ship_lat, lon=st.session_state.ship_lon)
+    u_act, v_act = float(curr_data.water_u), float(curr_data.water_v)
+    
+    sog = 15.0 + (u_act * 1.94)
+    fuel_gain = 25.4 if u_act > 0.4 else 12.0
+except Exception as e:
+    st.error(f"數據讀取失敗: {e}")
+    u_act, v_act, sog, fuel_gain = 0, 0, 15, 0
 
-# --- 5. 介面呈現：儀表板 ---
+# --- 5. 儀表板 ---
 st.subheader("📊 HELIOS 即時導航監控儀表板")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("🚀 當前對地航速 (SOG)", f"{sog:.1f} kn")
-c2.metric("⛽ 能源紅利增益", f"{fuel_efficiency}%")
-c3.metric("📍 船隻位置", f"{st.session_state.ship_lon:.2f}E, {st.session_state.ship_lat:.2f}N")
-c4.metric("📡 通訊延遲", "42 ms (LEO)")
+c1.metric("🚀 航速 (SOG)", f"{sog:.1f} kn")
+c2.metric("⛽ 能源紅利", f"{fuel_gain}%")
+c3.metric("📍 當前位置", f"{st.session_state.ship_lon:.2f}E, {st.session_state.ship_lat:.2f}N")
+c4.metric("📡 衛星狀態", "LEO 900km Link")
 
-# --- 6. 地圖繪製 ---
+# --- 6. 繪製海流格子圖與路徑 ---
 fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
-ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#1a1a1a', zorder=1)
-ax.add_feature(cfeature.COASTLINE.with_scale('10m'), edgecolor='white', linewidth=0.8, zorder=2)
-ax.set_extent([118, 125, 20, 27]) # 聚焦台灣海域
 
-# A. 繪製預估路徑 (藍色虛線 - 代表預測未來)
+# A. 繪製海流格子底圖 (Color Mesh)
+mesh = ax.pcolormesh(subset.lon, subset.lat, speed, cmap='Blues', alpha=0.7, shading='auto', zorder=0)
+plt.colorbar(mesh, ax=ax, label='Current Speed (m/s)', fraction=0.03, pad=0.04)
+
+# B. 陸地與海岸線
+ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#333333', zorder=2)
+ax.add_feature(cfeature.COASTLINE.with_scale('10m'), edgecolor='white', zorder=3)
+
+# C. 預測路徑 (藍色虛線)
 if st.session_state.planned_path:
-    p_lats = [p[0] for p in st.session_state.planned_path]
-    p_lons = [p[1] for p in st.session_state.planned_path]
-    ax.plot(p_lons, p_lats, color='cyan', linestyle='--', linewidth=1.5, alpha=0.6, label='Predicted Route (HELIOS AI)')
+    plon = [p[1] for p in st.session_state.planned_path]
+    plat = [p[0] for p in st.session_state.planned_path]
+    ax.plot(plon, plat, color='#00FFFF', linestyle='--', linewidth=1.5, label='Predicted (Future)')
 
-# B. 繪製實際路徑 (紅色實線 - 代表已知真實路徑)
+# D. 實際路徑 (紅色實線)
 if st.session_state.history_path:
-    h_lats = [p[0] for p in st.session_state.history_path]
-    h_lons = [p[1] for p in st.session_state.history_path]
-    ax.plot(h_lons, h_lats, color='red', linestyle='-', linewidth=2.5, label='Actual Verified Path', zorder=4)
+    hlon = [p[1] for p in st.session_state.history_path]
+    hlat = [p[0] for p in st.session_state.history_path]
+    ax.plot(hlon, hlat, color='red', linestyle='-', linewidth=2.5, label='Actual (Verified)', zorder=4)
 
-# C. 繪製當前海流向量 (紅色實線箭頭)
-ax.quiver(st.session_state.ship_lon, st.session_state.ship_lat, u_val, v_val, 
-          color='red', scale=5, width=0.01, label='Real-time Current Vector', zorder=5)
+# E. 船隻當前流場向量 (紅色實線箭頭)
+ax.quiver(st.session_state.ship_lon, st.session_state.ship_lat, u_act, v_act, 
+          color='red', scale=5, width=0.01, zorder=5)
 
-# D. 船隻位置標記
 ax.scatter(st.session_state.ship_lon, st.session_state.ship_lat, color='white', s=80, edgecolors='red', zorder=6)
-ax.scatter(dest_lon, dest_lat, color='yellow', marker='*', s=200, label='Target', zorder=6)
+ax.scatter(d_lon, d_lat, color='yellow', marker='*', s=200, label='Goal', zorder=6)
 
-ax.legend(loc='lower right', facecolor='#333333', labelcolor='white')
+ax.legend(loc='lower right')
 st.pyplot(fig)
 
-# --- 7. 移動模擬控制 ---
-if st.button("🚢 執行下一步移動 (模擬實測推進)"):
-    if st.session_state.planned_path:
-        # 尋找目前在預先規劃路徑中的下一個點
-        # 這裡簡單模擬：把 planned_path 的第一個點移到 history_path
-        if len(st.session_state.planned_path) > 1:
-            next_step = st.session_state.planned_path.pop(0)
-            st.session_state.ship_lat, st.session_state.ship_lon = next_step
-            st.session_state.history_path.append(next_step)
-            st.rerun()
-        else:
-            st.success("🏁 已抵達目標海域，任務完成。")
+# --- 7. 移動控制 ---
+if st.button("🚢 執行下一步移動"):
+    if len(st.session_state.planned_path) > 1:
+        next_pt = st.session_state.planned_path.pop(0)
+        st.session_state.ship_lat, st.session_state.ship_lon = next_pt
+        st.session_state.history_path.append(next_pt)
+        st.rerun()
+    else:
+        st.success("✅ 已抵達目的地")
