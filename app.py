@@ -5,13 +5,12 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-# --- 1. 基礎設定與常數 ---
+# --- 1. 系統初始化 ---
 st.set_page_config(page_title="HELIOS 智慧導航決策系統", layout="wide")
 
 LEO_STABILITY = 0.982 
 FUEL_GAIN_AVG = 25.4  
 
-# 初始化 Session State
 if 'ship_lat' not in st.session_state: st.session_state.ship_lat = 23.184
 if 'ship_lon' not in st.session_state: st.session_state.ship_lon = 121.739
 if 'step_idx' not in st.session_state: st.session_state.step_idx = 0
@@ -32,50 +31,51 @@ else:
 d_lat = st.sidebar.number_input("終點緯度", value=25.500, format="%.3f")
 d_lon = st.sidebar.number_input("終點經度", value=121.800, format="%.3f")
 
-# --- 3. 數據讀取 (極速抽樣版) ---
+# --- 3. 數據讀取 (優化版) ---
 @st.cache_data(ttl=3600)
 def get_fast_ocean_data():
     url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
     try:
         ds = xr.open_dataset(url, decode_times=False)
-        subset = ds.sel(lat=slice(21.0, 26.5), lon=slice(118.5, 124.5), depth=0).isel(time=-1, lat=slice(None, None, 3), lon=slice(None, None, 3)).load()
+        subset = ds.sel(lat=slice(21.0, 26.5), lon=slice(118.5, 124.5), depth=0).isel(time=-1, lat=slice(None, None, 2), lon=slice(None, None, 2)).load()
         return subset
     except: return None
 
-# --- 4. 優化路徑演算法 (平滑且起點相連) ---
-def generate_connected_path(slat, slon, dlat, dlon):
-    steps = 40 
+# --- 4. 平滑路徑演算法 (解決路徑怪怪的問題) ---
+def generate_pro_path(slat, slon, dlat, dlon):
+    steps = 50 
     lats = np.linspace(slat, dlat, steps)
     lons = np.linspace(slon, dlon, steps)
     
     path = []
     for i, (la, lo) in enumerate(zip(lats, lons)):
-        if i > 0 and i < steps - 1:
-            if 21.9 < la < 25.4 and 120.0 < lo < 122.2:
-                lo = 122.6 # 避障偏航
-        path.append((la, lo))
+        # 避障優化：使用漸進式偏航，而非死板跳轉
+        if 21.9 < la < 25.4 and lo < 122.3:
+            # 越靠近島嶼中央，向東偏量越大，形成弧線
+            offset = np.sin(np.pi * (la - 21.9) / (25.4 - 21.9)) * 0.4
+            lo = 122.4 + offset
+        path.append([la, lo])
     
-    smooth_path = []
-    window = 5
-    for i in range(len(path)):
-        start = max(0, i - window // 2)
-        end = min(len(path), i + window // 2 + 1)
-        avg_la = np.mean([p[0] for p in path[start:end]])
-        avg_lo = np.mean([p[1] for p in path[start:end]])
-        if i == 0: smooth_path.append((slat, slon))
-        elif i == len(path)-1: smooth_path.append((dlat, dlon))
-        else: smooth_path.append((avg_la, avg_lo))
-    return smooth_path
+    path = np.array(path)
+    # 使用簡單移動平均平滑經緯度
+    path[:, 0] = np.convolve(path[:, 0], np.ones(5)/5, mode='same')
+    path[:, 1] = np.convolve(path[:, 1], np.ones(5)/5, mode='same')
+    
+    # 強制修正起點與終點，防止脫離
+    path[0] = [slat, slon]
+    path[-1] = [dlat, dlon]
+    
+    return [tuple(p) for p in path]
 
 if st.sidebar.button("🚀 執行 AI 路徑分析", use_container_width=True):
-    st.session_state.real_p = generate_connected_path(s_lat, s_lon, d_lat, d_lon)
-    # 預測路徑僅作為對比，稍微偏移
-    st.session_state.pred_p = [(la, lo - 0.12) for la, lo in st.session_state.real_p]
+    st.session_state.real_p = generate_pro_path(s_lat, s_lon, d_lat, d_lon)
+    # 預測路徑模擬預報誤差
+    st.session_state.pred_p = [(la, lo - 0.08) for la, lo in st.session_state.real_p]
     st.session_state.ship_lat, st.session_state.ship_lon = s_lat, s_lon
     st.session_state.step_idx = 0
     st.rerun()
 
-# --- 5. 數據計算與儀表板渲染 ---
+# --- 5. 數據計算與對調後的儀表板 ---
 subset = get_fast_ocean_data()
 if subset is not None and st.session_state.real_p:
     curr_pt = subset.interp(lat=st.session_state.ship_lat, lon=st.session_state.ship_lon)
@@ -94,20 +94,23 @@ if subset is not None and st.session_state.real_p:
 
     st.subheader("📊 HELIOS 智慧導航決策儀表板")
     c1, c2, c3 = st.columns(3)
-    c1.metric("🚀 航速 (SOG)", f"{sog:.1f} kn")
-    c1.metric("📡 衛星接收", f"穩定 ({LEO_STABILITY*100:.1f}%)")
     
+    # 第一欄
+    c1.metric("🚀 航速 (SOG)", f"{sog:.1f} kn")
+    c1.metric("🧭 建議航向", f"{suggested_head:.0f}°") # 對調到這裡
+    
+    # 第二欄
     c2.metric("⛽ 能源紅利", f"{FUEL_GAIN_AVG}%", "Optimal")
     c2.metric("📏 航行總距離", f"{total_planned_dist:.1f} nmi", f"已航行 {traveled_dist:.1f}")
     
+    # 第三欄
     c3.metric("🎯 剩餘距離", f"{rem_dist:.1f} nmi")
-    c3.metric("🧭 建議航向", f"{suggested_head:.0f}°")
+    c3.metric("🕒 預估總時間", f"{total_est_time:.1f} hrs") # 對調到這裡
     
-    # 額外資訊欄
-    st.info(f"🕒 預估總航程時間: {total_est_time:.2f} 小時")
+    st.caption(f"📡 衛星接收強度: 穩定 ({LEO_STABILITY*100:.1f}%) | LEO-Link Active")
 
     # --- 6. 地圖繪圖區 ---
-    fig, ax = plt.subplots(figsize=(10, 6), subplot_kw={'projection': ccrs.PlateCarree()})
+    fig, ax = plt.subplots(figsize=(11, 7), subplot_kw={'projection': ccrs.PlateCarree()})
     speed_grid = np.sqrt(subset.water_u**2 + subset.water_v**2)
     mesh = ax.pcolormesh(subset.lon, subset.lat, speed_grid, cmap='YlGnBu', alpha=0.4, shading='auto')
     plt.colorbar(mesh, ax=ax, label='Current Speed (m/s)', fraction=0.03, pad=0.04)
@@ -115,31 +118,28 @@ if subset is not None and st.session_state.real_p:
     ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='#1e1e1e', zorder=2)
     ax.add_feature(cfeature.COASTLINE.with_scale('10m'), edgecolor='white', zorder=3)
     
-    # 分段繪製路徑：紅線(已規劃)
+    # 分段路徑：紅實線
     rx, ry = [p[1] for p in st.session_state.real_p], [p[0] for p in st.session_state.real_p]
-    ax.plot(rx, ry, color='red', linewidth=2.5, label='HELIOS Optimized Path', zorder=4)
+    ax.plot(rx, ry, color='red', linewidth=3, label='HELIOS Optimized Path', zorder=4)
     
-    # 預測路徑(虛線)：僅加在紅線之後或者作為環境對應
+    # 虛線：僅顯示剩餘部分的預測
     px, py = [p[1] for p in st.session_state.pred_p], [p[0] for p in st.session_state.pred_p]
-    ax.plot(px[st.session_state.step_idx:], py[st.session_state.step_idx:], color='white', linestyle='--', alpha=0.6, label='Forecast Horizon')
+    ax.plot(px[st.session_state.step_idx:], py[st.session_state.step_idx:], color='white', linestyle='--', alpha=0.5, label='Forecast Horizon')
     
-    # 終點標標 (星型)
-    ax.scatter(d_lon, d_lat, color='gold', marker='*', s=250, edgecolors='black', linewidth=1.5, zorder=6, label='DESTINATION')
+    # 終點圖標
+    ax.scatter(d_lon, d_lat, color='gold', marker='*', s=300, edgecolors='black', zorder=6, label='DESTINATION')
     
-    # 船隻目前位置
-    ax.scatter(st.session_state.ship_lon, st.session_state.ship_lat, color='red', s=120, edgecolors='white', zorder=7)
-    # 海流向量箭頭
-    ax.quiver(st.session_state.ship_lon, st.session_state.ship_lat, u, v, color='red', scale=6, zorder=8)
+    # 船隻與箭頭
+    ax.scatter(st.session_state.ship_lon, st.session_state.ship_lat, color='red', s=150, edgecolors='white', zorder=7)
+    ax.quiver(st.session_state.ship_lon, st.session_state.ship_lat, u, v, color='red', scale=5, width=0.007, zorder=8)
 
     ax.set_extent([119, 124.5, 21.0, 26.5])
-    ax.legend(loc='lower right', fontsize='small')
+    ax.legend(loc='lower right')
     st.pyplot(fig)
 
 # --- 7. 移動模擬 ---
-if st.button("🚢 推進至下一導航點"):
+if st.button("🚢 下一步：更新位置數據"):
     if st.session_state.step_idx < len(st.session_state.real_p) - 1:
         st.session_state.step_idx += 1
         st.session_state.ship_lat, st.session_state.ship_lon = st.session_state.real_p[st.session_state.step_idx]
         st.rerun()
-    else:
-        st.success("🏁 已成功抵達目的地！")
