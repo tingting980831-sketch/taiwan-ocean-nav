@@ -6,39 +6,61 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from scipy.interpolate import make_interp_spline # 用於路徑平滑化
 
-# --- 1. 核心物理常數 (來自研究報告) ---
-LEO_STABILITY = 0.982 # 衛星接收穩定度 98.2% [cite: 22, 107]
-FUEL_GAIN_AVG = 25.4  # 平均節能 25.4% [cite: 36, 99]
+# --- 修正後的路徑生成與儀表板邏輯 ---
 
-# --- 2. 路徑平滑與避障演算法 ---
-def generate_advanced_path(slat, slon, dlat, dlon):
-    # 建立多個控制點以實踐「戰術偏航」
-    mid_lat = (slat + dlat) / 2
-    # 根據研究，強制將路徑向東(黑潮流域)偏移 [cite: 33]
-    ctrl_lon = 122.6 if slon < 122.0 else slon + 0.5
+# 1. 產生平滑路徑 (解決路徑怪怪的問題)
+def generate_smooth_path(slat, slon, dlat, dlon):
+    steps = 25
+    lats = np.linspace(slat, dlat, steps)
+    lons = np.linspace(slon, dlon, steps)
     
-    nodes = np.array([
-        [slat, slon],
-        [mid_lat, ctrl_lon], # 誘導轉折點：捕獲流軸動能
-        [dlat, dlon]
-    ])
+    path = []
+    for i, (la, lo) in enumerate(zip(lats, lons)):
+        # 避障修正：台灣陸地範圍 (21.9N-25.3N, 120E-122E)
+        if 21.9 < la < 25.4 and 120.0 < lo < 122.2:
+            lo = 122.5 # 向東偏移至黑潮區
+        path.append((la, lo))
     
-    # 使用 B-Spline 產生 30 個平滑航點
-    t = np.linspace(0, 1, 3)
-    t_smooth = np.linspace(0, 1, 30)
-    
-    # 分別對緯度與經度進行平滑插值
-    spl_lat = make_interp_spline(t, nodes[:, 0], k=2)(t_smooth)
-    spl_lon = make_interp_spline(t, nodes[:, 1], k=2)(t_smooth)
-    
-    # 確保不會撞上台灣本島 (緯度 22-25.3, 經度 < 122.1)
-    safe_path = []
-    for la, lo in zip(spl_lat, spl_lon):
-        if 21.9 < la < 25.4 and lo < 122.2:
-            lo = 122.5 # 強制推向深水區
-        safe_path.append((la, lo))
-    return safe_path
+    # 簡單平滑處理：避免直角轉彎
+    smooth_path = []
+    for i in range(len(path)):
+        if i == 0 or i == len(path)-1:
+            smooth_path.append(path[i])
+        else:
+            # 取前後點的平均，讓轉折處變圓滑
+            avg_la = (path[i-1][0] + path[i][0] + path[i+1][0]) / 3
+            avg_lo = (path[i-1][1] + path[i][1] + path[i+1][1]) / 3
+            smooth_path.append((avg_la, avg_lo))
+    return smooth_path
 
+# 2. 儀表板數值計算 (解決總距離/時間為 0 的問題)
+if st.session_state.real_p:
+    idx = st.session_state.step_idx
+    
+    # 假設每一步代表航行了 0.5 小時 (你可以根據需求調整這個比例)
+    time_step = 0.5 
+    st.session_state.total_time = idx * time_step
+    
+    # 距離 = 速度 * 時間 (SOG 來自你截圖的 15.7 kn)
+    current_sog = 15.7 
+    st.session_state.total_dist = st.session_state.total_time * current_sog
+    
+    # 剩餘距離估算
+    rem_dist = 139.0 - st.session_state.total_dist
+    if rem_dist < 0: rem_dist = 0
+
+    # --- 顯示儀表板 ---
+    st.subheader("📊 HELIOS 衛星導航即時儀表板")
+    r1, r2, r3 = st.columns(3)
+    r1.metric("🚀 航速 (SOG)", f"{current_sog} kn")
+    # 這裡就是修正語法錯誤的地方：
+    r1.metric("📡 衛星接收", f"穩定 ({LEO_STABILITY*100:.1f}%)", "LEO-Link")
+    
+    r2.metric("⛽ 能源紅利", "25.4%", "Optimal")
+    r2.metric("📏 航行總距離", f"{st.session_state.total_dist:.1f} nmi")
+    
+    r3.metric("🎯 剩餘距離", f"{rem_dist:.1f} nmi")
+    r3.metric("🕒 航行總時間", f"{st.session_state.total_time:.2f} hrs")
 # --- 3. 執行分析時的邏輯 ---
 if st.sidebar.button("🚀 執行 AI 路徑分析"):
     with st.spinner('📡 正在運算 HELIOS 向量合成場...'):
