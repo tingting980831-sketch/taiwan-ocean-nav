@@ -4,9 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-from scipy.special import binom
 
-# --- 1. 系統初始化與狀態 ---
+# --- 1. 系統初始化 ---
 st.set_page_config(page_title="HELIOS 智慧導航決策系統", layout="wide")
 
 if 'ship_lat' not in st.session_state: st.session_state.ship_lat = 23.184
@@ -14,55 +13,62 @@ if 'ship_lon' not in st.session_state: st.session_state.ship_lon = 121.739
 if 'step_idx' not in st.session_state: st.session_state.step_idx = 0
 if 'real_p' not in st.session_state: st.session_state.real_p = []
 
-# --- 2. 側邊欄控制 ---
+# --- 2. 側邊欄 ---
 st.sidebar.header("🧭 HELIOS 導航控制中心")
 s_lat = st.sidebar.number_input("起始緯度", value=23.184, format="%.3f")
 s_lon = st.sidebar.number_input("起始經度", value=121.739, format="%.3f")
 d_lat = st.sidebar.number_input("終點緯度", value=24.000, format="%.3f")
 d_lon = st.sidebar.number_input("終點經度", value=120.000, format="%.3f")
 
-# --- 3. 核心算法：貝茲曲線避障導航 ---
-def bernstein_poly(i, n, t):
-    return binom(n, i) * (t**(n-i)) * (1-t)**i
+# --- 3. 【核心修正】地理避障路徑演算法 ---
+def generate_avoidance_path(slat, slon, dlat, dlon):
+    """
+    偵測起終點是否跨越台灣本島，並強制繞行南端或北端。
+    """
+    # 定義台灣避障轉折點 (Waypoints)
+    WP_SOUTH_CAPE = [21.5, 120.8]  # 鵝鑾鼻外海
+    WP_NORTH_CAPE = [25.6, 122.2]  # 三貂角外海
+    WP_EAST_SIDE  = [23.5, 122.3]  # 黑潮流軸點 (東部)
 
-def generate_bezier_path(points, num=60):
-    n = len(points) - 1
-    t = np.linspace(0, 1, num)
-    curve = np.zeros((num, 2))
-    for i in range(n + 1):
-        curve += np.outer(bernstein_poly(i, n, t), points[n-i])
-    return curve
-
-def generate_safe_helios_path(slat, slon, dlat, dlon):
-    # 台灣陸地緩衝邊界 (120.0E - 122.0E, 21.9N - 25.4N)
-    # 如果路徑會穿過這個區域，則需修正
-    ctrl_pts = [[slat, slon]]
+    route_pts = [[slat, slon]]
     
-    # 避障邏輯：如果跨越東西岸 (經度 121.0 為中心)
-    if (slon > 121.2 and dlon < 120.8) or (slon < 120.8 and dlon > 121.2):
-        # 決定繞南還是繞北 (以 23.5N 為界)
-        if (slat + dlat) / 2 < 23.8:
-            # 繞過南方：加入東側流軸點 + 鵝鑾鼻深海點 (21.5N, 120.8E)
-            ctrl_pts.append([22.5, 122.2]) # 黑潮流軸點
-            ctrl_pts.append([21.4, 121.0]) # 南端安全轉彎點 (避開墾丁近海)
+    # 判斷是否「跨越東西岸」：起點在東邊(>121) 且 終點在西邊(<121) 或反之
+    cross_island = (slon > 121.0 and dlon < 121.0) or (slon < 121.0 and dlon > 121.0)
+    
+    if cross_island:
+        # 如果起點在東部，建議先導向黑潮流軸，再決定繞南還是繞北
+        if slon > 121.0:
+            route_pts.append(WP_EAST_SIDE)
+        
+        # 根據目標緯度決定繞行方向
+        if d_lat < 23.5:
+            # 繞過南端
+            route_pts.append(WP_SOUTH_CAPE)
         else:
-            # 繞過北方：加入三貂角外海點
-            ctrl_pts.append([24.5, 122.3])
-            ctrl_pts.append([25.8, 121.8]) # 北端安全轉彎點
-            
-    ctrl_pts.append([dlat, dlon])
+            # 繞過北端
+            route_pts.append(WP_NORTH_CAPE)
+
+    route_pts.append([dlat, dlon])
     
-    # 使用貝茲曲線產生平滑路徑
-    path_array = generate_bezier_path(np.array(ctrl_pts))
-    return [tuple(p) for p in path_array]
+    # 將導航點轉換為高密度路徑
+    final_path = []
+    for i in range(len(route_pts)-1):
+        p1, p2 = route_pts[i], route_pts[i+1]
+        steps = 40
+        lats = np.linspace(p1[0], p2[0], steps)
+        lons = np.linspace(p1[1], p2[1], steps)
+        for la, lo in zip(lats, lons):
+            final_path.append((la, lo))
+            
+    return final_path
 
 if st.sidebar.button("🚀 執行 AI 安全路徑分析", use_container_width=True):
-    st.session_state.real_p = generate_safe_helios_path(s_lat, s_lon, d_lat, d_lon)
+    st.session_state.real_p = generate_avoidance_path(s_lat, s_lon, d_lat, d_lon)
     st.session_state.ship_lat, st.session_state.ship_lon = s_lat, s_lon
     st.session_state.step_idx = 0
     st.rerun()
 
-# --- 4. 數據與衛星狀態顯示 ---
+# --- 4. 數據獲取與衛星狀態 ---
 st.markdown("🛰️ **衛星接收強度：穩定 (98.2%)** | HELIOS 動態鏈結 (LEO-Link)")
 
 @st.cache_data(ttl=3600)
@@ -77,7 +83,7 @@ data = get_ocean_data()
 
 # --- 5. 儀表板區域 ---
 if st.session_state.real_p:
-    u, v = 0.5, 0.3
+    u, v = 0.5, 0.4
     if data is not None:
         try:
             curr = data.interp(lat=st.session_state.ship_lat, lon=st.session_state.ship_lon)
@@ -86,21 +92,21 @@ if st.session_state.real_p:
     
     sog = 15.0 + (u * 1.94)
     head = (np.degrees(np.arctan2(v, u)) + 360) % 360
-    dist_total = len(st.session_state.real_p) * 1.1 # 估算航程
+    dist_total = len(st.session_state.real_p) * 1.2
     
     c1, c2, c3 = st.columns(3)
     c1.metric("🚀 航速 (SOG)", f"{sog:.1f} kn")
-    c1.metric("🧭 建議航向", f"{head:.0f}°") # 左下
+    c1.metric("🧭 建議航向", f"{head:.0f}°")
     
     c2.metric("⛽ 能源紅利", "25.4%", "Optimal")
     c2.metric("📏 航行總距離", f"{dist_total:.1f} nmi")
     
-    c3.metric("🎯 剩餘距離", f"{max(0.0, dist_total * (1 - st.session_state.step_idx/60)):.1f} nmi")
-    c3.metric("🕒 預估總時間", f"{dist_total/sog:.2f} hrs") # 右下
+    c3.metric("🎯 剩餘距離", f"{max(0.0, dist_total * (1 - st.session_state.step_idx/len(st.session_state.real_p))):.1f} nmi")
+    c3.metric("🕒 預估總時間", f"{dist_total/sog:.2f} hrs")
 
     # --- 6. 地圖繪圖 ---
     fig, ax = plt.subplots(figsize=(12, 7), subplot_kw={'projection': ccrs.PlateCarree()})
-    ax.add_feature(cfeature.LAND, facecolor='#121212', zorder=2) # 黑色陸地
+    ax.add_feature(cfeature.LAND, facecolor='#151515', zorder=2) # 黑色陸地
     ax.add_feature(cfeature.COASTLINE, edgecolor='white', zorder=3)
     
     if data is not None:
@@ -110,16 +116,18 @@ if st.session_state.real_p:
     px = [p[1] for p in st.session_state.real_p]
     py = [p[0] for p in st.session_state.real_p]
     
-    ax.plot(px, py, color='white', linestyle='--', alpha=0.6, zorder=4) # 規劃虛線
-    ax.plot(px[:st.session_state.step_idx+1], py[:st.session_state.step_idx+1], color='red', linewidth=3, zorder=5) # 實際紅線
+    # 規劃路徑 (虛線)
+    ax.plot(px, py, color='white', linestyle='--', alpha=0.6, zorder=4)
+    # 實際路徑 (紅線)
+    ax.plot(px[:st.session_state.step_idx+1], py[:st.session_state.step_idx+1], color='red', linewidth=3, zorder=5)
     
-    ax.scatter(st.session_state.ship_lon, st.session_state.ship_lat, color='red', s=120, edgecolors='white', zorder=6)
-    ax.scatter(px[-1], py[-1], color='gold', marker='*', s=300, edgecolors='black', zorder=7)
+    ax.scatter(st.session_state.ship_lon, st.session_state.ship_lat, color='red', s=100, zorder=6)
+    ax.scatter(px[-1], py[-1], color='gold', marker='*', s=250, zorder=6)
     
     ax.set_extent([118.5, 124.5, 21.0, 26.5])
     st.pyplot(fig)
 
-if st.button("🚢 更新航行數據 (下一步)"):
+if st.button("🚢 下一步移動"):
     if st.session_state.step_idx < len(st.session_state.real_p) - 1:
         st.session_state.step_idx += 1
         st.session_state.ship_lat, st.session_state.ship_lon = st.session_state.real_p[st.session_state.step_idx]
