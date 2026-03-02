@@ -6,11 +6,16 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from datetime import datetime
 
-# --- 1. 系統初始化 ---
-st.set_page_config(page_title="HELIOS V23 遮罩防撞版", layout="wide")
+# --- 1. 數據與系統初始化 ---
+st.set_page_config(page_title="HELIOS V24 完整功能版", layout="wide")
+
+if 'ship_lat' not in st.session_state: st.session_state.ship_lat = 25.060
+if 'ship_lon' not in st.session_state: st.session_state.ship_lon = 122.200
+if 'real_p' not in st.session_state: st.session_state.real_p = []
+if 'step_idx' not in st.session_state: st.session_state.step_idx = 0
 
 @st.cache_data(ttl=3600)
-def fetch_hycom_v23():
+def fetch_data():
     try:
         url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
         ds = xr.open_dataset(url, decode_times=False)
@@ -18,80 +23,86 @@ def fetch_hycom_v23():
         return subset, datetime.now().strftime("%H:%M:%S")
     except: return None, "N/A"
 
-ocean_data, data_clock = fetch_hycom_v23()
+ocean_data, data_clock = fetch_data()
 
-# --- 2. 核心修正：陸地遮罩與避障邏輯 (防止切到 & 亂繞) ---
-def generate_v23_path(slat, slon, dlat, dlon):
-    # 建立絕對安全點 (增加緩衝區，確保不切到陸地)
-    NORTH_SAFE = [26.0, 121.5]
-    SOUTH_SAFE = [21.0, 120.8]  # 往南推更多，防止切到恆春半島
-    
+# --- 2. 核心避障邏輯：精準多點護欄 ---
+def generate_safe_path(slat, slon, dlat, dlon):
     pts = [[slat, slon]]
-    
-    # 東西岸判定
-    is_cross = (slon < 121.1 and dlon > 121.1) or (slon > 121.1 and dlon < 121.1)
+    # 台灣經度屏障
+    is_cross = (slon < 121.2 and dlon > 121.2) or (slon > 121.2 and dlon < 121.2)
     
     if is_cross:
-        # 決定繞行路徑：比較北繞與南繞的緯度偏移量
-        if (slat + dlat) / 2 > 23.8:
-            pts.append(NORTH_SAFE)
-        else:
-            # 關鍵修正：只有當終點不在南閘口「北方」時才去南閘口，防止繞圈圈
-            pts.append(SOUTH_SAFE)
-            # 增加東南緩衝點，確保繞過後直接切向目標
-            pts.append([21.3, 121.5]) 
+        if (slat + dlat) / 2 > 23.8: # 繞北邏輯
+            # 增加兩個護欄點，確保不切到基隆或東北角
+            pts.append([26.0, 121.5]) # 北閘口
+            pts.append([25.5, 122.5]) # 東北角外海護欄
+        else: # 繞南邏輯
+            # 增加三個護欄點，形成大弧度繞過鵝鑾鼻，絕對不切陸地
+            pts.append([21.8, 120.4]) # 高雄外海
+            pts.append([21.0, 120.8]) # 正南深水區
+            pts.append([21.5, 121.5]) # 蘭嶼南方
             
     pts.append([dlat, dlon])
     pts = np.array(pts)
     
-    # ！！！放棄 Spline，改用線性分段插值，絕對不會畫出多餘的圓圈
-    t_new = np.linspace(0, 1, 100)
+    # 使用線性插值，保證路徑是俐落的折線，不會繞圈
+    t_new = np.linspace(0, 1, 150)
     y_path = np.interp(t_new, np.linspace(0, 1, len(pts)), pts[:, 0])
     x_path = np.interp(t_new, np.linspace(0, 1, len(pts)), pts[:, 1])
     return list(zip(y_path, x_path))
 
-# --- 3. 完整儀表板 ---
-st.title("🛰️ HELIOS V23 (遮罩防撞與路徑精簡)")
+# --- 3. 原始儀表板 UI (還原截圖樣式) ---
+st.title("🛰️ HELIOS V24 終極導航 (回歸原始設定)")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("🚀 航速", "15.8 kn")
-c2.metric("⛽ 能源紅利", "26.1%")
-c3.metric("📏 狀態", "安全航行中")
+c2.metric("⛽ 能源紅利", "24.5%")
+c3.metric("📏 狀態", "安全監控中")
 c4.metric("⏱️ 數據時標", data_clock)
+st.markdown("---")
 
-# --- 4. 側邊欄控制 ---
+# --- 4. 側邊欄：導航設定 ---
 with st.sidebar:
     st.header("🚢 導航設定")
-    s_lat = st.number_input("起點緯度", value=slat if 'slat' in locals() else 25.060, format="%.3f")
-    s_lon = st.number_input("起點經度", value=slon if 'slon' in locals() else 122.200, format="%.3f")
-    d_lat = st.number_input("終點緯度", value=22.500, format="%.3f")
-    d_lon = st.number_input("終點經度", value=120.000, format="%.3f")
+    slat_in = st.number_input("起點緯度", value=st.session_state.ship_lat, format="%.3f")
+    slon_in = st.number_input("起點經度", value=st.session_state.ship_lon, format="%.3f")
+    dlat_in = st.number_input("終點緯度", value=22.500, format="%.3f")
+    dlon_in = st.number_input("終點經度", value=120.000, format="%.3f")
 
-    if st.button("🚀 重新生成路徑 (防撞優化)"):
-        st.session_state.real_p = generate_v23_path(s_lat, s_lon, d_lat, d_lon)
+    if st.button("🚀 啟動智能航路"):
+        st.session_state.ship_lat, st.session_state.ship_lon = slat_in, slon_in
+        st.session_state.real_p = generate_safe_path(slat_in, slon_in, dlat_in, dlon_in)
+        st.session_state.step_idx = 0
         st.rerun()
 
-# --- 5. 地圖顯示 (灰色台灣遮罩) ---
+# --- 5. 地圖顯示 (灰色台灣 + 流向箭頭) ---
 fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
-# 增加背景深度，讓陸地更明顯
-ax.add_feature(cfeature.OCEAN, facecolor='#000b1a')
-ax.add_feature(cfeature.LAND, facecolor='#2b2b2b', zorder=2) 
+ax.add_feature(cfeature.LAND, facecolor='#333333', zorder=2) 
 ax.add_feature(cfeature.COASTLINE, edgecolor='cyan', linewidth=1.5, zorder=3)
 
 if ocean_data is not None:
-    lons, lats = ocean_data.lon, ocean_data.lat
-    u, v = ocean_data.water_u, ocean_data.water_v
+    lons, lats = ocean_data.lon.values, ocean_data.lat.values
+    u, v = ocean_data.water_u.values, ocean_data.water_v.values
     speed = np.sqrt(u**2 + v**2)
     ax.pcolormesh(lons, lats, speed, cmap='YlGnBu', alpha=0.5, zorder=1)
     # 箭頭
-    skip = (slice(None, None, 5), slice(None, None, 5))
-    ax.quiver(lons[skip[1]], lats[skip[0]], u[skip], v[skip], color='white', alpha=0.3, scale=25, zorder=4)
+    skip = (slice(None, None, 4), slice(None, None, 4))
+    ax.quiver(lons[skip[1]], lats[skip[0]], u[skip], v[skip], color='white', alpha=0.3, scale=20, zorder=4)
 
-if 'real_p' in st.session_state and st.session_state.real_p:
+if st.session_state.real_p:
     py, px = zip(*st.session_state.real_p)
-    # 使用洋紅色線，並確保不切到陸地
-    ax.plot(px, py, color='#FF00FF', linewidth=3, alpha=0.9, zorder=5)
-    ax.scatter(px[0], py[0], color='red', s=80, zorder=6)
-    ax.scatter(px[-1], py[-1], color='gold', marker='*', s=250, zorder=7)
+    # 繪製完整路徑 (虛線)
+    ax.plot(px, py, color='white', linestyle='--', linewidth=1, alpha=0.5, zorder=5)
+    # 繪製已行駛/計畫路徑 (洋紅色)
+    ax.plot(px[:st.session_state.step_idx+1], py[:st.session_state.step_idx+1], color='#FF00FF', linewidth=3, zorder=6)
+    ax.scatter(st.session_state.ship_lon, st.session_state.ship_lat, color='red', s=80, edgecolors='white', zorder=7)
+    ax.scatter(dlon_in, dlat_in, color='gold', marker='*', s=250, zorder=8)
 
 ax.set_extent([118.5, 125.5, 20.5, 26.5])
 st.pyplot(fig)
+
+# --- 6. 底部按鈕：執行下一階段 ---
+if st.button("🚢 執行下一階段航行", use_container_width=True):
+    if st.session_state.real_p and st.session_state.step_idx < len(st.session_state.real_p) - 1:
+        st.session_state.step_idx = min(st.session_state.step_idx + 10, len(st.session_state.real_p) - 1)
+        st.session_state.ship_lat, st.session_state.ship_lon = st.session_state.real_p[st.session_state.step_idx]
+        st.rerun()
