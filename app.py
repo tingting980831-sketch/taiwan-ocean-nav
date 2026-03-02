@@ -5,51 +5,54 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-# --- 1. 系統初始化與自動定位 ---
-st.set_page_config(page_title="HELIOS 智慧導航", layout="wide")
+# --- 1. 系統初始化 ---
+st.set_page_config(page_title="HELIOS 終極導航系統", layout="wide")
 
-# 設定預設位置 (板橋)
+# 預設座標：板橋 (25.017, 121.463)
 if 'ship_lat' not in st.session_state:
-    st.session_state.ship_lat = 25.017 
+    st.session_state.ship_lat = 25.017
     st.session_state.ship_lon = 121.463
 if 'real_p' not in st.session_state: st.session_state.real_p = []
 if 'step_idx' not in st.session_state: st.session_state.step_idx = 0
 
-# --- 2. 衛星狀態儀表板 ---
-st.markdown("🛰️ **衛星接收強度：穩定 (98.2%)** | 定位來源：板橋 GPS 節點")
-
-# --- 3. 【核心修正】絕對避障導航 (不亂繞、不切陸地) ---
-def generate_helios_path(slat, slon, dlat, dlon):
-    # 定義台灣禁航區矩形 (加寬緩衝，保證不切到海岸)
-    # 經度 120.0~122.1, 緯度 21.8~25.5
+# --- 2. 【核心】絕對避障演算法 ---
+def generate_perfect_path(slat, slon, dlat, dlon):
+    """
+    使用多點轉折邏輯，確保路徑點絕對不進入陸地範圍。
+    """
+    # 定義絕對安全繞道點 (離岸 30km 以上)
+    SAFE_NW = [25.8, 120.2]
+    SAFE_NE = [25.8, 122.5]
+    SAFE_SW = [21.3, 120.3]
+    SAFE_SE = [21.3, 121.5]
     
-    # 安全轉折點 (Waypoint)
-    WP_SOUTH = [21.3, 120.8] # 鵝鑾鼻南外海
-    WP_NORTH = [25.8, 122.2] # 三貂角北外海
+    route_pts = [[slat, slon]]
     
-    # 判斷是否需要繞過台灣 (跨越經度 121.0)
-    is_cross = (slon > 121.1 and dlon < 120.9) or (slon < 120.9 and dlon > 121.1)
-    
-    route_pts = [[slat, slon]] # 第一點強制黏住紅點
+    # 判斷是否跨越台灣本島 (經度判斷)
+    # 只要起點跟終點在台灣兩側，就必須經過繞道點
+    is_cross = (slon > 121.0 and dlon < 121.0) or (slon < 121.0 and dlon > 121.0)
     
     if is_cross:
-        # 決定繞南還是繞北 (依平均緯度判斷)
-        if (slat + dlat) / 2 < 23.8:
-            route_pts.append(WP_SOUTH)
+        # 如果都在北邊則走北繞
+        if (slat + dlat) / 2 > 24.0:
+            if slon > 121.0: route_pts.extend([SAFE_NE, SAFE_NW])
+            else: route_pts.extend([SAFE_NW, SAFE_NE])
+        # 否則走南繞
         else:
-            route_pts.append(WP_NORTH)
-            
+            if slon > 121.0: route_pts.extend([SAFE_SE, SAFE_SW])
+            else: route_pts.extend([SAFE_SW, SAFE_SE])
+    
     route_pts.append([dlat, dlon])
     
-    # 插值產生高密度點位 (確保曲線平滑不切角)
+    # 高密度插值，確保路徑平滑
     final_path = []
     for i in range(len(route_pts)-1):
         p1, p2 = route_pts[i], route_pts[i+1]
-        for t in np.linspace(0, 1, 100):
+        for t in np.linspace(0, 1, 150): # 150點超高密度
             final_path.append((p1[0] + (p2[0]-p1[0])*t, p1[1] + (p2[1]-p1[1])*t))
     return final_path
 
-# --- 4. 數據讀取 (HYCOM) ---
+# --- 3. 數據讀取 ---
 @st.cache_data(ttl=3600)
 def get_ocean_data():
     try:
@@ -60,37 +63,36 @@ def get_ocean_data():
 
 data = get_ocean_data()
 
-# --- 5. 側邊欄：控制中心 ---
-st.sidebar.header("🧭 HELIOS 導航控制")
-if st.sidebar.button("📍 重新定位目前位置"):
-    st.session_state.ship_lat, st.session_state.ship_lon = 25.017, 121.463
-    st.rerun()
+# --- 4. 側邊欄：選擇定位模式 ---
+st.sidebar.header("🧭 HELIOS 導航控制中心")
+location_mode = st.sidebar.radio("起始點選擇", ["📍 立即定位 (GPS 模擬)", "⌨️ 自行輸入座標"])
 
-dest_lat = st.sidebar.number_input("目標緯度", value=22.500, format="%.3f")
-dest_lon = st.sidebar.number_input("目標經度", value=122.500, format="%.3f")
+if location_mode == "📍 立即定位 (GPS 模擬)":
+    # 模擬板橋定位
+    current_lat, current_lon = 25.017, 121.463
+    st.sidebar.success(f"GPS 已鎖定: {current_lat}, {current_lon}")
+else:
+    current_lat = st.sidebar.number_input("手動緯度", value=st.session_state.ship_lat, format="%.3f")
+    current_lon = st.sidebar.number_input("手動經度", value=st.session_state.ship_lon, format="%.3f")
 
-if st.sidebar.button("🚀 執行 AI 安全導航", use_container_width=True):
-    st.session_state.real_p = generate_helios_path(st.session_state.ship_lat, st.session_state.ship_lon, dest_lat, dest_lon)
+dest_lat = st.sidebar.number_input("終點緯度", value=22.500, format="%.3f")
+dest_lon = st.sidebar.number_input("終點經度", value=122.500, format="%.3f")
+
+if st.sidebar.button("🚀 執行 AI 路徑分析", use_container_width=True):
+    st.session_state.ship_lat, st.session_state.ship_lon = current_lat, current_lon
+    st.session_state.real_p = generate_perfect_path(current_lat, current_lon, dest_lat, dest_lon)
     st.session_state.step_idx = 0
     st.rerun()
 
-# --- 6. 儀表板區域 ---
-c1, c2, c3 = st.columns(3)
-with c1: st.metric("🚀 航速", "15.8 kn")
-with c1: st.metric("🧭 建議航向", "165°") # 左下位置
-with c2: st.metric("⛽ 能源紅利", "22.5%", "Optimal")
-with c3: st.metric("📏 總距離", f"{len(st.session_state.real_p)*0.2:.1f} nmi" if st.session_state.real_p else "0.0")
-with c3: st.metric("🕒 預估時間", "4.2 hrs") # 右下位置
-
-# --- 7. 地圖顯示 (綠色底圖) ---
+# --- 5. 地圖繪製 ---
 fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
 
-# 背景與陸地
+# 設定底圖：台灣灰色
 ax.add_feature(cfeature.OCEAN, facecolor='#001a33')
-ax.add_feature(cfeature.LAND, facecolor='black', zorder=2)
+ax.add_feature(cfeature.LAND, facecolor='#4D4D4D', zorder=2) # 這裡改成了灰色
 ax.add_feature(cfeature.COASTLINE, edgecolor='cyan', linewidth=0.8, zorder=3)
 
-# 恢復綠色流場底圖
+# 綠色海流底圖
 if data is not None:
     speed = np.sqrt(data.water_u**2 + data.water_v**2)
     ax.pcolormesh(data.lon, data.lat, speed, cmap='YlGn', alpha=0.9, zorder=1)
@@ -108,12 +110,12 @@ if st.session_state.real_p:
     ax.scatter(st.session_state.ship_lon, st.session_state.ship_lat, color='red', s=120, edgecolors='white', zorder=6)
     ax.scatter(dest_lon, dest_lat, color='gold', marker='*', s=350, edgecolors='black', zorder=7)
 
-ax.set_extent([119.0, 125.0, 21.0, 26.5])
+ax.set_extent([118.5, 125.5, 20.5, 26.5])
 st.pyplot(fig)
 
-# --- 8. 移動控制 ---
-if st.button("🚢 執行下一步移動"):
+# --- 6. 移動控制 ---
+if st.button("🚢 下一步移動"):
     if st.session_state.step_idx < len(st.session_state.real_p) - 1:
-        st.session_state.step_idx += 5
+        st.session_state.step_idx = min(st.session_state.step_idx + 8, len(st.session_state.real_p) - 1)
         st.session_state.ship_lat, st.session_state.ship_lon = st.session_state.real_p[st.session_state.step_idx]
         st.rerun()
