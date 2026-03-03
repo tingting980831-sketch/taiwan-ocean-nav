@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import time
 
@@ -33,18 +33,16 @@ def fetch_hycom():
         ds = xr.open_dataset(url, decode_times=False)
         ds = ds.sel(lat=slice(20,27), lon=slice(118,126), depth=0).isel(time=-1).load()
         hycom_time = str(ds.time.values[-1])
-        # 儲存快取
         ds.to_netcdf(CACHE_FILE)
         return ds, hycom_time, "ONLINE"
     except:
-        # fallback 快取
         if os.path.exists(CACHE_FILE):
             try:
                 ds = xr.open_dataset(CACHE_FILE)
                 return ds, "CACHE", datetime.now().strftime("%Y-%m-%d %H:%M")
             except:
                 pass
-        # fallback 模擬流場
+        # 模擬流場備援
         lats = np.linspace(20,27,80)
         lons = np.linspace(118,126,80)
         lon2d, lat2d = np.meshgrid(lons,lats)
@@ -77,7 +75,7 @@ def gps_position():
     )
 
 # ===============================
-# 5. 地球距離
+# 5. 地球距離 & 航向
 # ===============================
 def haversine(p1,p2):
     R=6371
@@ -95,18 +93,17 @@ def calc_bearing(p1,p2):
     return (np.degrees(np.arctan2(y,x))+360)%360
 
 # ===============================
-# 6. 船速模型 (隨流場)
+# 6. 船速模型 (即時流場)
 # ===============================
 BASE_SPEED = 12 # kn
 def dynamic_speed(lat,lon,dx,dy):
-    # 找最近格點
-    lat_idx = np.abs(ocean_data.lat-lat).argmin()
-    lon_idx = np.abs(ocean_data.lon-lon).argmin()
-    u = ocean_data.water_u[lat_idx,lon_idx]
-    v = ocean_data.water_v[lat_idx,lon_idx]
+    lat_idx = np.abs(ocean_data.lat.values - lat).argmin()
+    lon_idx = np.abs(ocean_data.lon.values - lon).argmin()
+    u = ocean_data.water_u.values[lat_idx, lon_idx]
+    v = ocean_data.water_v.values[lat_idx, lon_idx]
     dir_vec = np.array([dx,dy])
     dir_vec /= (np.linalg.norm(dir_vec)+1e-6)
-    speed = BASE_SPEED + 3*(u*dir_vec[1]+v*dir_vec[0]) # 順流加速，逆流減速
+    speed = BASE_SPEED + 3*(u*dir_vec[1]+v*dir_vec[0])
     speed = np.clip(speed,4,20)
     return speed
 
@@ -152,10 +149,9 @@ time_bonus=12+4*np.cos(elapsed/3)
 distance,eta = route_stats()
 
 # ===============================
-# 9. 儀表板
+# 9. 儀表板 (兩行)
 # ===============================
 st.title("🛰️ HELIOS 智慧航行系統")
-
 row1 = st.columns(4)
 row1[0].metric("🚀 航速",f"{BASE_SPEED} kn")
 row1[1].metric("⛽ 省油效益",f"{fuel_bonus:.1f}%")
@@ -170,11 +166,10 @@ row2[0].metric("🧭 建議航向",brg)
 row2[1].metric("📏 預計距離",f"{distance:.1f} km")
 row2[2].metric("🕒 預計時間",f"{eta:.1f} hr")
 row2[3].metric("🌊 流場時間",ocean_time)
-
 st.markdown("---")
 
 # ===============================
-# 10. 側邊欄設定
+# 10. 側邊欄
 # ===============================
 with st.sidebar:
     st.header("🚢 導航控制")
@@ -211,9 +206,10 @@ with st.sidebar:
 fig,ax=plt.subplots(figsize=(10,8),subplot_kw={'projection':ccrs.PlateCarree()})
 ax.add_feature(cfeature.LAND,facecolor="#333333")
 ax.add_feature(cfeature.COASTLINE,color="cyan")
+
 if ocean_data is not None:
-    speed=np.sqrt(ocean_data.water_u**2+ocean_data.water_v**2)
-    ax.pcolormesh(ocean_data.lon,ocean_data.lat,speed,cmap="YlGn",alpha=0.6)
+    speed=np.sqrt(ocean_data.water_u.values**2+ocean_data.water_v.values**2)
+    ax.pcolormesh(ocean_data.lon.values,ocean_data.lat.values,speed,cmap="YlGn",alpha=0.6)
 
 if st.session_state.real_p:
     py,px=zip(*st.session_state.real_p)
@@ -228,7 +224,8 @@ st.pyplot(fig)
 # 12. 航行模擬
 # ===============================
 if st.button("🚢 執行下一階段航行",use_container_width=True):
-    if st.session_state.real_p and st.session_state.step_idx<len(st.session_state.real_p)-1:
-        st.session_state.step_idx+=8
-        st.session_state.ship_lat,st.session_state.ship_lon=st.session_state.real_p[st.session_state.step_idx]
+    if st.session_state.real_p:
+        next_idx = min(st.session_state.step_idx + 8, len(st.session_state.real_p)-1)
+        st.session_state.step_idx = next_idx
+        st.session_state.ship_lat,st.session_state.ship_lon=st.session_state.real_p[next_idx]
         st.experimental_rerun()
