@@ -1,6 +1,7 @@
 streamlit
 xarray
-netcdf4
-cartopy
+numpy
 matplotlib
+cartopy
+pydap
 scipy
