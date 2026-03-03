@@ -199,4 +199,3 @@ if st.button("🚢 執行下一階段航行", use_container_width=True):
         st.session_state.step_idx = min(st.session_state.step_idx + 8, len(st.session_state.real_p)-1)
         st.session_state.ship_lat, st.session_state.ship_lon = st.session_state.real_p[st.session_state.step_idx]
         st.experimental_rerun()
-        
