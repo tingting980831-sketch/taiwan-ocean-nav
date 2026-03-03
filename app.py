@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from datetime import datetime
-import os
 
 # ===============================
 # 1. 初始化
@@ -20,48 +19,71 @@ if 'real_p' not in st.session_state: st.session_state.real_p = []
 if 'step_idx' not in st.session_state: st.session_state.step_idx = 0
 
 # ===============================
-# 2. 數據抓取 (移植 V27 的 OPeNDAP 邏輯)
+# 2. 數據抓取
 # ===============================
 @st.cache_data(ttl=3600)
-def fetch_ocean_data_v36():
+def fetch_ocean_data():
     try:
         url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
-        # 採用 V27 的 decode_times=False 提高成功率
         ds = xr.open_dataset(url, decode_times=False)
         subset = ds.sel(lat=slice(20.0, 27.0), lon=slice(118.0, 126.0), depth=0).isel(time=-1).load()
-        
-        # 準備繪圖數據
         lons = subset.lon.values
         lats = subset.lat.values
         u = subset.water_u.values
         v = subset.water_v.values
-        
-        # 核心修正：實施陸地遮罩 (Land Masking)
         speed = np.sqrt(u**2 + v**2)
-        # 只要是陸地(值為0)或異常大的點，設為 NaN，箭頭就不會出現
         mask = (speed == 0) | (speed > 5) | np.isnan(speed)
         u[mask] = np.nan
         v[mask] = np.nan
-        
         return lons, lats, u, v, datetime.now().strftime("%H:%M:%S"), "ONLINE"
     except:
-        # 備援模擬數據 (模擬 V27 格式但加上陸地過濾)
         lons = np.linspace(118, 126, 80)
         lats = np.linspace(20, 27, 80)
-        u_sim = 0.6 * np.ones((80, 80))
-        v_sim = 0.8 * np.ones((80, 80))
-        # 抹除陸地區域箭頭 (台灣與中國沿岸)
+        u = 0.6 * np.ones((80, 80))
+        v = 0.8 * np.ones((80, 80))
         for i, lat in enumerate(lats):
             for j, lon in enumerate(lons):
                 if (21.8 <= lat <= 25.4 and 120.0 <= lon <= 122.1) or (lat >= 24.3 and lon <= 119.6):
-                    u_sim[i, j] = np.nan
-                    v_sim[i, j] = np.nan
-        return lons, lats, u_sim, v_sim, "N/A", "OFFLINE"
+                    u[i, j] = np.nan
+                    v[i, j] = np.nan
+        return lons, lats, u, v, "N/A", "OFFLINE"
 
-lons, lats, u, v, ocean_time, stream_status = fetch_ocean_data_v36()
+lons, lats, u, v, ocean_time, stream_status = fetch_ocean_data()
 
 # ===============================
-# 3. 原始儀表板
+# 3. 陸地判斷
+# ===============================
+def is_on_land(lat, lon):
+    taiwan = (21.8 <= lat <= 25.4) and (120.0 <= lon <= 122.1)
+    china = (lat >= 24.3 and lon <= 119.6)
+    return taiwan or china
+
+# ===============================
+# 4. 智能海上航路規劃
+# ===============================
+def plan_sea_route(start, end, n_points=60):
+    lats = np.linspace(start[0], end[0], n_points)
+    lons = np.linspace(start[1], end[1], n_points)
+    path = []
+
+    for lat, lon in zip(lats, lons):
+        trial_lat = lat
+        shift = 0
+        max_shift = 2.0
+        # 向南微調
+        while is_on_land(trial_lat, lon) and abs(shift) < max_shift:
+            trial_lat -= 0.05
+            shift += 0.05
+        # 向北微調
+        shift = 0
+        while is_on_land(trial_lat, lon) and abs(shift) < max_shift:
+            trial_lat += 0.05
+            shift += 0.05
+        path.append([trial_lat, lon])
+    return path
+
+# ===============================
+# 5. 儀表板
 # ===============================
 st.title("🛰️ HELIOS 智慧航行系統")
 
@@ -79,7 +101,7 @@ r2[3].metric("🕒 數據時標", ocean_time)
 st.markdown("---")
 
 # ===============================
-# 4. 側邊欄 (座標輸入)
+# 6. 側邊欄控制
 # ===============================
 with st.sidebar:
     st.header("🚢 導航控制中心")
@@ -89,29 +111,31 @@ with st.sidebar:
     elon = st.number_input("終點經度", value=st.session_state.dest_lon, format="%.3f")
 
     if st.button("🚀 啟動智能航路", use_container_width=True):
-        st.session_state.ship_lat, st.session_state.ship_lon = slat, slon
-        st.session_state.dest_lat, st.session_state.dest_lon = elat, elon
-        # 規劃路徑
-        st.session_state.real_p = [[slat, slon], [elat, elon]]
-        st.session_state.step_idx = 0
-        st.rerun()
+        if is_on_land(slat, slon):
+            st.error("❌ 起點在陸地")
+        elif is_on_land(elat, elon):
+            st.error("❌ 終點在陸地")
+        else:
+            st.session_state.ship_lat, st.session_state.ship_lon = slat, slon
+            st.session_state.dest_lat, st.session_state.dest_lon = elat, elon
+            st.session_state.real_p = plan_sea_route([slat, slon], [elat, elon])
+            st.session_state.step_idx = 0
+            st.experimental_rerun()
 
 # ===============================
-# 5. 地圖繪製 (視覺修正)
+# 7. 地圖繪製
 # ===============================
 fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
 ax.add_feature(cfeature.LAND, facecolor='#2b2b2b', zorder=2)
 ax.add_feature(cfeature.COASTLINE, edgecolor='cyan', linewidth=1.2, zorder=3)
 
-# 顯示流速
+# 流速圖
 speed = np.sqrt(u**2 + v**2)
 ax.pcolormesh(lons, lats, speed, cmap='YlGn', alpha=0.7, shading='gouraud', zorder=1)
-
-# 顯示箭頭 (使用過濾後的 u, v，陸地上保證沒箭頭)
 skip = (slice(None, None, 5), slice(None, None, 5))
-ax.quiver(lons[skip[1]], lats[skip[0]], u[skip], v[skip], 
-          color='white', alpha=0.4, scale=30, width=0.002, zorder=4)
+ax.quiver(lons[skip[1]], lats[skip[0]], u[skip], v[skip], color='white', alpha=0.4, scale=30, width=0.002, zorder=4)
 
+# 船路徑
 if st.session_state.real_p:
     py, px = zip(*st.session_state.real_p)
     ax.plot(px, py, color='#FF00FF', linewidth=2.5, zorder=5)
