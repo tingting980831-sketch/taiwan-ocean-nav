@@ -6,6 +6,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from datetime import datetime
 import heapq
+import time  # ✅ 加上這行
 
 st.set_page_config(page_title="HELIOS 智慧航行系統", layout="wide")
 
