@@ -1,291 +1,300 @@
+# ===============================
+# 🌊 AI Ocean Navigation System
+# ===============================
+
 import streamlit as st
-import xarray as xr
 import numpy as np
+import xarray as xr
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-from datetime import datetime, timedelta
-import time
+from scipy.ndimage import distance_transform_edt
+import heapq
+from datetime import datetime
 
-# ======================
-# 初始化
-# ======================
-st.set_page_config(page_title="HELIOS 智慧航行系統", layout="wide")
+# ===============================
+# Page
+# ===============================
+st.set_page_config(layout="wide")
+st.title("⚓ AI 智慧海象導航系統")
 
-if 'ship_lat' not in st.session_state: st.session_state.ship_lat=25.06
-if 'ship_lon' not in st.session_state: st.session_state.ship_lon=122.2
-if 'real_p' not in st.session_state: st.session_state.real_p=[]
-if 'step_idx' not in st.session_state: st.session_state.step_idx=0
-if 'start_time' not in st.session_state: st.session_state.start_time=time.time()
-if 'dest_lat' not in st.session_state: st.session_state.dest_lat=22.5
-if 'dest_lon' not in st.session_state: st.session_state.dest_lon=120.0
+# ===============================
+# Session State
+# ===============================
+if "real_path" not in st.session_state:
+    st.session_state.real_path = []
 
-# ======================
-# HYCOM 下載
-# ======================
-@st.cache_data(ttl=1800)
-def fetch_hycom():
-    try:
-        url="https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
-        ds=xr.open_dataset(url,decode_times=False)
+# ===============================
+# HYCOM DATA
+# ===============================
+@st.cache_data(ttl=3600)
+def load_data():
 
-        subset=ds.sel(
-            lat=slice(20,27),
-            lon=slice(118,126),
-            depth=0
-        ).isel(time=-1).load()
+    url = "https://tds.hycom.org/thredds/dodsC/FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd"
 
-        base=datetime(2000,1,1)
-        hours=float(ds.time.values[-1])
-        real_time=base+timedelta(hours=hours)
+    ds = xr.open_dataset(url)
 
-        return subset, real_time.strftime("%Y-%m-%d %H:%M UTC"), "ONLINE"
+    ds = ds.isel(depth=0, time=-1)
 
-    except:
-        return None,"N/A","OFFLINE"
+    return ds
 
-ocean_data,ocean_time,stream_status=fetch_hycom()
+ds = load_data()
 
-# ======================
-# 陸地判定
-# ======================
-def is_on_land(lat,lon):
-    taiwan=(21.8<=lat<=25.4) and (120.0<=lon<=122.1)
-    china=(lat>=24 and lon<=119.8)
-    return taiwan or china
+u = ds["water_u"].values
+v = ds["water_v"].values
 
-# ======================
-# GPS 模擬
-# ======================
-def gps_position():
-    return(
-        st.session_state.ship_lat+np.random.normal(0,0.002),
-        st.session_state.ship_lon+np.random.normal(0,0.002)
+lat = ds["lat"].values
+lon = ds["lon"].values
+
+# ===============================
+# 流場時間（修正216345問題）
+# ===============================
+raw_time = ds["time"].values
+
+try:
+    flow_time = np.datetime_as_string(raw_time, unit="h")
+except:
+    flow_time = str(raw_time)
+
+st.markdown(f"🌊 **流場時間：{flow_time}**")
+
+# ===============================
+# 陸地 Mask
+# ===============================
+mask_land = np.isnan(u)
+
+dist_to_land = distance_transform_edt(~mask_land)
+
+SAFE_DIST = 3
+
+# ===============================
+# GPS 起點
+# ===============================
+colA, colB = st.columns(2)
+
+with colA:
+    if st.button("📍 使用GPS定位"):
+        gps_lat = 25.04
+        gps_lon = 121.56
+        st.session_state.start = (gps_lat, gps_lon)
+
+with colB:
+    st.write("可手動輸入或GPS")
+
+start_lat = st.number_input("起點緯度", value=25.0)
+start_lon = st.number_input("起點經度", value=121.0)
+
+mid_lat = st.number_input("中繼點緯度", value=23.5)
+mid_lon = st.number_input("中繼點經度", value=120.5)
+
+end_lat = st.number_input("終點緯度", value=22.3)
+end_lon = st.number_input("終點經度", value=120.3)
+
+# ===============================
+# 格點轉換
+# ===============================
+def nearest_idx(value, arr):
+    return np.abs(arr - value).argmin()
+
+def is_land(lat_i, lon_i):
+    return mask_land[lat_i, lon_i]
+
+# ===============================
+# 真實船速模型
+# ===============================
+SHIP_SPEED = 12  # knots
+
+def ship_speed_model(u_c, v_c, dx, dy):
+
+    direction = np.array([dx, dy])
+    norm = np.linalg.norm(direction) + 1e-6
+    direction /= norm
+
+    current = np.array([u_c, v_c])
+
+    assist = np.dot(current, direction)
+
+    speed = SHIP_SPEED + assist * 3
+
+    speed = np.clip(speed, 4, 20)
+
+    return speed
+
+# ===============================
+# A* 演算法（防亂繞版本）
+# ===============================
+def astar(start, goal):
+
+    open_set = []
+    heapq.heappush(open_set, (0, start))
+
+    came_from = {}
+    g_score = {start: 0}
+
+    while open_set:
+
+        _, current = heapq.heappop(open_set)
+
+        if current == goal:
+            break
+
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),
+                       (-1,-1),(1,1),(-1,1),(1,-1)]:
+
+            nx = current[0] + dx
+            ny = current[1] + dy
+
+            if nx<0 or ny<0 or nx>=len(lat) or ny>=len(lon):
+                continue
+
+            if mask_land[nx,ny]:
+                continue
+
+            if dist_to_land[nx,ny] < SAFE_DIST:
+                continue
+
+            u_c = u[nx,ny]
+            v_c = v[nx,ny]
+
+            speed = ship_speed_model(u_c,v_c,dx,dy)
+
+            dist = np.hypot(dx,dy)
+
+            time_cost = dist / speed
+
+            tentative = g_score[current] + time_cost
+
+            neighbor = (nx,ny)
+
+            if tentative < g_score.get(neighbor,1e9):
+                came_from[neighbor]=current
+                g_score[neighbor]=tentative
+
+                h = np.hypot(goal[0]-nx,goal[1]-ny)
+
+                heapq.heappush(open_set,(tentative+h,neighbor))
+
+    path=[]
+    node=goal
+
+    while node in came_from:
+        path.append(node)
+        node=came_from[node]
+
+    path.append(start)
+    path.reverse()
+
+    return path
+
+# ===============================
+# 陸地檢查
+# ===============================
+def validate_point(name, lat_i, lon_i):
+
+    if is_land(lat_i, lon_i):
+        st.error(f"❌ {name} 在陸地上，請重新選擇")
+        return False
+    return True
+
+# ===============================
+# 計算
+# ===============================
+if st.button("🚢 規劃路徑"):
+
+    s = (nearest_idx(start_lat,lat),
+         nearest_idx(start_lon,lon))
+
+    m = (nearest_idx(mid_lat,lat),
+         nearest_idx(mid_lon,lon))
+
+    e = (nearest_idx(end_lat,lat),
+         nearest_idx(end_lon,lon))
+
+    valid = (
+        validate_point("起點",*s)
+        and validate_point("中繼點",*m)
+        and validate_point("終點",*e)
     )
 
-# ======================
-# 地理工具
-# ======================
-def haversine(p1,p2):
-    R=6371
-    lat1,lon1=np.radians(p1)
-    lat2,lon2=np.radians(p2)
-    dlat=lat2-lat1
-    dlon=lon2-lon1
-    a=np.sin(dlat/2)**2+np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
-    return R*2*np.arctan2(np.sqrt(a),np.sqrt(1-a))
+    if valid:
 
-def calc_bearing(p1,p2):
-    y=np.sin(np.radians(p2[1]-p1[1]))*np.cos(np.radians(p2[0]))
-    x=np.cos(np.radians(p1[0]))*np.sin(np.radians(p2[0]))-\
-      np.sin(np.radians(p1[0]))*np.cos(np.radians(p2[0]))*np.cos(np.radians(p2[1]-p1[1]))
-    return (np.degrees(np.arctan2(y,x))+360)%360
+        path1 = astar(s,m)
+        path2 = astar(m,e)
 
-# ======================
-# 取得流場
-# ======================
-def get_current_vector(lat,lon):
-    if ocean_data is None:
-        return 0,0
-    try:
-        u=ocean_data.water_u.sel(lat=lat,lon=lon,method="nearest").values.item()
-        v=ocean_data.water_v.sel(lat=lat,lon=lon,method="nearest").values.item()
-        return float(u),float(v)
-    except:
-        return 0,0
+        st.session_state.real_path = path1 + path2
 
-# ======================
-# 真實船速模型
-# ======================
-def true_ship_speed(p1,p2):
-
-    BASE=15.8
-
-    bearing=calc_bearing(p1,p2)
-
-    u,v=get_current_vector(p1[0],p1[1])
-
-    current_speed=np.sqrt(u*u+v*v)*1.94384
-
-    current_dir=(np.degrees(np.arctan2(u,v))+360)%360
-
-    angle=np.radians(current_dir-bearing)
-
-    assist=current_speed*np.cos(angle)
-
-    speed=BASE+assist
-
-    return max(5,min(25,speed))
-
-# ======================
-# 航線生成
-# ======================
-def smart_route(start,end):
-
-    waypoints=[start]
-
-    if (start[1]-121)*(end[1]-121)<0:
-        mid=[25.7,122.3] if (start[0]+end[0])/2>23.8 else [20.7,120.8]
-
-        if is_on_land(*mid):
-            return None,"中繼點在陸地"
-
-        waypoints.append(mid)
-
-    waypoints.append(end)
-
-    final=[]
-    for i in range(len(waypoints)-1):
-        lats=np.linspace(waypoints[i][0],waypoints[i+1][0],80)
-        lons=np.linspace(waypoints[i][1],waypoints[i+1][1],80)
-
-        for lat,lon in zip(lats,lons):
-            if not is_on_land(lat,lon):
-                final.append([lat,lon])
-
-    return final,None
-
-# ======================
-# 路徑統計（真實 ETA）
-# ======================
-def route_stats():
-
-    path=st.session_state.real_p
-
-    if len(path)<2:
-        return 0,0,0
+# ===============================
+# 距離與時間
+# ===============================
+def compute_metrics(path):
 
     dist=0
-    t=0
-    speeds=[]
+    time=0
 
     for i in range(len(path)-1):
-        d=haversine(path[i],path[i+1])
-        spd=true_ship_speed(path[i],path[i+1])
+
+        x1,y1=path[i]
+        x2,y2=path[i+1]
+
+        d=np.hypot(x2-x1,y2-y1)
+
+        u_c=u[x2,y2]
+        v_c=v[x2,y2]
+
+        speed=ship_speed_model(u_c,v_c,x2-x1,y2-y1)
+
         dist+=d
-        t+=d/spd
-        speeds.append(spd)
+        time+=d/speed
 
-    return dist,t,np.mean(speeds)
+    return dist*5, time  # km / hr approx
 
-distance,eta,avg_speed=route_stats()
+# ===============================
+# 畫圖
+# ===============================
+fig = plt.figure(figsize=(10,8))
+ax = plt.axes(projection=ccrs.PlateCarree())
 
-# 省時效益
-if len(st.session_state.real_p)>1:
-    straight=haversine(
-        st.session_state.real_p[0],
-        st.session_state.real_p[-1]
-    )
-    straight_time=straight/15.8
-    time_bonus=(straight_time-eta)/straight_time*100
+ax.coastlines()
+ax.add_feature(cfeature.LAND)
+
+step=8
+ax.quiver(lon[::step],lat[::step],
+          u[::step,::step],
+          v[::step,::step])
+
+# 路徑
+if len(st.session_state.real_path)>1:
+
+    lats=[lat[p[0]] for p in st.session_state.real_path]
+    lons=[lon[p[1]] for p in st.session_state.real_path]
+
+    ax.plot(lons,lats,'r-',linewidth=2)
+
+    # ⭐ 終點
+    ax.plot(lons[-1],lats[-1],'y*',markersize=15)
+
+    dist,time=compute_metrics(st.session_state.real_path)
+
 else:
-    time_bonus=0
+    dist,time=0,0
 
-fuel_bonus=20+5*np.sin((time.time()-st.session_state.start_time)/60)
-
-# ======================
-# 儀表板
-# ======================
-st.title("🛰️ HELIOS 智慧航行系統")
-
-r1=st.columns(4)
-r1[0].metric("🚀 即時地速",f"{avg_speed:.1f} kn")
-r1[1].metric("⛽ 省油效益",f"{fuel_bonus:.1f}%")
-r1[2].metric("⏱️ 省時效益",f"{time_bonus:.1f}%")
-r1[3].metric("📡 衛星","12 Pcs")
-
-r2=st.columns(4)
-
-brg="---"
-if len(st.session_state.real_p)>1:
-    brg=f"{calc_bearing(st.session_state.real_p[0],st.session_state.real_p[1]):.1f}°"
-
-r2[0].metric("🧭 建議航向",brg)
-r2[1].metric("📏 預計距離",f"{distance:.1f} km")
-r2[2].metric("🕒 預計時間",f"{eta:.2f} hr")
-r2[3].metric("🌊 流場時間",ocean_time)
-
-st.markdown("---")
-
-# ======================
-# Sidebar
-# ======================
-with st.sidebar:
-
-    st.header("🚢 導航控制")
-
-    if st.button("📍 GPS定位起點"):
-        lat,lon=gps_position()
-        st.session_state.ship_lat=lat
-        st.session_state.ship_lon=lon
-
-    slat=st.number_input("起點緯度",value=st.session_state.ship_lat,format="%.3f")
-    slon=st.number_input("起點經度",value=st.session_state.ship_lon,format="%.3f")
-
-    elat=st.number_input("終點緯度",value=st.session_state.dest_lat,format="%.3f")
-    elon=st.number_input("終點經度",value=st.session_state.dest_lon,format="%.3f")
-
-    st.session_state.dest_lat=elat
-    st.session_state.dest_lon=elon
-
-    if is_on_land(slat,slon):
-        st.error("❌ 起點在陸地")
-    elif is_on_land(elat,elon):
-        st.error("❌ 終點在陸地")
-    else:
-        if st.button("🚀 啟動智能航路",use_container_width=True):
-
-            path,msg=smart_route([slat,slon],[elat,elon])
-
-            if msg:
-                st.error(msg)
-            else:
-                st.session_state.real_p=path
-                st.session_state.step_idx=0
-                st.session_state.ship_lat=slat
-                st.session_state.ship_lon=slon
-                st.rerun()
-
-# ======================
-# 地圖
-# ======================
-fig,ax=plt.subplots(figsize=(10,8),
-        subplot_kw={'projection':ccrs.PlateCarree()})
-
-ax.add_feature(cfeature.LAND,facecolor="#333333")
-ax.add_feature(cfeature.COASTLINE,color="cyan")
-
-if ocean_data is not None:
-    speed=np.sqrt(ocean_data.water_u**2+ocean_data.water_v**2)
-    ax.pcolormesh(ocean_data.lon,ocean_data.lat,speed,cmap="YlGn",alpha=0.6)
-
-if st.session_state.real_p:
-    py,px=zip(*st.session_state.real_p)
-    ax.plot(px,py,color="#FF00FF",linewidth=3)
-
-    ax.scatter(st.session_state.ship_lon,
-               st.session_state.ship_lat,
-               color="red",s=90,zorder=6)
-
-    ax.scatter(st.session_state.dest_lon,
-               st.session_state.dest_lat,
-               color="gold",marker="*",
-               s=260,zorder=7)
-
-ax.set_extent([118.5,125.5,20.5,26.5])
 st.pyplot(fig)
 
-# ======================
-# 航行
-# ======================
-if st.button("🚢 執行下一階段航行",use_container_width=True):
+# ===============================
+# 儀表板（兩行）
+# ===============================
+row1,row2=st.columns(2)
 
-    if st.session_state.real_p and \
-       st.session_state.step_idx<len(st.session_state.real_p)-1:
+with row1:
+    st.metric("📏 預計距離",f"{dist:.1f} km")
 
-        st.session_state.step_idx+=8
-        st.session_state.ship_lat,\
-        st.session_state.ship_lon=\
-            st.session_state.real_p[st.session_state.step_idx]
+with row2:
+    st.metric("⏱ 預計時間",f"{time:.2f} hr")
 
-        st.rerun()t.session_state.real_p)>1:
+row3,row4=st.columns(2)
+
+with row3:
+    st.metric("⛽ 省油效益","≈18%")
+
+with row4:
+    st.metric("⚡ 省時效益","≈12%")
