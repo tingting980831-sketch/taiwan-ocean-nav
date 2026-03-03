@@ -6,26 +6,28 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from datetime import datetime
 import time
+from heapq import heappush, heappop
 
 # ===============================
-# 1. 初始化
+# 1. 初始化 session_state
 # ===============================
 st.set_page_config(page_title="HELIOS 智慧航行系統", layout="wide")
 
-# 初始化 session_state
-for key, val in {
-    'ship_lat': 25.060, 'ship_lon': 122.200,
-    'dest_lat': 22.500, 'dest_lon': 120.000,
+default_state = {
+    'ship_lat': 25.06, 'ship_lon': 122.2,
+    'dest_lat': 22.5, 'dest_lon': 120.0,
     'real_p': [], 'step_idx': 0,
-    'start_time': time.time()
-}.items():
+    'start_time': time.time(),
+    'rerun_flag': False
+}
+for key, val in default_state.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
 # ===============================
-# 2. HYCOM 即時流場抓取
+# 2. HYCOM 即時流場
 # ===============================
-@st.cache_data(ttl=900)  # 15分鐘更新
+@st.cache_data(ttl=900)
 def fetch_ocean_data():
     try:
         url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
@@ -35,20 +37,20 @@ def fetch_ocean_data():
         lats = subset.lat.values
         u = subset.water_u.values
         v = subset.water_v.values
-        speed = np.sqrt(u**2+v**2)
+        speed = np.sqrt(u**2 + v**2)
         mask = (speed==0) | (speed>5) | np.isnan(speed)
         u[mask]=np.nan
         v[mask]=np.nan
         return lons, lats, u, v, datetime.now().strftime("%H:%M:%S"), "ONLINE"
     except:
         # 模擬資料
-        lons = np.linspace(118, 126, 80)
-        lats = np.linspace(20, 27, 80)
+        lons = np.linspace(118,126,80)
+        lats = np.linspace(20,27,80)
         u = 0.6*np.ones((80,80))
         v = 0.8*np.ones((80,80))
         for i, lat in enumerate(lats):
             for j, lon in enumerate(lons):
-                if (21.8<=lat<=25.4 and 120.0<=lon<=122.1) or (lat>=24.3 and lon<=119.6):
+                if (21.8<=lat<=25.4 and 120<=lon<=122.1) or (lat>=24.3 and lon<=119.6):
                     u[i,j]=np.nan
                     v[i,j]=np.nan
         return lons, lats, u, v, "N/A", "OFFLINE"
@@ -59,9 +61,7 @@ lons, lats, u, v, ocean_time, stream_status = fetch_ocean_data()
 # 3. 陸地判斷
 # ===============================
 def is_on_land(lat, lon):
-    taiwan = (21.8<=lat<=25.4) and (120.0<=lon<=122.1)
-    china = (lat>=24.3 and lon<=119.6)
-    return taiwan or china
+    return (21.8<=lat<=25.4 and 120<=lon<=122.1) or (lat>=24.3 and lon<=119.6)
 
 # ===============================
 # 4. GPS 模擬
@@ -71,7 +71,7 @@ def gps_position():
            st.session_state.ship_lon + np.random.normal(0,0.002)
 
 # ===============================
-# 5. 地球距離
+# 5. 距離與航向
 # ===============================
 def haversine(p1,p2):
     R = 6371
@@ -86,16 +86,13 @@ def calc_bearing(p1,p2):
     y = np.sin(np.radians(p2[1]-p1[1]))*np.cos(np.radians(p2[0]))
     x = np.cos(np.radians(p1[0]))*np.sin(np.radians(p2[0])) - \
         np.sin(np.radians(p1[0]))*np.cos(np.radians(p2[0]))*np.cos(np.radians(p2[1]-p1[1]))
-    return (np.degrees(np.arctan2(y,x)) + 360)%360
+    return (np.degrees(np.arctan2(y,x))+360)%360
 
 # ===============================
-# 6. 智慧航線（考慮流場）
+# 6. 智慧航線（A* + 流場加權）
 # ===============================
 def smart_route(start, end, lons, lats, u, v):
-    # 簡單格點 A* 演算法
-    from heapq import heappush, heappop
-    lat_grid = lats
-    lon_grid = lons
+    lat_grid, lon_grid = lats, lons
     nlat, nlon = len(lat_grid), len(lon_grid)
 
     def closest_idx(val, arr):
@@ -111,23 +108,18 @@ def smart_route(start, end, lons, lats, u, v):
     while heap:
         cost, current, path = heappop(heap)
         if current == end_idx:
-            # 將格點轉回經緯度
             return [[lat_grid[i], lon_grid[j]] for i,j in path], None
         i,j = current
         if visited[i,j]: continue
-        visited[i,j] = True
-
-        # 鄰近八格
+        visited[i,j]=True
         for di in [-1,0,1]:
             for dj in [-1,0,1]:
-                ni, nj = i+di, j+dj
+                ni,nj = i+di, j+dj
                 if 0<=ni<nlat and 0<=nj<nlon and not visited[ni,nj]:
-                    if np.isnan(u[ni,nj]) or np.isnan(v[ni,nj]):
-                        continue
-                    # 花費=距離-流速加成
-                    dist = haversine([lat_grid[i], lon_grid[j]], [lat_grid[ni], lon_grid[nj]])
-                    flow_bonus = np.sqrt(u[ni,nj]**2 + v[ni,nj]**2)
-                    heappush(heap, (cost + dist/1.0 - flow_bonus, (ni,nj), path+[(ni,nj)]))
+                    if np.isnan(u[ni,nj]) or np.isnan(v[ni,nj]): continue
+                    dist = haversine([lat_grid[i],lon_grid[j]], [lat_grid[ni],lon_grid[nj]])
+                    flow_bonus = np.sqrt(u[ni,nj]**2+v[ni,nj]**2)
+                    heappush(heap, (cost + dist - flow_bonus, (ni,nj), path+[(ni,nj)]))
     return None, "找不到安全航路"
 
 # ===============================
@@ -138,14 +130,14 @@ def route_stats():
         return 0,0,0
     dist = sum(haversine(st.session_state.real_p[i], st.session_state.real_p[i+1])
                for i in range(len(st.session_state.real_p)-1))
-    speed_now = 12 + 3*np.random.rand()  # 即時航速模擬
+    speed_now = 12 + np.random.rand()*3  # 模擬航速
     eta = dist / speed_now
     return dist, eta, speed_now
 
 distance, eta, speed_now = route_stats()
 
 # ===============================
-# 8. 儀表板（兩行）
+# 8. 儀表板
 # ===============================
 st.title("🛰️ HELIOS 智慧航行系統")
 
@@ -184,17 +176,22 @@ with st.sidebar:
         st.session_state.ship_lat, st.session_state.ship_lon = gps_position()
 
     if st.button("🚀 啟動智慧航路", use_container_width=True):
-        path, msg = smart_route([slat, slon],[elat, elon], lons, lats, u, v)
+        st.session_state.rerun_flag = True  # 標記 rerun
+        path, msg = smart_route([slat,slon],[elat,elon], lons,lats,u,v)
         if msg:
             st.error(msg)
-        elif path is not None:
+        else:
             st.session_state.real_p = path
             st.session_state.step_idx = 0
             st.session_state.ship_lat = slat
             st.session_state.ship_lon = slon
             st.session_state.dest_lat = elat
             st.session_state.dest_lon = elon
-            st.experimental_rerun()
+
+# 立即 rerun（安全方式）
+if st.session_state.rerun_flag:
+    st.session_state.rerun_flag = False
+    st.experimental_rerun()
 
 # ===============================
 # 10. 地圖
@@ -203,15 +200,12 @@ fig, ax = plt.subplots(figsize=(10,8), subplot_kw={'projection': ccrs.PlateCarre
 ax.add_feature(cfeature.LAND, facecolor="#2b2b2b", zorder=2)
 ax.add_feature(cfeature.COASTLINE, edgecolor='cyan', linewidth=1.2, zorder=3)
 
-# 流速
-speed = np.sqrt(u**2 + v**2)
+speed = np.sqrt(u**2+v**2)
 ax.pcolormesh(lons, lats, speed, cmap='YlGn', alpha=0.7, shading='gouraud', zorder=1)
 
-# 箭頭
 skip = (slice(None,None,5), slice(None,None,5))
 ax.quiver(lons[skip[1]], lats[skip[0]], u[skip], v[skip], color='white', alpha=0.4, scale=30, width=0.002, zorder=4)
 
-# 航線
 if st.session_state.real_p:
     py, px = zip(*st.session_state.real_p)
     ax.plot(px, py, color='#FF00FF', linewidth=2.5, zorder=5)
