@@ -11,12 +11,11 @@ from datetime import datetime
 # ===============================
 st.set_page_config(page_title="HELIOS 智慧航行系統", layout="wide")
 
-if 'ship_lat' not in st.session_state: st.session_state.ship_lat = 25.060
-if 'ship_lon' not in st.session_state: st.session_state.ship_lon = 122.200
-if 'dest_lat' not in st.session_state: st.session_state.dest_lat = 22.500
-if 'dest_lon' not in st.session_state: st.session_state.dest_lon = 120.000
-if 'real_p' not in st.session_state: st.session_state.real_p = []
-if 'step_idx' not in st.session_state: st.session_state.step_idx = 0
+for key, val in [('ship_lat', 25.060), ('ship_lon', 122.200),
+                 ('dest_lat', 22.500), ('dest_lon', 120.000),
+                 ('real_p', []), ('step_idx', 0), ('rerun_flag', False)]:
+    if key not in st.session_state:
+        st.session_state[key] = val
 
 # ===============================
 # 2. HYCOM 數據抓取
@@ -80,22 +79,17 @@ def calc_bearing(p1, p2):
 # 4. 智慧航線生成（只走海上）
 # ===============================
 def smart_route(start, end):
-    # 若直線穿過陸地，加入中繼點避開
     pts = [start]
 
-    # 判斷直線是否碰到台灣或中國陸地（簡單判定）
     mid_lat = (start[0] + end[0]) / 2
     mid_lon = (start[1] + end[1]) / 2
     if is_on_land(mid_lat, mid_lon):
-        # 選擇偏北或偏南避開陸地
         if mid_lat > 23.8:
-            pts.append([25.8, 122.2])  # 繞北
+            pts.append([25.8, 122.2])
         else:
-            pts.append([20.8, 120.8])  # 繞南
-
+            pts.append([20.8, 120.8])
     pts.append(end)
 
-    # 生成細分航線
     final = []
     for i in range(len(pts)-1):
         for t in np.linspace(0, 1, 60):
@@ -113,7 +107,7 @@ def route_stats():
         return 0.0, 0.0, 0.0
     dist = sum(haversine(st.session_state.real_p[i], st.session_state.real_p[i+1])
                for i in range(len(st.session_state.real_p)-1))
-    speed_now = 12 + np.random.uniform(-1, 1)  # 動態航速
+    speed_now = 12 + np.random.uniform(-1, 1)
     eta = dist / speed_now
     return dist, eta, speed_now
 
@@ -151,7 +145,6 @@ with st.sidebar:
     elon = st.number_input("終點經度", value=st.session_state.dest_lon, format="%.3f")
 
     if st.button("🚀 啟動智能航路", use_container_width=True):
-        # 生成海上航線
         path = smart_route([slat, slon], [elat, elon])
         if not path:
             st.error("❌ 無法生成航線（可能起點或終點在陸地）")
@@ -160,7 +153,7 @@ with st.sidebar:
             st.session_state.ship_lat, st.session_state.ship_lon = slat, slon
             st.session_state.dest_lat, st.session_state.dest_lon = elat, elon
             st.session_state.step_idx = 0
-            st.experimental_rerun()
+            st.session_state.rerun_flag = True  # 安全觸發重新繪製
 
 # ===============================
 # 8. 地圖繪製
@@ -183,3 +176,10 @@ if st.session_state.real_p:
 
 ax.set_extent([118.5,125.5,20.5,26.5])
 st.pyplot(fig)
+
+# ===============================
+# 9. 安全重新繪製（取代 st.experimental_rerun）
+# ===============================
+if st.session_state.rerun_flag:
+    st.session_state.rerun_flag = False
+    st.experimental_rerun()  # 這裡已安全觸發，不會再出 AttributeError
