@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 
 # ===============================
@@ -21,27 +21,32 @@ if 'dest_lat' not in st.session_state: st.session_state.dest_lat = 22.5
 if 'dest_lon' not in st.session_state: st.session_state.dest_lon = 120.0
 
 # ===============================
-# 2. HYCOM
+# 2. HYCOM 取得最新資料
 # ===============================
 @st.cache_data(ttl=1800)
 def fetch_hycom():
     try:
-        url="https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
-        ds=xr.open_dataset(url,decode_times=False)
+        url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
+        ds = xr.open_dataset(url, decode_times=False)
 
-        subset=ds.sel(
+        subset = ds.sel(
             lat=slice(20,27),
             lon=slice(118,126),
             depth=0
         ).isel(time=-1).load()
 
-        # 取得HYCOM時間
-        hycom_time=str(ds.time.values[-1])
+        # === 正確轉換 HYCOM 時間 ===
+        time_units = ds.time.units  # 例如 "hours since 2000-01-01 00:00:00"
+        base_time_str = time_units.split("since")[1].strip()
+        base_time = datetime.strptime(base_time_str, "%Y-%m-%d %H:%M:%S")
 
-        return subset, hycom_time, "ONLINE"
+        latest_hour = float(ds.time.values[-1])
+        hycom_time = base_time + timedelta(hours=latest_hour)
 
-    except:
-        return None,"N/A","OFFLINE"
+        return subset, hycom_time.strftime("%Y-%m-%d %H:%M UTC"), "ONLINE"
+
+    except Exception as e:
+        return None, "N/A", "OFFLINE"
 
 ocean_data, ocean_time, stream_status = fetch_hycom()
 
@@ -54,16 +59,7 @@ def is_on_land(lat,lon):
     return taiwan or china
 
 # ===============================
-# 4. GPS 模擬
-# ===============================
-def gps_position():
-    return (
-        st.session_state.ship_lat + np.random.normal(0,0.002),
-        st.session_state.ship_lon + np.random.normal(0,0.002)
-    )
-
-# ===============================
-# 5. 地球距離
+# 4. 地球距離
 # ===============================
 def haversine(p1,p2):
     R=6371
@@ -81,7 +77,7 @@ def calc_bearing(p1,p2):
     return (np.degrees(np.arctan2(y,x))+360)%360
 
 # ===============================
-# 6. 航線生成
+# 5. 智能航線（禁止穿越陸地）
 # ===============================
 def smart_route(start,end):
 
@@ -89,27 +85,28 @@ def smart_route(start,end):
 
     if (start[1]-121)*(end[1]-121)<0:
         mid=[25.7,122.2] if (start[0]+end[0])/2>23.8 else [20.7,120.8]
-
         if is_on_land(*mid):
             return None,"中繼點落在陸地"
-
         pts.append(mid)
 
     pts.append(end)
 
     final=[]
+
     for i in range(len(pts)-1):
-        for t in np.linspace(0,1,60):
+        for t in np.linspace(0,1,100):
             lat=pts[i][0]+(pts[i+1][0]-pts[i][0])*t
             lon=pts[i][1]+(pts[i+1][1]-pts[i][1])*t
 
-            if not is_on_land(lat,lon):
-                final.append([lat,lon])
+            if is_on_land(lat,lon):
+                return None,"航線會穿越陸地"
+
+            final.append([lat,lon])
 
     return final,None
 
 # ===============================
-# 7. 路徑統計
+# 6. 路徑統計
 # ===============================
 def route_stats():
     if len(st.session_state.real_p)<2:
@@ -124,47 +121,30 @@ def route_stats():
     speed=15.8
     return dist,dist/speed
 
-elapsed=(time.time()-st.session_state.start_time)/60
-fuel_bonus=20+5*np.sin(elapsed/2)
-time_bonus=12+4*np.cos(elapsed/3)
-
 distance,eta=route_stats()
 
 # ===============================
-# 8. 儀表板（兩行）
+# 7. 儀表板
 # ===============================
 st.title("🛰️ HELIOS 智慧航行系統")
 
-r1=st.columns(4)
-r1[0].metric("🚀 航速","15.8 kn")
-r1[1].metric("⛽ 省油效益",f"{fuel_bonus:.1f}%")
-r1[2].metric("⏱️ 省時效益",f"{time_bonus:.1f}%")
-r1[3].metric("📡 衛星","12 Pcs")
+col=st.columns(4)
+col[0].metric("🚀 航速","15.8 kn")
+col[1].metric("📏 預計距離",f"{distance:.1f} km")
+col[2].metric("🕒 預計時間",f"{eta:.1f} hr")
+col[3].metric("🌊 HYCOM時間",ocean_time)
 
-r2=st.columns(4)
-
-brg="---"
-if len(st.session_state.real_p)>1:
-    brg=f"{calc_bearing(st.session_state.real_p[0],st.session_state.real_p[1]):.1f}°"
-
-r2[0].metric("🧭 建議航向",brg)
-r2[1].metric("📏 預計距離",f"{distance:.1f} km")
-r2[2].metric("🕒 預計時間",f"{eta:.1f} hr")
-r2[3].metric("🌊 流場時間",ocean_time)
+st.markdown(f"資料狀態：{stream_status}")
+st.markdown(f"現在UTC時間：{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
 st.markdown("---")
 
 # ===============================
-# 9. Sidebar
+# 8. Sidebar
 # ===============================
 with st.sidebar:
 
     st.header("🚢 導航控制")
-
-    if st.button("📍 GPS定位起點"):
-        lat,lon=gps_position()
-        st.session_state.ship_lat=lat
-        st.session_state.ship_lon=lon
 
     slat=st.number_input("起點緯度",value=st.session_state.ship_lat,format="%.3f")
     slon=st.number_input("起點經度",value=st.session_state.ship_lon,format="%.3f")
@@ -175,26 +155,20 @@ with st.sidebar:
     st.session_state.dest_lat=elat
     st.session_state.dest_lon=elon
 
-    if is_on_land(slat,slon):
-        st.error("❌ 起點在陸地")
-    elif is_on_land(elat,elon):
-        st.error("❌ 終點在陸地")
-    else:
-        if st.button("🚀 啟動智能航路",use_container_width=True):
+    if st.button("🚀 啟動智能航路",use_container_width=True):
 
-            path,msg=smart_route([slat,slon],[elat,elon])
+        path,msg=smart_route([slat,slon],[elat,elon])
 
-            if msg:
-                st.error(msg)
-            else:
-                st.session_state.real_p=path
-                st.session_state.step_idx=0
-                st.session_state.ship_lat=slat
-                st.session_state.ship_lon=slon
-                st.rerun()
+        if msg:
+            st.error(msg)
+        else:
+            st.session_state.real_p=path
+            st.session_state.ship_lat=slat
+            st.session_state.ship_lon=slon
+            st.rerun()
 
 # ===============================
-# 10. 地圖
+# 9. 地圖
 # ===============================
 fig,ax=plt.subplots(figsize=(10,8),
         subplot_kw={'projection':ccrs.PlateCarree()})
@@ -210,12 +184,10 @@ if st.session_state.real_p:
     py,px=zip(*st.session_state.real_p)
     ax.plot(px,py,color="#FF00FF",linewidth=3)
 
-    # 船
     ax.scatter(st.session_state.ship_lon,
                st.session_state.ship_lat,
                color="red",s=90,zorder=6)
 
-    # ⭐ 終點星星（修復）
     ax.scatter(st.session_state.dest_lon,
                st.session_state.dest_lat,
                color="gold",marker="*",
@@ -223,18 +195,3 @@ if st.session_state.real_p:
 
 ax.set_extent([118.5,125.5,20.5,26.5])
 st.pyplot(fig)
-
-# ===============================
-# 11. 航行模擬
-# ===============================
-if st.button("🚢 執行下一階段航行",use_container_width=True):
-
-    if st.session_state.real_p and \
-       st.session_state.step_idx<len(st.session_state.real_p)-1:
-
-        st.session_state.step_idx+=8
-        st.session_state.ship_lat,\
-        st.session_state.ship_lon=\
-            st.session_state.real_p[st.session_state.step_idx]
-
-        st.rerun()
