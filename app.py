@@ -76,18 +76,21 @@ def calc_bearing(p1, p2):
     return (np.degrees(np.arctan2(y, x)) + 360) % 360
 
 # ===============================
-# 4. 智慧航線生成（只走海上）
+# ===============================
+# 4. 智慧航線生成（更嚴格避開陸地）
 # ===============================
 def smart_route(start, end):
+    buffer_deg = 0.1  # 緩衝區：距離陸地 0.1 度內禁止航行
     pts = [start]
 
+    # 預設中點，如果落在陸地，改成靠海的中繼點
     mid_lat = (start[0] + end[0]) / 2
     mid_lon = (start[1] + end[1]) / 2
     if is_on_land(mid_lat, mid_lon):
         if mid_lat > 23.8:
-            pts.append([25.8, 122.2])
+            pts.append([25.8, 122.3])  # 靠海中繼點
         else:
-            pts.append([20.8, 120.8])
+            pts.append([20.8, 120.9])
     pts.append(end)
 
     final = []
@@ -95,10 +98,14 @@ def smart_route(start, end):
         for t in np.linspace(0, 1, 60):
             lat = pts[i][0] + (pts[i+1][0] - pts[i][0]) * t
             lon = pts[i][1] + (pts[i+1][1] - pts[i][1]) * t
-            if not is_on_land(lat, lon):
+            # 嚴格判斷：靠近台灣或中國沿岸緩衝區都禁止
+            if not is_on_land(lat, lon) and \
+               not is_on_land(lat + buffer_deg, lon) and \
+               not is_on_land(lat - buffer_deg, lon) and \
+               not is_on_land(lat, lon + buffer_deg) and \
+               not is_on_land(lat, lon - buffer_deg):
                 final.append([lat, lon])
     return final
-
 # ===============================
 # 5. 航線統計
 # ===============================
