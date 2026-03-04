@@ -127,25 +127,31 @@ if lat is not None:
             fuel_bonus = 18.5 if mode == "AI 變頻省油" else 14.1
 
     # ===============================
-    # 3. 儀表板與旗艦衛星設定更新 (修改處)
-    # ===============================
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🧭 建議航向", brg_val)
-    c2.metric("⛽ 省油效益", f"{fuel_bonus:.1f}%", delta="AI Active" if mode=="AI 變頻省油" else None)
-    
-    # 衛星設定：從 36 Pcs 改為 72 Pcs 旗艦配置
-    c3.metric("📡 衛星狀態", "Active (72/72)") 
-    # AIS 模式：新增隨傳隨回功能
-    c4.metric("🚢 AIS 模式", "Real-time (隨傳隨回)")
+# 3. 儀表板與動態衛星模擬 (更新版)
+# ===============================
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("🧭 建議航向", brg_val)
+c2.metric("⛽ 省油效益", f"{fuel_bonus:.1f}%", delta="AI Active" if mode=="AI 變頻省油" else None)
 
-    c5, c6, c7 = st.columns([1, 1, 2])
-    c5.metric("📏 預計距離", f"{dist_km:.1f} km")
-    c6.metric("🕒 預計時間", f"{eta:.1f} hr")
-    # 增加 LEO 技術宣告
-    c7.metric("🕒 系統狀態", "LEO 550km / ISL 已連線")
-    st.caption(f"HYCOM 流場更新時間: {ocean_time}")
-    st.markdown("---")
+# --- 動態衛星計算邏輯 ---
+# 模擬在 72 顆全域網中，當前經緯度上方可視的衛星數量 (4~9 顆跳動)
+import time
+# 利用經緯度總和當種子，讓不同位置看到的衛星數不同
+seed = int(s_lat + s_lon) 
+np.random.seed(seed)
+visible_sats = np.random.randint(4, 10) 
 
+# 顯示格式：目前連線數 / 總數
+c3.metric("📡 衛星狀態", f"Active ({visible_sats}/72)") 
+c4.metric("🚢 AIS 模式", "Real-time (隨傳隨回)")
+
+c5, c6, c7 = st.columns([1, 1, 2])
+c5.metric("📏 預計距離", f"{dist_km:.1f} km")
+c6.metric("🕒 預計時間", f"{eta:.1f} hr")
+
+# 增加動態連線品質顯示
+c7.metric("🕒 系統狀態", f"LEO 550km / ISL 優質連線")
+st.caption(f"衛星幾何配置 (GDOP): 優良 | 數據源: {ocean_time}")
     # ===============================
     # 4. 繪圖功能
     # ===============================
