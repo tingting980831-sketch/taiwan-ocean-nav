@@ -9,18 +9,18 @@ import xarray as xr
 import pandas as pd
 
 # ===============================
-# 1. 擴大海域 4D 數據抓取 (22N-27N, 115E-125E)
+# 1. 數據抓取 (20N-27N, 117E-125E)
 # ===============================
 @st.cache_data(ttl=3600)
-def get_expanded_4d_v22():
+def get_final_4d_data():
     url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
     try:
         ds = xr.open_dataset(url, decode_times=False)
-        # 依照最新需求：115~125, 22~27
+        # 修正後的範圍：117~125, 20~27
         subset = ds.isel(time=slice(-24, None)).sel(
             depth=0, 
-            lon=slice(115.0, 125.0), 
-            lat=slice(22.0, 27.0)
+            lon=slice(117.0, 125.0), 
+            lat=slice(20.0, 27.0)
         ).load()
         
         u_4d = np.nan_to_num(subset.water_u.values).astype(np.float32)
@@ -30,11 +30,11 @@ def get_expanded_4d_v22():
             dt_raw = xr.decode_cf(subset).time.values
             dt_display = pd.to_datetime(dt_raw[0]).strftime('%Y-%m-%d %H:%M')
         except:
-            dt_display = "24H Forecast (Taipei Time)"
+            dt_display = "Latest 24H Forecast"
             
         return subset.lat.values.astype(np.float32), subset.lon.values.astype(np.float32), u_4d, v_4d, dt_display
     except Exception as e:
-        st.error(f"⚠️ 數據範圍擴大失敗，請檢查網路連線: {e}")
+        st.error(f"⚠️ 數據載入失敗: {e}")
         return None, None, None, None, None
 
 def calc_bearing(p1, p2):
@@ -51,31 +51,31 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * np.asin(np.sqrt(a))
 
 # ===============================
-# 2. 介面設定
+# 2. 系統 UI
 # ===============================
-st.set_page_config(layout="wide", page_title="HELIOS V4 Expanded")
-st.title("🛰️ HELIOS 智慧航行系統 (擴大海域 22N 版)")
+st.set_page_config(layout="wide", page_title="HELIOS V5 Optimized")
+st.title("🛰️ HELIOS 智慧航行系統 (修正海域版)")
 
-lat, lon, u_4d, v_4d, ocean_time = get_expanded_4d_v22()
+lat, lon, u_4d, v_4d, ocean_time = get_final_4d_data()
 
 if lat is not None:
-    # 建立避岸遮罩 (針對擴大範圍調整參數)
+    # 避岸遮罩計算
     LON, LAT = np.meshgrid(lon, lat)
-    land_mask = (((LAT - 23.8) / 1.7) ** 2 + ((LON - 121.0) / 0.85) ** 2) < 1
+    land_mask = (((LAT - 23.7) / 1.75) ** 2 + ((LON - 121.0) / 0.85) ** 2) < 1
     penghu_mask = (((LAT - 23.5) / 0.25) ** 2 + ((LON - 119.6) / 0.25) ** 2) < 1
     full_mask = land_mask | penghu_mask
     
     grid_res = lat[1] - lat[0]
-    safe_margin = int(12 / (111 * grid_res)) # 12km 安全距離
+    safe_margin = int(12 / (111 * grid_res)) 
     forbidden = full_mask | (distance_transform_edt(~full_mask) <= safe_margin)
 
     with st.sidebar:
         st.header("導航參數設定")
-        if st.button("📍 定位至高雄/台南外海", use_container_width=True):
-            st.session_state.start_lat, st.session_state.start_lon = 22.80, 120.00
+        if st.button("📍 定位至巴士海峽北端", use_container_width=True):
+            st.session_state.start_lat, st.session_state.start_lon = 21.50, 120.00
         
-        s_lat = st.number_input("起點緯度 (Lat)", value=st.session_state.get('start_lat', 23.00), min_value=22.0, max_value=27.0, format="%.2f")
-        s_lon = st.number_input("起點經度 (Lon)", value=st.session_state.get('start_lon', 116.00), min_value=115.0, max_value=125.0, format="%.2f")
+        s_lat = st.number_input("起點緯度 (Lat)", value=st.session_state.get('start_lat', 22.00), min_value=20.0, max_value=27.0, format="%.2f")
+        s_lon = st.number_input("起點經度 (Lon)", value=st.session_state.get('start_lon', 118.00), min_value=117.0, max_value=125.0, format="%.2f")
         e_lat = st.number_input("終點緯度 (Lat)", value=25.20, format="%.2f")
         e_lon = st.number_input("終點經度 (Lon)", value=122.00, format="%.2f")
         ship_speed_kn = 15.0
@@ -85,7 +85,7 @@ if lat is not None:
     s_idx, g_idx = get_idx(s_lat, s_lon), get_idx(e_lat, e_lon)
 
     # ===============================
-    # 3. 4D A* 動態規劃邏輯
+    # 3. 4D A* 動態規劃
     # ===============================
     path, dist_km, fuel_bonus, eta, brg_val = None, 0.0, 0.0, 0.0, "---"
     
@@ -105,7 +105,7 @@ if lat is not None:
             for d in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
                 ni, nj = current[0]+d[0], current[1]+d[1]
                 if 0 <= ni < len(lat) and 0 <= nj < len(lon) and not forbidden[ni, nj]:
-                    t_idx = min(int(curr_h), 23) # 每小時流場切換
+                    t_idx = min(int(curr_h), 23)
                     step_dist = haversine(lat[current[0]], lon[current[1]], lat[ni], lon[nj])
                     u_curr, v_curr = u_4d[t_idx, ni, nj], v_4d[t_idx, ni, nj]
                     
@@ -113,7 +113,7 @@ if lat is not None:
                     move_vec = np.array([dx, dy], dtype=np.float32) / (np.hypot(dx, dy) + 1e-6)
                     assist = np.dot(move_vec, [u_curr, v_curr])
                     
-                    cost = step_dist * (1 - 0.7 * assist) # 順流效益優化
+                    cost = step_dist * (1 - 0.7 * assist)
                     tg = g_score[current] + cost
                     
                     if (ni, nj) not in g_score or tg < g_score[(ni, nj)]:
@@ -128,10 +128,10 @@ if lat is not None:
                 dist_km += haversine(lat[path[k][0]], lon[path[k][1]], lat[path[k+1][0]], lon[path[k+1][1]])
             brg_val = f"{calc_bearing((lat[path[0][0]], lon[path[0][1]]), (lat[path[1][0]], lon[path[1][1]])):.1f}°"
             eta = dist_km / (ship_speed_kn * 1.852)
-            fuel_bonus = 13.8
+            fuel_bonus = 14.1
 
     # ===============================
-    # 4. 儀表板
+    # 4. 儀表板排版
     # ===============================
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("🚀 航速", f"{ship_speed_kn} kn")
@@ -146,20 +146,21 @@ if lat is not None:
     st.markdown("---")
 
     # ===============================
-    # 5. 地圖視覺化 (115E-125E, 22N-27N)
+    # 5. 地圖視覺化 (117E-125E, 20N-27N)
     # ===============================
-    fig, ax = plt.subplots(figsize=(12, 7), subplot_kw={'projection': ccrs.PlateCarree()})
-    # 設定顯示範圍，稍微多留邊界避免切到
-    ax.set_extent([114.8, 125.2, 21.8, 27.2]) 
+    fig, ax = plt.subplots(figsize=(11, 8.5), subplot_kw={'projection': ccrs.PlateCarree()})
+    # 設定顯示範圍，稍微多留 0.2 度邊界防止切圖
+    ax.set_extent([116.8, 125.2, 19.8, 27.2]) 
     
     speed_0 = np.sqrt(u_4d[0]**2 + v_4d[0]**2)
     ax.pcolormesh(lon, lat, speed_0, cmap='YlGn', alpha=0.8, zorder=0)
     ax.add_feature(cfeature.LAND, facecolor='#2c2c2c', zorder=2)
     ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1.2, zorder=3)
-    
-    # 優化箭頭密度，適合大範圍顯示
-    ax.quiver(LON[::8, ::8], LAT[::8, ::8], u_4d[0, ::8, ::8], v_4d[0, ::8, ::8], 
-              color='cyan', alpha=0.15, scale=28, zorder=4)
+    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='gray', zorder=3)
+
+    # 箭頭密度設定
+    ax.quiver(LON[::9, ::9], LAT[::9, ::9], u_4d[0, ::9, ::9], v_4d[0, ::9, ::9], 
+              color='cyan', alpha=0.15, scale=25, zorder=4)
 
     if path:
         py, px = [lat[p[0]] for p in path], [lon[p[1]] for p in path]
