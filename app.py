@@ -1,7 +1,3 @@
-# ==========================================
-# AI 海象導航系統 - HYCOM 實時資料整合版
-# ==========================================
-
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,205 +6,199 @@ import cartopy.feature as cfeature
 from scipy.ndimage import distance_transform_edt
 import heapq
 import time
-import xarray as xr  # 處理遠端海洋大數據
+import xarray as xr
 import pandas as pd
 
-# ------------------------------------------
-# Streamlit 基本頁面設定
-# ------------------------------------------
-st.set_page_config(page_title="⚓ AI 海象導航系統", layout="wide")
-st.title("⚓ AI 海象導航系統 (HYCOM Real-time Integration)")
-st.markdown("本系統直接連線至 **HYCOM 官方伺服器 (OPeNDAP)**，獲取當前全球海洋預報資料。")
+# ==========================================
+# 1. Streamlit 頁面配置
+# ==========================================
+st.set_page_config(page_title="⚓ AI Maritime Navigator", layout="wide")
+st.title("⚓ AI Maritime Navigation System")
+st.markdown("### Real-time HYCOM Data & A* Route Optimization")
 
-# ------------------------------------------
-# 核心功能：連線 HYCOM 官方伺服器
-# ------------------------------------------
-@st.cache_data(ttl=3600)  # 資料快取 1 小時，避免重複抓取造成網路卡頓
+# ==========================================
+# 2. 核心數據功能：連線 HYCOM 伺服器
+# ==========================================
+@st.cache_data(ttl=3600)
 def get_hycom_realtime_data():
-    # HYCOM 官方最新實驗數據網址 (expt_93.0 為目前活躍版本)
-    # uv3z 代表包含 U/V 向量與 3D 深度資料的檔案路徑
+    # 目前 2026 年最穩定的 HYCOM 實時數據網址
     tds_url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
     
     try:
-        # 開啟遠端數據集 (不下載整個檔案，僅建立數據索引)
-        ds = xr.open_dataset(tds_url, decode_times=True)
+        # 【關鍵修正】使用 decode_times=False 避開時間格式錯誤
+        ds = xr.open_dataset(tds_url, decode_times=False)
         
-        # 篩選最新時間點、海表面 (depth=0)、台灣周邊範圍
-        # 為了效能，範圍設定在經度 118~124，緯度 20~27
-        latest_subset = ds.sel(
-            time=ds.time[-1],           # 抓取最後一筆 (最新預報)
-            depth=0,                   # 海表面
-            lon=slice(118, 124),       # 台灣經度範圍
-            lat=slice(20, 27)          # 台灣緯度範圍
-        ).load() # 僅將這部分小範圍資料 load 進記憶體
+        # 抓取最後一筆預報 (Latest) 並切換至台灣海域範圍
+        subset = ds.isel(time=-1).sel(
+            depth=0,
+            lon=slice(118, 124),
+            lat=slice(20, 27)
+        ).load()
         
-        # 轉換為原系統所需的 NumPy 陣列格式
-        lat_arr = latest_subset.lat.values
-        lon_arr = latest_subset.lon.values
-        u_arr = latest_subset.water_u.values
-        v_arr = latest_subset.water_v.values
-        
-        # 處理陸地 NaN 值：HYCOM 的陸地格點為 NaN，將其轉為 0 避免計算錯誤
-        u_arr = np.nan_to_num(u_arr)
-        v_arr = np.nan_to_num(v_arr)
-        
-        # 取得資料時間戳記
-        data_ts = pd.to_datetime(latest_subset.time.values).strftime('%Y-%m-%d %H:%M')
+        # 嘗試解碼時間字串以供顯示
+        try:
+            decoded_ds = xr.decode_cf(subset)
+            data_ts = pd.to_datetime(decoded_ds.time.values).strftime('%Y-%m-%d %H:%M')
+        except:
+            data_ts = "Latest Available Forecast (Manual Sync)"
+
+        # 轉換為 NumPy 格式
+        lat_arr = subset.lat.values
+        lon_arr = subset.lon.values
+        u_arr = np.nan_to_num(subset.water_u.values)
+        v_arr = np.nan_to_num(subset.water_v.values)
         
         return lat_arr, lon_arr, u_arr, v_arr, data_ts
     
     except Exception as e:
-        st.error(f"連線 HYCOM 伺服器失敗: {e}")
+        st.error(f"⚠️ Connection to HYCOM failed: {e}")
         return None, None, None, None, None
 
 # 執行資料抓取
 lat, lon, u, v, data_time = get_hycom_realtime_data()
 
 if lat is not None:
-    st.success(f"已成功獲取 HYCOM 實時海象數據 (數據更新時間: {data_time})")
+    st.sidebar.success(f"✅ Data Loaded: {data_time}")
     
-    # 建立網格
+    # 建立網格與陸地遮罩
     LON, LAT = np.meshgrid(lon, lat)
-
-    # ------------------------------------------
-    # 台灣陸地遮罩與禁止區 (維持原邏輯)
-    # ------------------------------------------
-    # 粗略台灣形狀（橢圓）
+    
+    # 台灣陸地定義 (橢圓形近似 + 緩衝區)
     center_lat, center_lon = 23.7, 121.0
     a, b = 1.6, 0.8
     land_mask = (((LAT - center_lat) / a) ** 2 + ((LON - center_lon) / b) ** 2) < 1
-
-    # 外擴 5 km 緩衝區
-    grid_km = 111 * (lat[1] - lat[0])
-    expand_cells = int(5 / grid_km)
-    dist = distance_transform_edt(~land_mask)
-    buffer_mask = dist <= expand_cells
     
-    # 最終導航禁止區
-    forbidden = land_mask | buffer_mask
+    # 外擴 5 km 作為安全禁區
+    grid_res = lat[1] - lat[0]
+    buffer_cells = int(0.05 / grid_res) # 約 5km 的網格數
+    dist_map = distance_transform_edt(~land_mask)
+    forbidden = land_mask | (dist_map <= buffer_cells)
 
-    # ------------------------------------------
-    # A* 搜尋演算法 (維持原邏輯)
-    # ------------------------------------------
-    def heuristic(a, b):
-        return np.hypot(a[0]-b[0], a[1]-b[1])
+    # ==========================================
+    # 3. A* 搜尋演算法邏輯
+    # ==========================================
+    def heuristic(p1, p2):
+        return np.hypot(p1[0]-p2[0], p1[1]-p2[1])
 
     def flow_cost(i, j, ni, nj):
         dx = lon[nj] - lon[j]
         dy = lat[ni] - lat[i]
+        
+        # 移動向量歸一化
         move_vec = np.array([dx, dy])
-        move_vec = move_vec / (np.linalg.norm(move_vec)+1e-6)
+        norm = np.linalg.norm(move_vec)
+        move_vec = move_vec / (norm + 1e-6)
+        
+        # 當地海流向量
         flow_vec = np.array([u[i,j], v[i,j]])
+        
+        # 計算流速貢獻 (內積)
         assist = np.dot(move_vec, flow_vec)
-        base = np.hypot(dx, dy)
-        # 利用海流輔助降低成本 (assist > 0 代表順流)
-        return base * (1 - 0.6 * assist)
+        
+        # 基本物理距離成本 * 海流修正因子 (順流成本降低)
+        return norm * (1 - 0.7 * assist)
 
     def astar(start, goal):
         open_set = []
         heapq.heappush(open_set, (0, start))
-        came = {}
-        g = {start: 0}
-        dirs = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+        came_from = {}
+        g_score = {start: 0}
+        
+        # 8 方向移動
+        neighbors = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
 
         while open_set:
             _, current = heapq.heappop(open_set)
+
             if current == goal:
                 path = []
-                while current in came:
+                while current in came_from:
                     path.append(current)
-                    current = came[current]
+                    current = came_from[current]
                 path.append(start)
                 return path[::-1]
 
-            for d in dirs:
+            for d in neighbors:
                 ni, nj = current[0] + d[0], current[1] + d[1]
-                if ni < 0 or nj < 0 or ni >= len(lat) or nj >= len(lon):
-                    continue
-                if forbidden[ni, nj]:
-                    continue
+                
+                # 邊界與陸地檢查
+                if ni < 0 or nj < 0 or ni >= len(lat) or nj >= len(lon): continue
+                if forbidden[ni, nj]: continue
 
-                new_cost = g[current] + flow_cost(current[0], current[1], ni, nj)
-                nxt = (ni, nj)
-                if nxt not in g or new_cost < g[nxt]:
-                    g[nxt] = new_cost
-                    f = new_cost + heuristic(nxt, goal)
-                    heapq.heappush(open_set, (f, nxt))
-                    came[nxt] = current
+                tentative_g = g_score[current] + flow_cost(current[0], current[1], ni, nj)
+                
+                neighbor = (ni, nj)
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + heuristic(neighbor, goal)
+                    heapq.heappush(open_set, (f_score, neighbor))
         return None
 
-    # ------------------------------------------
-    # UI 輸入部分
-    # ------------------------------------------
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Start Point")
-        start_lat = st.number_input("起點緯度", value=22.3, step=0.1, format="%.2f")
-        start_lon = st.number_input("起點經度", value=120.0, step=0.1, format="%.2f")
-
-    with col2:
-        st.subheader("End Point")
-        end_lat = st.number_input("終點緯度", value=25.2, step=0.1, format="%.2f")
-        end_lon = st.number_input("終點經度", value=122.0, step=0.1, format="%.2f")
-
-    # 座標轉格點索引
-    def nearest_idx(lat0, lon0):
-        i = np.argmin(np.abs(lat - lat0))
-        j = np.argmin(np.abs(lon - lon0))
-        return i, j
-
-    start_idx = nearest_idx(start_lat, start_lon)
-    goal_idx = nearest_idx(end_lat, end_lon)
-
-    # ------------------------------------------
-    # 路徑計算
-    # ------------------------------------------
-    t0 = time.time()
-    path = astar(start_idx, goal_idx)
-    elapsed = time.time() - t0
-
-    st.write(f"⏱️ A* 優化路徑計算完成，耗時: {elapsed:.2f} 秒")
-
-    # ------------------------------------------
-    # 結果視覺化
-    # ------------------------------------------
-    fig = plt.figure(figsize=(12, 10))
-    ax = plt.axes(projection=ccrs.PlateCarree())
-
-    # 設定顯示範圍
-    ax.set_extent([118.5, 123.5, 21.0, 26.5])
-    
-    # 專業底圖設定
-    ax.add_feature(cfeature.LAND, facecolor='#444444', zorder=1)
-    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1, zorder=2)
-    ax.add_feature(cfeature.OCEAN, facecolor='#1a1a1a')
-
-    # 繪製 HYCOM 實時海流向量
-    # 使用 quiver 繪製箭頭，[::6] 是抽樣步長，避免箭頭太擠
-    q = ax.quiver(
-        LON[::6, ::6], LAT[::6, ::6], 
-        u[::6, ::6], v[::6, ::6], 
-        color='cyan', alpha=0.4, scale=20, zorder=3
-    )
-
-    # 繪製優化路徑
-    if path:
-        py = [lat[p[0]] for p in path]
-        px = [lon[p[1]] for p in path]
-        ax.plot(px, py, color='#FF00FF', linewidth=3, label='Optimized Path (HYCOM)', zorder=5)
+    # ==========================================
+    # 4. UI 互動與參數輸入
+    # ==========================================
+    with st.sidebar:
+        st.header("Navigation Parameters")
+        s_lat = st.number_input("Start Lat", value=22.3, step=0.1, format="%.2f")
+        s_lon = st.number_input("Start Lon", value=120.0, step=0.1, format="%.2f")
+        e_lat = st.number_input("End Lat", value=25.2, step=0.1, format="%.2f")
+        e_lon = st.number_input("End Lon", value=122.0, step=0.1, format="%.2f")
         
-        # 繪製直線對比 (原始路徑)
-        ax.plot([start_lon, end_lon], [start_lat, end_lat], color='white', 
-                linestyle='--', alpha=0.5, label='Original (Direct) Path', zorder=4)
+        run_btn = st.button("🚀 Calculate Optimized Route", use_container_bar_toggle=True)
 
-    # 標示點位
-    ax.scatter(start_lon, start_lat, color='#00FF00', s=120, label='Departure', zorder=6, edgecolors='black')
-    ax.scatter(end_lon, end_lat, color='#FFFF00', s=120, label='Destination', zorder=6, edgecolors='black')
+    # 座標轉換為索引
+    def get_idx(la, lo):
+        return np.argmin(np.abs(lat - la)), np.argmin(np.abs(lon - lo))
 
-    ax.legend(loc='lower right', frameon=True)
-    ax.set_title(f"HYCOM Real-time Route Optimization\n(Data Time: {data_time})", color='black', fontsize=14)
+    start_idx = get_idx(s_lat, s_lon)
+    goal_idx = get_idx(e_lat, e_lon)
 
-    st.pyplot(fig)
+    # ==========================================
+    # 5. 計算路徑與視覺化
+    # ==========================================
+    if run_btn:
+        t_start = time.time()
+        path = astar(start_idx, goal_idx)
+        t_end = time.time()
+
+        if path:
+            st.success(f"Route Found! Optimization Time: {t_end - t_start:.2f}s")
+            
+            fig = plt.figure(figsize=(12, 9))
+            ax = plt.axes(projection=ccrs.PlateCarree())
+            ax.set_extent([118.5, 123.5, 21.0, 26.5])
+            
+            # 專業底圖
+            ax.add_feature(cfeature.LAND, facecolor='#2c2c2c', zorder=1)
+            ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.8, zorder=2)
+            ax.add_feature(cfeature.OCEAN, facecolor='#121212')
+
+            # 繪製真實 HYCOM 海流場
+            ax.quiver(LON[::6, ::6], LAT[::6, ::6], u[::6, ::6], v[::6, ::6], 
+                      color='cyan', alpha=0.35, scale=20, zorder=3, label="Ocean Currents")
+
+            # 繪製優化路徑
+            py = [lat[p[0]] for p in path]
+            px = [lon[p[1]] for p in path]
+            ax.plot(px, py, color='#FF00FF', linewidth=3, label='AI Optimized Path', zorder=5)
+            
+            # 原始直線路徑 (對比)
+            ax.plot([s_lon, e_lon], [s_lat, e_lat], color='white', 
+                    linestyle='--', alpha=0.4, label='Direct Route', zorder=4)
+
+            # 點位標註
+            ax.scatter(s_lon, s_lat, color='lime', s=150, edgecolors='black', label='Departure', zorder=6)
+            ax.scatter(e_lon, e_lat, color='yellow', s=150, edgecolors='black', label='Arrival', zorder=6)
+
+            ax.legend(loc='lower right', facecolor='white', framealpha=0.8)
+            ax.set_title(f"HYCOM Real-time Routing: {data_time}", fontsize=14, color='white', backgroundcolor='black')
+            
+            st.pyplot(fig)
+        else:
+            st.error("No valid route found. Please check if the points are in open sea.")
+    else:
+        st.info("Adjust coordinates in the sidebar and click the button to start optimization.")
 
 else:
-    st.error("無法載入海象數據，請確認伺服器狀態或網路連線。")
+    st.error("Could not fetch HYCOM data. Please check your internet or try again later.")
