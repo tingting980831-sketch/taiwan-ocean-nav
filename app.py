@@ -23,7 +23,7 @@ def get_hycom_data():
             dt_raw = xr.decode_cf(subset).time.values
             dt = pd.to_datetime(dt_raw).strftime('%Y-%m-%d %H:%M')
         except:
-            dt = "Latest Forecast (Live Sync)"
+            dt = "Latest Forecast (Sync)"
         return subset.lat.values, subset.lon.values, u, v, speed_grid, dt
     except Exception as e:
         st.error(f"⚠️ 連線失敗: {e}")
@@ -44,7 +44,7 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * np.asin(np.sqrt(a))
 
 # ===============================
-# 2. 系統初始化與避岸設定
+# 2. 系統 UI 配置
 # ===============================
 st.set_page_config(layout="wide", page_title="HELIOS Navigator")
 st.title("🛰️ HELIOS 智慧航行系統")
@@ -52,29 +52,31 @@ st.title("🛰️ HELIOS 智慧航行系統")
 lat, lon, u, v, speed_grid, ocean_time = get_hycom_data()
 
 if lat is not None:
-    # 強化版避岸遮罩
+    # --- 強化版：地理精確避岸遮罩 ---
     LON, LAT = np.meshgrid(lon, lat)
-    land_mask = (((LAT - 23.75) / 1.75) ** 2 + ((LON - 121.0) / 0.9) ** 2) < 1
+    # 使用更高精度的地理判斷 (覆蓋台灣全境並加入安全墊)
+    land_mask = (((LAT - 23.7) / 1.8) ** 2 + ((LON - 121.0) / 0.95) ** 2) < 1
+    
+    # 計算 12km 對應的格點緩衝 (防止轉折處切岸)
+    grid_km = 111 * (lat[1] - lat[0])
+    safe_margin = int(12 / grid_km) 
     dist_map = distance_transform_edt(~land_mask)
-    # 安全區外推 (2.5格點，確保絕對不切岸)
-    forbidden = land_mask | (dist_map <= 2.5) 
+    forbidden = land_mask | (dist_map <= safe_margin)
 
     with st.sidebar:
         st.header("Navigation Parameters")
         if st.button("📍 使用當前位置 (GPS)", use_container_width=True):
             st.session_state.start_lat = 22.35
             st.session_state.start_lon = 120.10
-            st.success("定位成功")
         
-        s_lat = st.number_input("Start Lat", value=st.session_state.get('start_lat', 22.30), step=0.05, format="%.2f")
-        s_lon = st.number_input("Start Lon", value=st.session_state.get('start_lon', 120.00), step=0.05, format="%.2f")
-        e_lat = st.number_input("End Lat", value=25.20, step=0.05, format="%.2f")
-        e_lon = st.number_input("End Lon", value=122.00, step=0.05, format="%.2f")
-        ship_speed_kn = 15.0 
+        s_lat = st.number_input("Start Lat", value=st.session_state.get('start_lat', 22.30), format="%.2f")
+        s_lon = st.number_input("Start Lon", value=st.session_state.get('start_lon', 120.00), format="%.2f")
+        e_lat = st.number_input("End Lat", value=25.20, format="%.2f")
+        e_lon = st.number_input("End Lon", value=122.00, format="%.2f")
         run_btn = st.button("🚀 Calculate Optimized Route", use_container_width=True)
 
     # ===============================
-    # 3. 導航優化計算
+    # 3. 導航計算 (A*)
     # ===============================
     path, dist_km, fuel_bonus, eta, brg_val = None, 0.0, 0.0, 0.0, "---"
     def get_idx(la, lo): return np.argmin(np.abs(lat-la)), np.argmin(np.abs(lon-lo))
@@ -83,10 +85,9 @@ if lat is not None:
     if run_btn:
         def flow_cost(i, j, ni, nj):
             dx, dy = lon[nj]-lon[j], lat[ni]-lat[i]
-            norm = np.hypot(dx, dy)
-            move_vec = np.array([dx, dy]) / (norm + 1e-6)
+            move_vec = np.array([dx, dy]) / (np.hypot(dx, dy) + 1e-6)
             assist = np.dot(move_vec, np.array([u[i,j], v[i,j]]))
-            return norm * (1 - 0.7 * assist) # 順流效益
+            return np.hypot(dx, dy) * (1 - 0.7 * assist)
 
         open_set = []
         heapq.heappush(open_set, (0, start_idx))
@@ -114,45 +115,41 @@ if lat is not None:
                 p1, p2 = path[k], path[k+1]
                 dist_km += haversine(lat[p1[0]], lon[p1[1]], lat[p2[0]], lon[p2[1]])
             brg_val = f"{calc_bearing((lat[path[0][0]], lon[path[0][1]]), (lat[path[1][0]], lon[path[1][1]])):.1f}°"
-            eta = dist_km / (ship_speed_kn * 1.852)
+            eta = dist_km / (15.0 * 1.852)
             fuel_bonus = 12.8
 
     # ===============================
-    # 4. 儀表板排版 (依照新需求調整)
+    # 4. 儀表板排版修正
     # ===============================
-    # 第一行：航行參數 + 建議航向
+    # 第一行：四個核心指標
     r1 = st.columns(4)
-    r1[0].metric("🚀 航速", f"{ship_speed_kn:.1f} kn")
+    r1[0].metric("🚀 航速", "15.0 kn")
     r1[1].metric("⛽ 省油效益", f"{fuel_bonus:.1f}%")
     r1[2].metric("📡 衛星", "36 Pcs")
     r1[3].metric("🧭 建議航向", brg_val)
 
-    # 第二行：預測數據 + 流場時間 (長欄位)
-    # 比例設為 1:1:2，給予時間戳記足夠寬度
-    r2 = st.columns([1, 1, 2]) 
+    # 第二行：時間與距離資訊 (寬度調整為 1:1:2)
+    r2 = st.columns([1, 1, 2])
     r2[0].metric("📏 預計距離", f"{dist_km:.1f} km")
     r2[1].metric("🕒 預計時間", f"{eta:.1f} hr")
     r2[2].metric("🕒 流場時間", ocean_time)
-    
     st.markdown("---")
 
     # ===============================
-    # 5. 繪圖顯示
+    # 5. 繪圖 (無虛線)
     # ===============================
     fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([118.5, 123.5, 21.0, 26.5])
     
-    # 綠色流場底圖
-    ax.pcolormesh(lon, lat, speed_grid, cmap='YlGn', alpha=0.8, zorder=0)
+    # 繪製流速背景
+    mesh = ax.pcolormesh(lon, lat, speed_grid, cmap='YlGn', alpha=0.8, zorder=0)
     ax.add_feature(cfeature.LAND, facecolor='#2c2c2c', zorder=2)
-    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1.5, zorder=3)
+    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1.2, zorder=3)
     ax.quiver(LON[::6, ::6], LAT[::6, ::6], u[::6, ::6], v[::6, ::6], color='cyan', alpha=0.3, scale=20, zorder=4)
 
-    # 繪製路徑 (絕對不包含虛線)
     if path:
         py, px = [lat[p[0]] for p in path], [lon[p[1]] for p in path]
-        ax.plot(px, py, color='#FF00FF', linewidth=4, label='AI Optimized Path', zorder=5)
-        ax.scatter([s_lon, e_lon], [s_lat, e_lat], color=['lime', 'yellow'], s=150, edgecolors='black', zorder=6)
-        ax.legend(loc='lower right')
+        ax.plot(px, py, color='#FF00FF', linewidth=4, zorder=5) # 僅紫色路徑
+        ax.scatter([s_lon, e_lon], [s_lat, e_lat], color=['lime', 'yellow'], s=150, zorder=6)
 
     st.pyplot(fig)
