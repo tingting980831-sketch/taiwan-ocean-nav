@@ -7,6 +7,7 @@ import cartopy.feature as cfeature
 import heapq
 from datetime import datetime
 import math
+import random
 
 # =====================================================
 # Page
@@ -29,60 +30,51 @@ for k,v in defaults.items():
         st.session_state[k]=v
 
 # =====================================================
-# HYCOM 即時流場（OPeNDAP 穩定版）
+# 🌊 真實 HYCOM (OPeNDAP)
 # =====================================================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800, show_spinner="🌊 連接 HYCOM 即時流場...")
 def load_hycom():
 
     url="https://tds.hycom.org/thredds/dodsC/FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd"
 
-    try:
-        ds=xr.open_dataset(url,engine="pydap",decode_times=False)
+    ds=xr.open_dataset(
+        url,
+        engine="pydap",
+        decode_times=False
+    )
 
-        sub=ds.sel(
-            lat=slice(21,26),
-            lon=slice(118,123)
-        ).isel(time=0,depth=0)
+    subset=ds.sel(
+        lat=slice(21,26),
+        lon=slice(118,123)
+    ).isel(time=0,depth=0)
 
-        u=sub["water_u"].values
-        v=sub["water_v"].values
+    u=subset["water_u"].values
+    v=subset["water_v"].values
 
-        ocean_time=str(ds.time.values[0])[:19]
+    if np.isnan(u).all():
+        raise RuntimeError("HYCOM資料為空")
 
-        return sub.lon.values,sub.lat.values,u,v,ocean_time,"ONLINE"
+    ocean_time=str(ds.time.values[0])[:19]
 
-    except:
-        # fallback 模擬流場
-        lon=np.linspace(118,123,80)
-        lat=np.linspace(21,26,80)
-        X,Y=np.meshgrid(lon,lat)
+    return subset.lon.values, subset.lat.values, u, v, ocean_time
 
-        u=0.6*np.sin(Y/2)
-        v=0.4*np.cos(X/2)
-
-        return lon,lat,u,v,"SIMULATION","OFFLINE"
-
-
-lons,lats,u,v,ocean_time,flow_status = load_hycom()
+lons,lats,u,v,ocean_time = load_hycom()
 
 # =====================================================
-# 陸地限制（5km buffer）
+# 陸地限制（台灣 + 5km）
 # =====================================================
 BUFFER_DEG = 0.045
 
 def is_land(lat,lon):
-
     taiwan = (
         (21.8-BUFFER_DEG <= lat <= 25.4+BUFFER_DEG) and
         (120.0-BUFFER_DEG <= lon <= 122.1+BUFFER_DEG)
     )
-
     china = (lat>=24.2-BUFFER_DEG and lon<=119.6+BUFFER_DEG)
-
     return taiwan or china
 
 # =====================================================
-# 距離
+# 地理工具
 # =====================================================
 def haversine(a,b):
     R=6371
@@ -93,38 +85,28 @@ def haversine(a,b):
     h=np.sin(dlat/2)**2+np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
     return 2*R*np.arctan2(np.sqrt(h),np.sqrt(1-h))
 
-# =====================================================
-# 流速查詢
-# =====================================================
+def bearing(a,b):
+    lat1,lon1=np.radians(a)
+    lat2,lon2=np.radians(b)
+    dlon=lon2-lon1
+    x=np.sin(dlon)*np.cos(lat2)
+    y=np.cos(lat1)*np.sin(lat2)-np.sin(lat1)*np.cos(lat2)*np.cos(dlon)
+    brng=np.degrees(np.arctan2(x,y))
+    return (brng+360)%360
+
 def current_vec(lat,lon):
     i=np.abs(lats-lat).argmin()
     j=np.abs(lons-lon).argmin()
     return u[i,j],v[i,j]
 
 # =====================================================
-# 建議航向
-# =====================================================
-def bearing(p1,p2):
-    lat1,lon1=np.radians(p1)
-    lat2,lon2=np.radians(p2)
-
-    dlon=lon2-lon1
-    x=np.sin(dlon)*np.cos(lat2)
-    y=np.cos(lat1)*np.sin(lat2)-np.sin(lat1)*np.cos(lat2)*np.cos(dlon)
-
-    brng=np.degrees(np.arctan2(x,y))
-    return (brng+360)%360
-
-# =====================================================
-# A*（流場影響）
+# 🚢 A* 智慧航線（流場影響）
 # =====================================================
 def smart_route(start,end):
 
     step=0.12
     dirs=[(-1,0),(1,0),(0,-1),(0,1),
           (-1,-1),(-1,1),(1,-1),(1,1)]
-
-    def h(p): return haversine(p,end)
 
     open_set=[]
     heapq.heappush(open_set,(0,start))
@@ -136,7 +118,7 @@ def smart_route(start,end):
 
         _,cur=heapq.heappop(open_set)
 
-        if haversine(cur,end)<15:
+        if haversine(cur,end)<20:
             path=[cur]
             while tuple(cur) in came:
                 cur=came[tuple(cur)]
@@ -155,14 +137,17 @@ def smart_route(start,end):
             cu,cv=current_vec(*nxt)
             current_speed=np.sqrt(cu**2+cv**2)
 
-            eff_speed=max(4,base_speed+current_speed*2)
+            effective_speed=max(
+                4,
+                base_speed + current_speed*2
+            )
 
-            cost=step/eff_speed
+            cost=step/effective_speed
             new_g=g[tuple(cur)]+cost
 
             if tuple(nxt) not in g or new_g<g[tuple(nxt)]:
                 g[tuple(nxt)]=new_g
-                f=new_g+h(nxt)
+                f=new_g+haversine(nxt,end)
                 heapq.heappush(open_set,(f,nxt))
                 came[tuple(nxt)]=cur
 
@@ -175,13 +160,18 @@ with st.sidebar:
 
     st.header("🚢 導航控制")
 
-    slat=st.number_input("起點緯度",value=st.session_state.ship_lat)
-    slon=st.number_input("起點經度",value=st.session_state.ship_lon)
+    slat=st.number_input("起點緯度",value=st.session_state.ship_lat,format="%.3f")
+    slon=st.number_input("起點經度",value=st.session_state.ship_lon,format="%.3f")
 
-    elat=st.number_input("終點緯度",value=st.session_state.dest_lat)
-    elon=st.number_input("終點經度",value=st.session_state.dest_lon)
+    if st.button("📍 使用目前位置"):
+        st.session_state.ship_lat=25.03
+        st.session_state.ship_lon=121.56
+        st.rerun()
 
-    if st.button("🚀 生成智慧航線",use_container_width=True):
+    elat=st.number_input("終點緯度",value=st.session_state.dest_lat,format="%.3f")
+    elon=st.number_input("終點經度",value=st.session_state.dest_lon,format="%.3f")
+
+    if st.button("🚀 啟動智慧航線",use_container_width=True):
 
         if is_land(slat,slon):
             st.error("起點在陸地")
@@ -189,43 +179,44 @@ with st.sidebar:
             st.error("終點在陸地")
         else:
             path=smart_route([slat,slon],[elat,elon])
-
             st.session_state.ship_lat=slat
             st.session_state.ship_lon=slon
             st.session_state.dest_lat=elat
             st.session_state.dest_lon=elon
             st.session_state.real_p=path
-
             st.rerun()
 
 # =====================================================
-# Dashboard
+# 儀表板
 # =====================================================
 st.title("🛰️ HELIOS 智慧航行系統")
 
-speed_now=12+np.random.uniform(-1.5,1.5)
-satellite=np.random.randint(8,15)
+speed_now=12+random.uniform(-1.5,1.5)
+satellite=random.randint(7,14)
 
 distance=0
-heading="--"
+eta=0
+heading="—"
 
 if st.session_state.real_p:
-    pts=st.session_state.real_p
-    distance=sum(haversine(pts[i],pts[i+1]) for i in range(len(pts)-1))
-    heading=f"{bearing(pts[0],pts[1]):.0f}°"
+    path=st.session_state.real_p
+    for i in range(len(path)-1):
+        distance+=haversine(path[i],path[i+1])
+    eta=distance/speed_now
+    heading=f"{bearing(path[0],path[1]):.0f}°"
 
-c1,c2,c3,c4,c5=st.columns(5)
-
-c1.metric("🚀 即時航速",f"{speed_now:.1f} kn")
-c2.metric("📡 衛星接收",f"{satellite} 顆")
-c3.metric("🌊 流場連線",flow_status)
-c4.metric("🧭 建議航向",heading)
-c5.metric("📏 航程距離",f"{distance:.1f} km")
+cols=st.columns(6)
+cols[0].metric("🚀 即時航速",f"{speed_now:.1f} kn")
+cols[1].metric("📡 衛星接收",f"{satellite} 顆")
+cols[2].metric("🌊 流場時間",ocean_time)
+cols[3].metric("📏 航程距離",f"{distance:.1f} km")
+cols[4].metric("⏱ 預估時間",f"{eta:.1f} hr")
+cols[5].metric("🧭 建議航向",heading)
 
 st.markdown("---")
 
 # =====================================================
-# Map
+# 地圖
 # =====================================================
 fig,ax=plt.subplots(figsize=(10,8),
         subplot_kw={'projection':ccrs.PlateCarree()})
@@ -242,12 +233,11 @@ if st.session_state.real_p:
 
 ax.scatter(st.session_state.ship_lon,
            st.session_state.ship_lat,
-           color="red",s=80)
+           color="red",s=80,zorder=6)
 
 ax.scatter(st.session_state.dest_lon,
            st.session_state.dest_lat,
-           color="gold",marker="*",s=250)
+           color="gold",marker="*",s=250,zorder=7)
 
-ax.set_extent([118.5,125.5,20.5,26.5])
-
+ax.set_extent([118.5,123.5,21,26])
 st.pyplot(fig)
