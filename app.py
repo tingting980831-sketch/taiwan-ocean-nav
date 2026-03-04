@@ -6,15 +6,14 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
 from datetime import datetime
-import math
 
 # ===============================
-# Page
+# PAGE
 # ===============================
 st.set_page_config(page_title="HELIOS 智慧航行系統", layout="wide")
 
 # ===============================
-# Session State
+# SESSION STATE
 # ===============================
 defaults = {
     "ship_lat":25.06,
@@ -28,14 +27,14 @@ for k,v in defaults.items():
         st.session_state[k]=v
 
 # ===============================
-# HYCOM 即時流場
+# HYCOM 真實流場（強制）
 # ===============================
 @st.cache_data(ttl=1800)
 def fetch_ocean():
 
-    try:
-        url="https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
+    url="https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
 
+    try:
         ds=xr.open_dataset(url,decode_times=True)
 
         sub=ds.sel(
@@ -44,6 +43,12 @@ def fetch_ocean():
             depth=0
         ).isel(time=-1).load()
 
+        u=sub.water_u.values
+        v=sub.water_v.values
+
+        if np.isnan(u).all():
+            raise ValueError("Empty current")
+
         ocean_time=np.datetime_as_string(
             ds.time.values[-1],unit="m"
         )
@@ -51,40 +56,35 @@ def fetch_ocean():
         return (
             sub.lon.values,
             sub.lat.values,
-            sub.water_u.values,
-            sub.water_v.values,
+            u,
+            v,
             ocean_time,
-            "ONLINE"
+            "HYCOM CONNECTED ✅"
         )
 
-    except Exception as e:
-        lon=np.linspace(118,126,80)
-        lat=np.linspace(20,27,80)
-        u=np.zeros((80,80))
-        v=np.zeros((80,80))
-        return lon,lat,u,v,"N/A","OFFLINE"
+    except:
+        st.error("❌ HYCOM 流場連線失敗")
+        st.stop()
 
+lons,lats,u,v,ocean_time,status = fetch_ocean()
 
-lons,lats,u,v,ocean_time,status=fetch_ocean()
+pretty_time = datetime.fromisoformat(
+    ocean_time.replace("Z","")
+).strftime("%Y-%m-%d %H:%M")
 
 # ===============================
-# 台灣陸地限制（5km buffer）
+# LAND MASK（台灣 +5km）
 # ===============================
-BUFFER_DEG=0.045
+BUFFER=0.045
 
 def is_land(lat,lon):
-
-    taiwan=(
-        (21.8-BUFFER_DEG<=lat<=25.4+BUFFER_DEG) and
-        (120.0-BUFFER_DEG<=lon<=122.1+BUFFER_DEG)
-    )
-
-    china=(lat>=24.2-BUFFER_DEG and lon<=119.6+BUFFER_DEG)
-
+    taiwan=((21.8-BUFFER<=lat<=25.4+BUFFER) and
+            (120.0-BUFFER<=lon<=122.1+BUFFER))
+    china=(lat>=24.2-BUFFER and lon<=119.6+BUFFER)
     return taiwan or china
 
 # ===============================
-# 距離
+# DISTANCE
 # ===============================
 def haversine(a,b):
     R=6371
@@ -96,7 +96,7 @@ def haversine(a,b):
     return 2*R*np.arctan2(np.sqrt(h),np.sqrt(1-h))
 
 # ===============================
-# 流速
+# CURRENT VECTOR
 # ===============================
 def current_vec(lat,lon):
     i=np.abs(lats-lat).argmin()
@@ -104,23 +104,7 @@ def current_vec(lat,lon):
     return u[i,j],v[i,j]
 
 # ===============================
-# 建議航向
-# ===============================
-def bearing(start,end):
-
-    lat1,lon1=np.radians(start)
-    lat2,lon2=np.radians(end)
-
-    dlon=lon2-lon1
-
-    x=np.sin(dlon)*np.cos(lat2)
-    y=np.cos(lat1)*np.sin(lat2)-np.sin(lat1)*np.cos(lat2)*np.cos(dlon)
-
-    brng=np.degrees(np.arctan2(x,y))
-    return (brng+360)%360
-
-# ===============================
-# A* 航線
+# A* 智慧航線（真流場）
 # ===============================
 def smart_route(start,end):
 
@@ -154,14 +138,22 @@ def smart_route(start,end):
             if is_land(*nxt):
                 continue
 
-            base_speed=12
+            base_speed=6.5  # m/s
 
             cu,cv=current_vec(*nxt)
-            current_speed=np.sqrt(cu**2+cv**2)
 
-            effective_speed=max(
-                4,
-                base_speed+current_speed*2
+            vx=nxt[1]-cur[1]
+            vy=nxt[0]-cur[0]
+
+            norm=np.sqrt(vx**2+vy**2)+1e-9
+            dirx=vx/norm
+            diry=vy/norm
+
+            current_projection=cu*dirx+cv*diry
+
+            effective_speed=np.clip(
+                base_speed+current_projection,
+                1.5,15
             )
 
             cost=step/effective_speed
@@ -176,7 +168,28 @@ def smart_route(start,end):
     return []
 
 # ===============================
-# Sidebar
+# ROUTE STATS
+# ===============================
+def route_stats(path):
+
+    if len(path)<2:
+        return 0,0,0,0
+
+    dist=0
+    for i in range(len(path)-1):
+        dist+=haversine(path[i],path[i+1])
+
+    speed_kn=12+np.random.uniform(-1,1)
+    hours=dist/(speed_kn*1.852)
+
+    dy=path[1][0]-path[0][0]
+    dx=path[1][1]-path[0][1]
+    heading=(np.degrees(np.arctan2(dx,dy))+360)%360
+
+    return dist,hours,heading,speed_kn
+
+# ===============================
+# SIDEBAR
 # ===============================
 with st.sidebar:
 
@@ -184,7 +197,6 @@ with st.sidebar:
 
     slat=st.number_input("起點緯度",value=st.session_state.ship_lat,format="%.3f")
     slon=st.number_input("起點經度",value=st.session_state.ship_lon,format="%.3f")
-
     elat=st.number_input("終點緯度",value=st.session_state.dest_lat,format="%.3f")
     elon=st.number_input("終點經度",value=st.session_state.dest_lon,format="%.3f")
 
@@ -195,60 +207,40 @@ with st.sidebar:
         elif is_land(elat,elon):
             st.error("終點在陸地")
         else:
-
             path=smart_route([slat,slon],[elat,elon])
-
+            st.session_state.real_p=path
             st.session_state.ship_lat=slat
             st.session_state.ship_lon=slon
             st.session_state.dest_lat=elat
             st.session_state.dest_lon=elon
-            st.session_state.real_p=path
-
             st.rerun()
 
 # ===============================
-# Dashboard
+# DASHBOARD
 # ===============================
 st.title("🛰️ HELIOS 智慧航行系統")
 
-speed_now=float(12+np.random.uniform(-1.5,1.5))
-satellite=int(9+np.random.randint(0,6))
+dist,eta,heading,speed_now=route_stats(st.session_state.real_p)
+satellite=int(8+np.random.randint(0,6))
 
-distance=0
-eta="--"
-heading="--"
-
-if st.session_state.real_p:
-
-    path=st.session_state.real_p
-
-    for i in range(len(path)-1):
-        distance+=haversine(path[i],path[i+1])
-
-    hours=distance/22
-    eta=f"{hours:.1f} hr"
-
-    heading=f"{bearing(path[0],path[-1]):.0f}°"
-
-r1=st.columns(6)
+r1=st.columns(4)
 r1[0].metric("🚀 即時航速",f"{speed_now:.1f} kn")
-r1[1].metric("📡 衛星",satellite)
-r1[2].metric("🌊 流場",status)
-r1[3].metric("🕒 流場時間",ocean_time)
-r1[4].metric("📏 航行距離",f"{distance:.1f} km")
-r1[5].metric("🧭 建議航向",heading)
+r1[1].metric("📡 衛星接收",f"{satellite} 顆")
+r1[2].metric("🌊 流場狀態",status)
+r1[3].metric("🕒 流場時間",pretty_time)
 
-st.caption(f"⏱ 預估航行時間 ETA：{eta}")
+r2=st.columns(3)
+r2[0].metric("📏 預計距離",f"{dist:.1f} km")
+r2[1].metric("⏱️ 預計航行時間",f"{eta:.1f} hr")
+r2[2].metric("🧭 建議航向",f"{heading:.0f}°")
 
 st.markdown("---")
 
 # ===============================
-# Map
+# MAP
 # ===============================
-fig,ax=plt.subplots(
-    figsize=(10,8),
-    subplot_kw={'projection':ccrs.PlateCarree()}
-)
+fig,ax=plt.subplots(figsize=(10,8),
+    subplot_kw={'projection':ccrs.PlateCarree()})
 
 ax.add_feature(cfeature.LAND,facecolor="#2b2b2b")
 ax.add_feature(cfeature.COASTLINE,color="cyan")
@@ -269,5 +261,4 @@ ax.scatter(st.session_state.dest_lon,
            color="gold",marker="*",s=250,zorder=7)
 
 ax.set_extent([118.5,125.5,20.5,26.5])
-
 st.pyplot(fig)
