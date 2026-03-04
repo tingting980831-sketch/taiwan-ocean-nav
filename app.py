@@ -9,7 +9,7 @@ import xarray as xr
 import pandas as pd
 
 # ===============================
-# 1. 核心工具與數據抓取 (避開解碼錯誤)
+# 1. 核心數據抓取
 # ===============================
 @st.cache_data(ttl=3600)
 def get_hycom_data():
@@ -26,7 +26,7 @@ def get_hycom_data():
             dt = "Latest Forecast (Live)"
         return subset.lat.values, subset.lon.values, u, v, speed_grid, dt
     except Exception as e:
-        st.error(f"⚠️ HYCOM 連線失敗: {e}")
+        st.error(f"⚠️ 連線失敗: {e}")
         return None, None, None, None, None, None
 
 def calc_bearing(p1, p2):
@@ -52,43 +52,40 @@ st.title("🛰️ HELIOS 智慧航行系統")
 lat, lon, u, v, speed_grid, ocean_time = get_hycom_data()
 
 if lat is not None:
-    # --- 避岸演算法準備 ---
+    # --- 核心更新：強化型避岸遮罩 ---
     LON, LAT = np.meshgrid(lon, lat)
-    land_mask = (((LAT - 23.7) / 1.65) ** 2 + ((LON - 121.0) / 0.85) ** 2) < 1
-    grid_dist_km = 111 * (lat[1] - lat[0]) 
-    safe_buffer_cells = int(8 / grid_dist_km) # 設置 8 公里緩衝
+    # 增加橢圓半徑並調整中心，強化對東北角與西南岸的覆蓋
+    land_mask = (((LAT - 23.75) / 1.75) ** 2 + ((LON - 121.0) / 0.9) ** 2) < 1
+    
+    # 增加緩衝寬度，確保邊緣網格不會被選中
+    grid_res = lat[1] - lat[0]
     dist_map = distance_transform_edt(~land_mask)
-    forbidden = land_mask | (dist_map <= safe_buffer_cells)
+    # 設為 2.5 格點寬度（約 20km 以上的安全區）
+    forbidden = land_mask | (dist_map <= 2.5) 
 
-    # --- 側邊欄：加入立即定位功能 ---
+    # --- 側邊欄 ---
     with st.sidebar:
         st.header("Navigation Parameters")
-        
-        # 立即定位按鈕邏輯
         if st.button("📍 使用當前位置 (GPS)", use_container_width=True):
-            st.session_state.start_lat = 22.35 # 模擬當前 GPS 緯度
-            st.session_state.start_lon = 120.10 # 模擬當前 GPS 經度
+            st.session_state.start_lat = 22.35
+            st.session_state.start_lon = 120.10
             st.success("已鎖定當前座標")
         
-        # 使用 session_state 保持定位後的數值
         s_lat = st.number_input("Start Lat", value=st.session_state.get('start_lat', 22.30), step=0.05, format="%.2f")
         s_lon = st.number_input("Start Lon", value=st.session_state.get('start_lon', 120.00), step=0.05, format="%.2f")
         e_lat = st.number_input("End Lat", value=25.20, step=0.05, format="%.2f")
         e_lon = st.number_input("End Lon", value=122.00, step=0.05, format="%.2f")
-        
         ship_speed_kn = 15.0 
         run_btn = st.button("🚀 Calculate Optimized Route", use_container_width=True)
 
+    # ===============================
+    # 3. A* 導航計算
+    # ===============================
+    path, dist_km, fuel_bonus, eta, brg_val = None, 0.0, 0.0, 0.0, "---"
     def get_idx(la, lo): return np.argmin(np.abs(lat-la)), np.argmin(np.abs(lon-lo))
     start_idx, goal_idx = get_idx(s_lat, s_lon), get_idx(e_lat, e_lon)
 
-    # ===============================
-    # 3. A* 演算法執行
-    # ===============================
-    path, dist_km, fuel_bonus, eta, brg_val = None, 0.0, 0.0, 0.0, "---"
-
     if run_btn:
-        def heuristic(p1, p2): return np.hypot(p1[0]-p2[0], p1[1]-p2[1])
         def flow_cost(i, j, ni, nj):
             dx, dy = lon[nj]-lon[j], lat[ni]-lat[i]
             norm = np.hypot(dx, dy)
@@ -115,7 +112,7 @@ if lat is not None:
                     if (ni, nj) not in g_score or tg < g_score[(ni, nj)]:
                         came_from[(ni, nj)] = current
                         g_score[(ni, nj)] = tg
-                        heapq.heappush(open_set, (tg + heuristic((ni, nj), goal_idx), (ni, nj)))
+                        heapq.heappush(open_set, (tg + np.hypot(ni-goal_idx[0], nj-goal_idx[1]), (ni, nj)))
 
         if path:
             for k in range(len(path)-1):
@@ -126,36 +123,38 @@ if lat is not None:
             fuel_bonus = 12.8
 
     # ===============================
-    # 4. 儀表板 (已移除流場狀態)
+    # 4. 儀表板排版修正
     # ===============================
-    r1 = st.columns(3) # 改為 3 列
-    r1[0].metric("🚀 航速", f"{ship_speed_kn:.1f} kn")
-    r1[1].metric("⛽ 省油效益", f"{fuel_bonus:.1f}%")
-    r1[2].metric("📡 衛星", "36 Pcs")
+    # 第一行：維持三項核心數據
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🚀 航速", f"{ship_speed_kn:.1f} kn")
+    m2.metric("⛽ 省油效益", f"{fuel_bonus:.1f}%")
+    m3.metric("📡 衛星", "36 Pcs")
 
-    r2 = st.columns(4)
-    r2[0].metric("🧭 建議航向", brg_val)
-    r2[1].metric("📏 預計距離", f"{dist_km:.1f} km")
-    r2[2].metric("🕒 預計抵達", f"{eta:.1f} hr")
-    r2[3].metric("🕒 流場時間", ocean_time)
+    # 第二行：調整為三列，讓「流場時間」有充足空間顯示
+    m4, m5, m6 = st.columns([1, 1, 2]) # 比例調整為 1:1:2
+    m4.metric("🧭 建議航向", brg_val)
+    m5.metric("📏 預計距離", f"{dist_km:.1f} km")
+    m6.metric("🕒 流場時間", ocean_time)
+    
+    # 將預計抵達移至第三行獨立顯示或併入，這裡選擇放在下方一行與圖表分界
+    st.write(f"⏱️ **預計抵達耗時：{eta:.1f} 小時**")
     st.markdown("---")
 
     # ===============================
-    # 5. 視覺化 (僅保留紫色優化線)
+    # 5. 視覺化 (純化：移除虛線)
     # ===============================
     fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([118.5, 123.5, 21.0, 26.5])
     
-    # 綠色流速底圖
-    mesh = ax.pcolormesh(lon, lat, speed_grid, cmap='YlGn', alpha=0.8, zorder=0)
+    ax.pcolormesh(lon, lat, speed_grid, cmap='YlGn', alpha=0.8, zorder=0)
     ax.add_feature(cfeature.LAND, facecolor='#2c2c2c', zorder=2)
     ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1.5, zorder=3)
     ax.quiver(LON[::6, ::6], LAT[::6, ::6], u[::6, ::6], v[::6, ::6], color='cyan', alpha=0.3, scale=20, zorder=4)
 
-    # 繪製路徑 (無虛線)
     if path:
         py, px = [lat[p[0]] for p in path], [lon[p[1]] for p in path]
-        ax.plot(px, py, color='#FF00FF', linewidth=4, label='AI Optimized Path', zorder=5)
+        ax.plot(px, py, color='#FF00FF', linewidth=4, label='Optimized Path', zorder=5)
         ax.scatter([s_lon, e_lon], [s_lat, e_lat], color=['lime', 'yellow'], s=150, edgecolors='black', zorder=6)
         ax.legend(loc='lower right')
 
