@@ -49,7 +49,7 @@ def haversine(lat1, lon1, lat2, lon2):
 # 2. 系統 UI 與定位功能
 # ===============================
 st.set_page_config(layout="wide", page_title="HELIOS V6 Flagship")
-st.title("🛰️ HELIOS 智慧航行系統")
+st.title("🛰️ HELIOS 智慧航行系統 (旗艦通訊版)")
 
 lat, lon, u_4d, v_4d, ocean_time = get_v6_data()
 
@@ -127,33 +127,27 @@ if lat is not None:
             fuel_bonus = 18.5 if mode == "AI 變頻省油" else 14.1
 
     # ===============================
-# 3. 儀表板與動態衛星模擬 (更新版)
-# ===============================
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("🧭 建議航向", brg_val)
-c2.metric("⛽ 省油效益", f"{fuel_bonus:.1f}%", delta="AI Active" if mode=="AI 變頻省油" else None)
-
-# --- 動態衛星計算邏輯 ---
-# 模擬在 72 顆全域網中，當前經緯度上方可視的衛星數量 (4~9 顆跳動)
-import time
-# 利用經緯度總和當種子，讓不同位置看到的衛星數不同
-seed = int(s_lat + s_lon) 
-np.random.seed(seed)
-visible_sats = np.random.randint(4, 10) 
-
-# 顯示格式：目前連線數 / 總數
-c3.metric("📡 衛星狀態", f"Active ({visible_sats}/72)") 
-c4.metric("🚢 AIS 模式", "Real-time (隨傳隨回)")
-
-c5, c6, c7 = st.columns([1, 1, 2])
-c5.metric("📏 預計距離", f"{dist_km:.1f} km")
-c6.metric("🕒 預計時間", f"{eta:.1f} hr")
-
-# 增加動態連線品質顯示
-c7.metric("🕒 系統狀態", f"LEO 550km / ISL 優質連線")
-st.caption(f"衛星幾何配置 (GDOP): 優良 | 數據源: {ocean_time}")
+    # 3. 儀表板與動態衛星模擬
     # ===============================
-    # 4. 繪圖功能
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🧭 建議航向", brg_val)
+    c2.metric("⛽ 省油效益", f"{fuel_bonus:.1f}%", delta="AI Active" if mode=="AI 變頻省油" else None)
+    
+    # 隨座標跳動的動態衛星數 (4~9顆)
+    np.random.seed(int(s_lat + s_lon))
+    visible_sats = np.random.randint(4, 10)
+    c3.metric("📡 衛星狀態", f"Active ({visible_sats}/72)") 
+    c4.metric("🚢 AIS 模式", "Real-time (隨傳隨回)")
+
+    c5, c6, c7 = st.columns([1, 1, 2])
+    c5.metric("📏 預計距離", f"{dist_km:.1f} km")
+    c6.metric("🕒 預計時間", f"{eta:.1f} hr")
+    c7.metric("🕒 系統狀態", "LEO 550km / ISL 連線優良")
+    st.caption(f"數據來源: HYCOM 4D / 同步時間: {ocean_time}")
+    st.markdown("---")
+
+    # ===============================
+    # 4. 繪圖功能 (修正縮進處)
     # ===============================
     fig, ax = plt.subplots(figsize=(11, 8.5), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([116.8, 125.2, 19.8, 27.2]) 
@@ -168,4 +162,5 @@ st.caption(f"衛星幾何配置 (GDOP): 優良 | 數據源: {ocean_time}")
         ax.plot(px, py, color='#FF00FF', linewidth=2.5, zorder=5) 
         ax.scatter(s_lon, s_lat, color='lime', s=80, edgecolors='black', zorder=6) 
         ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=200, edgecolors='black', zorder=6)
+    
     st.pyplot(fig)
