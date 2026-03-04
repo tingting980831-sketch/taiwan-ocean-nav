@@ -44,7 +44,7 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * np.asin(np.sqrt(a))
 
 # ===============================
-# 2. 系統 UI 配置
+# 2. 系統配置與避岸邏輯
 # ===============================
 st.set_page_config(layout="wide", page_title="HELIOS Navigator")
 st.title("🛰️ HELIOS 智慧航行系統")
@@ -52,12 +52,9 @@ st.title("🛰️ HELIOS 智慧航行系統")
 lat, lon, u, v, speed_grid, ocean_time = get_hycom_data()
 
 if lat is not None:
-    # --- 強化版：地理精確避岸遮罩 ---
+    # 強化版避岸遮罩
     LON, LAT = np.meshgrid(lon, lat)
-    # 使用更高精度的地理判斷 (覆蓋台灣全境並加入安全墊)
     land_mask = (((LAT - 23.7) / 1.8) ** 2 + ((LON - 121.0) / 0.95) ** 2) < 1
-    
-    # 計算 12km 對應的格點緩衝 (防止轉折處切岸)
     grid_km = 111 * (lat[1] - lat[0])
     safe_margin = int(12 / grid_km) 
     dist_map = distance_transform_edt(~land_mask)
@@ -75,19 +72,31 @@ if lat is not None:
         e_lon = st.number_input("End Lon", value=122.00, format="%.2f")
         run_btn = st.button("🚀 Calculate Optimized Route", use_container_width=True)
 
-    # ===============================
-    # 3. 導航計算 (A*)
-    # ===============================
-    path, dist_km, fuel_bonus, eta, brg_val = None, 0.0, 0.0, 0.0, "---"
+    # 座標索引轉換
     def get_idx(la, lo): return np.argmin(np.abs(lat-la)), np.argmin(np.abs(lon-lo))
     start_idx, goal_idx = get_idx(s_lat, s_lon), get_idx(e_lat, e_lon)
 
-    if run_btn:
+    # --- 陸地檢核提醒 ---
+    is_start_invalid = forbidden[start_idx]
+    is_goal_invalid = forbidden[goal_idx]
+    
+    if is_start_invalid:
+        st.warning("🚨 提醒：起點位於陸地或離岸過近，請調整起點座標。")
+    if is_goal_invalid:
+        st.warning("🚨 提醒：終點位於陸地或離岸過近，請調整終點座標。")
+
+    # ===============================
+    # 3. 導航優化 (A*)
+    # ===============================
+    path, dist_km, fuel_bonus, eta, brg_val = None, 0.0, 0.0, 0.0, "---"
+
+    if run_btn and not is_start_invalid and not is_goal_invalid:
         def flow_cost(i, j, ni, nj):
             dx, dy = lon[nj]-lon[j], lat[ni]-lat[i]
-            move_vec = np.array([dx, dy]) / (np.hypot(dx, dy) + 1e-6)
+            dist = np.hypot(dx, dy)
+            move_vec = np.array([dx, dy]) / (dist + 1e-6)
             assist = np.dot(move_vec, np.array([u[i,j], v[i,j]]))
-            return np.hypot(dx, dy) * (1 - 0.7 * assist)
+            return dist * (1 - 0.7 * assist)
 
         open_set = []
         heapq.heappush(open_set, (0, start_idx))
@@ -117,18 +126,18 @@ if lat is not None:
             brg_val = f"{calc_bearing((lat[path[0][0]], lon[path[0][1]]), (lat[path[1][0]], lon[path[1][1]])):.1f}°"
             eta = dist_km / (15.0 * 1.852)
             fuel_bonus = 12.8
+    elif run_btn:
+        st.error("❌ 無法計算：請確保起點與終點皆在海上。")
 
     # ===============================
-    # 4. 儀表板排版修正
+    # 4. 儀表板排版 (依照前次需求調整)
     # ===============================
-    # 第一行：四個核心指標
     r1 = st.columns(4)
     r1[0].metric("🚀 航速", "15.0 kn")
     r1[1].metric("⛽ 省油效益", f"{fuel_bonus:.1f}%")
     r1[2].metric("📡 衛星", "36 Pcs")
     r1[3].metric("🧭 建議航向", brg_val)
 
-    # 第二行：時間與距離資訊 (寬度調整為 1:1:2)
     r2 = st.columns([1, 1, 2])
     r2[0].metric("📏 預計距離", f"{dist_km:.1f} km")
     r2[1].metric("🕒 預計時間", f"{eta:.1f} hr")
@@ -136,20 +145,26 @@ if lat is not None:
     st.markdown("---")
 
     # ===============================
-    # 5. 繪圖 (無虛線)
+    # 5. 視覺化 (縮小路徑與點，終點改星星)
     # ===============================
     fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([118.5, 123.5, 21.0, 26.5])
     
-    # 繪製流速背景
-    mesh = ax.pcolormesh(lon, lat, speed_grid, cmap='YlGn', alpha=0.8, zorder=0)
+    ax.pcolormesh(lon, lat, speed_grid, cmap='YlGn', alpha=0.8, zorder=0)
     ax.add_feature(cfeature.LAND, facecolor='#2c2c2c', zorder=2)
     ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1.2, zorder=3)
-    ax.quiver(LON[::6, ::6], LAT[::6, ::6], u[::6, ::6], v[::6, ::6], color='cyan', alpha=0.3, scale=20, zorder=4)
+    ax.quiver(LON[::6, ::6], LAT[::6, ::6], u[::6, ::6], v[::6, ::6], color='cyan', alpha=0.2, scale=20, zorder=4)
 
+    # 繪製路徑
     if path:
         py, px = [lat[p[0]] for p in path], [lon[p[1]] for p in path]
-        ax.plot(px, py, color='#FF00FF', linewidth=4, zorder=5) # 僅紫色路徑
-        ax.scatter([s_lon, e_lon], [s_lat, e_lat], color=['lime', 'yellow'], s=150, zorder=6)
+        # 路徑稍微變細 (linewidth=2.5)
+        ax.plot(px, py, color='#FF00FF', linewidth=2.5, zorder=5) 
+        
+        # 起點：圓點 (s=80)
+        ax.scatter(s_lon, s_lat, color='lime', s=80, edgecolors='black', zorder=6) 
+        
+        # 終點：星星 (marker='*', s=180 比例放大)
+        ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=180, edgecolors='black', zorder=6)
 
     st.pyplot(fig)
