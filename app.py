@@ -49,7 +49,7 @@ def haversine(lat1, lon1, lat2, lon2):
 # 2. 系統 UI 與定位功能
 # ===============================
 st.set_page_config(layout="wide", page_title="HELIOS V6 Flagship")
-st.title("🛰️ HELIOS 智慧航行系統 (旗艦通訊版)")
+st.title("🛰️ HELIOS 智慧航行系統")
 
 lat, lon, u_4d, v_4d, ocean_time = get_v6_data()
 
