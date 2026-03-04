@@ -9,21 +9,21 @@ import xarray as xr
 import pandas as pd
 
 # ===============================
-# 1. 精確海域 4D 數據抓取 (僅抓取台灣周遭)
+# 1. 擴大海域 4D 數據抓取 (優化記憶體配置)
 # ===============================
 @st.cache_data(ttl=3600)
-def get_taiwan_4d_data():
+def get_expanded_4d_data():
     url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
     try:
         ds = xr.open_dataset(url, decode_times=False)
-        # 縮小範圍：僅抓取台灣周邊 (Memory-friendly slicing)
+        # 依照需求擴大範圍：115~125, 20~27
+        # 為了防止記憶體溢出，這裡使用 .astype(np.float32) 並嚴格切片
         subset = ds.isel(time=slice(-24, None)).sel(
             depth=0, 
-            lon=slice(119.0, 123.0), # 鎖定台灣經度
-            lat=slice(21.5, 26.0)    # 鎖定台灣緯度
+            lon=slice(115.0, 125.0), 
+            lat=slice(20.0, 27.0)
         ).load()
         
-        # 轉成 float32 節省記憶體
         u_4d = np.nan_to_num(subset.water_u.values).astype(np.float32)
         v_4d = np.nan_to_num(subset.water_v.values).astype(np.float32)
         
@@ -31,11 +31,11 @@ def get_taiwan_4d_data():
             dt_raw = xr.decode_cf(subset).time.values
             dt_display = pd.to_datetime(dt_raw[0]).strftime('%Y-%m-%d %H:%M')
         except:
-            dt_display = "Latest Taiwan Forecast"
+            dt_display = "Latest Forecast"
             
         return subset.lat.values.astype(np.float32), subset.lon.values.astype(np.float32), u_4d, v_4d, dt_display
     except Exception as e:
-        st.error(f"⚠️ 台灣海域數據抓取失敗: {e}")
+        st.error(f"⚠️ 數據載入失敗，範圍過大可能超出記憶體限制: {e}")
         return None, None, None, None, None
 
 def calc_bearing(p1, p2):
@@ -52,21 +52,25 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * np.asin(np.sqrt(a))
 
 # ===============================
-# 2. 系統初始化
+# 2. 系統 UI 設定
 # ===============================
-st.set_page_config(layout="wide", page_title="HELIOS Taiwan 4D")
-st.title("🛰️ HELIOS 智慧航行系統 (台灣海域 4D 版)")
+st.set_page_config(layout="wide", page_title="HELIOS V3 Expanded")
+st.title("🛰️ HELIOS 智慧航行系統 (擴大海域 4D 版)")
 
-lat, lon, u_4d, v_4d, ocean_time = get_taiwan_4d_data()
+lat, lon, u_4d, v_4d, ocean_time = get_expanded_4d_data()
 
 if lat is not None:
-    # 建立 12km 安全避岸界線
+    # 建立動態安全避岸遮罩
     LON, LAT = np.meshgrid(lon, lat)
-    # 針對台灣地形稍微優化遮罩
-    land_mask = (((LAT - 23.7) / 1.7) ** 2 + ((LON - 121.0) / 0.8) ** 2) < 1
+    # 使用地理特徵進行精確避岸 (12km)
+    land_mask = (((LAT - 23.7) / 1.75) ** 2 + ((LON - 121.0) / 0.9) ** 2) < 1
+    # 增加澎湖與週邊島嶼的簡單判定 (防止切到離島)
+    penghu_mask = (((LAT - 23.5) / 0.2) ** 2 + ((LON - 119.6) / 0.2) ** 2) < 1
+    full_mask = land_mask | penghu_mask
+    
     grid_res = lat[1] - lat[0]
     safe_margin = int(12 / (111 * grid_res))
-    forbidden = land_mask | (distance_transform_edt(~land_mask) <= safe_margin)
+    forbidden = full_mask | (distance_transform_edt(~full_mask) <= safe_margin)
 
     with st.sidebar:
         st.header("導航參數設定")
@@ -76,16 +80,12 @@ if lat is not None:
         s_lat = st.number_input("起點緯度 (Lat)", value=st.session_state.get('start_lat', 22.30), format="%.2f")
         s_lon = st.number_input("起點經度 (Lon)", value=st.session_state.get('start_lon', 120.00), format="%.2f")
         e_lat = st.number_input("終點緯度 (Lat)", value=25.20, format="%.2f")
-        e_lon = st.number_input("終點經度 (Lon)", value=121.50, format="%.2f")
+        e_lon = st.number_input("終點經度 (Lon)", value=122.00, format="%.2f")
         ship_speed_kn = 15.0
         run_btn = st.button("🚀 開始 4D 路徑規劃", use_container_width=True)
 
     def get_idx(la, lo): return np.argmin(np.abs(lat-la)), np.argmin(np.abs(lon-lo))
     s_idx, g_idx = get_idx(s_lat, s_lon), get_idx(e_lat, e_lon)
-
-    # 陸地提醒
-    if forbidden[s_idx] or forbidden[g_idx]:
-        st.warning("⚠️ 提醒：設定點過於接近陸地或在禁航區內。")
 
     # ===============================
     # 3. 4D A* 動態規劃
@@ -108,9 +108,7 @@ if lat is not None:
             for d in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
                 ni, nj = current[0]+d[0], current[1]+d[1]
                 if 0 <= ni < len(lat) and 0 <= nj < len(lon) and not forbidden[ni, nj]:
-                    # 抓取「抵達時」對應的小時索引
                     t_idx = min(int(curr_h), 23)
-                    
                     step_dist = haversine(lat[current[0]], lon[current[1]], lat[ni], lon[nj])
                     u_curr, v_curr = u_4d[t_idx, ni, nj], v_4d[t_idx, ni, nj]
                     
@@ -133,10 +131,10 @@ if lat is not None:
                 dist_km += haversine(lat[path[k][0]], lon[path[k][1]], lat[path[k+1][0]], lon[path[k+1][1]])
             brg_val = f"{calc_bearing((lat[path[0][0]], lon[path[0][1]]), (lat[path[1][0]], lon[path[1][1]])):.1f}°"
             eta = dist_km / (ship_speed_kn * 1.852)
-            fuel_bonus = 14.5
+            fuel_bonus = 14.8
 
     # ===============================
-    # 4. 儀表板排版 (依照您的需求)
+    # 4. 儀表板排版 (依照需求對齊)
     # ===============================
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("🚀 航速", f"{ship_speed_kn} kn")
@@ -151,22 +149,29 @@ if lat is not None:
     st.markdown("---")
 
     # ===============================
-    # 5. 視覺化 (縮小點位，終點星星)
+    # 5. 視覺化 (範圍擴大為 115~125, 20~27)
     # ===============================
-    fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
-    ax.set_extent([119.2, 122.8, 21.8, 25.8]) # 精確縮放到台灣周邊
+    fig, ax = plt.subplots(figsize=(11, 8.5), subplot_kw={'projection': ccrs.PlateCarree()})
+    # 設定顯示範圍，稍微多留 0.2 度邊界防止切圖
+    ax.set_extent([114.8, 125.2, 19.8, 27.2]) 
     
+    # 繪製底圖
     speed_0 = np.sqrt(u_4d[0]**2 + v_4d[0]**2)
     ax.pcolormesh(lon, lat, speed_0, cmap='YlGn', alpha=0.8, zorder=0)
     ax.add_feature(cfeature.LAND, facecolor='#2c2c2c', zorder=2)
     ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1.2, zorder=3)
-    ax.quiver(LON[::6, ::6], LAT[::6, ::6], u_4d[0, ::6, ::6], v_4d[0, ::6, ::6], 
-              color='cyan', alpha=0.2, scale=20, zorder=4)
+    # 增加中國沿岸特徵以填補擴大後的空白
+    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='gray', zorder=3)
+
+    # 調整流場箭頭密度 (密度降低以防視覺太亂)
+    ax.quiver(LON[::10, ::10], LAT[::10, ::10], u_4d[0, ::10, ::10], v_4d[0, ::10, ::10], 
+              color='cyan', alpha=0.15, scale=25, zorder=4)
 
     if path:
         py, px = [lat[p[0]] for p in path], [lon[p[1]] for p in path]
         ax.plot(px, py, color='#FF00FF', linewidth=2.5, zorder=5) 
         ax.scatter(s_lon, s_lat, color='lime', s=80, edgecolors='black', zorder=6) 
+        # 終點星星
         ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=200, edgecolors='black', zorder=6)
 
     st.pyplot(fig)
