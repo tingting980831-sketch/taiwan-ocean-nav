@@ -5,7 +5,6 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from scipy.ndimage import distance_transform_edt
 import heapq
-import time
 import xarray as xr
 import pandas as pd
 
@@ -27,7 +26,7 @@ def get_hycom_data():
             dt = "Latest Forecast (Live)"
         return subset.lat.values, subset.lon.values, u, v, speed_grid, dt
     except Exception as e:
-        st.error(f"⚠️ 連線失敗: {e}")
+        st.error(f"⚠️ HYCOM 連線失敗: {e}")
         return None, None, None, None, None, None
 
 def calc_bearing(p1, p2):
@@ -53,26 +52,30 @@ st.title("🛰️ HELIOS 智慧航行系統")
 lat, lon, u, v, speed_grid, ocean_time = get_hycom_data()
 
 if lat is not None:
-    # --- 核心更新：精準避岸演算法 ---
+    # --- 避岸演算法準備 ---
     LON, LAT = np.meshgrid(lon, lat)
-    # 建立台灣陸地精細遮罩 (橢圓半徑稍微外擴)
     land_mask = (((LAT - 23.7) / 1.65) ** 2 + ((LON - 121.0) / 0.85) ** 2) < 1
-    
-    # 設置 8 公里緩衝 (5km + 3km 容錯)
     grid_dist_km = 111 * (lat[1] - lat[0]) 
-    safe_buffer_cells = int(8 / grid_dist_km) 
-    
-    # 計算離岸距離並生成禁航區
+    safe_buffer_cells = int(8 / grid_dist_km) # 設置 8 公里緩衝
     dist_map = distance_transform_edt(~land_mask)
     forbidden = land_mask | (dist_map <= safe_buffer_cells)
 
-    # --- 側邊欄 ---
+    # --- 側邊欄：加入立即定位功能 ---
     with st.sidebar:
         st.header("Navigation Parameters")
-        s_lat = st.number_input("Start Lat", value=22.30, step=0.05, format="%.2f")
-        s_lon = st.number_input("Start Lon", value=120.00, step=0.05, format="%.2f")
+        
+        # 立即定位按鈕邏輯
+        if st.button("📍 使用當前位置 (GPS)", use_container_width=True):
+            st.session_state.start_lat = 22.35 # 模擬當前 GPS 緯度
+            st.session_state.start_lon = 120.10 # 模擬當前 GPS 經度
+            st.success("已鎖定當前座標")
+        
+        # 使用 session_state 保持定位後的數值
+        s_lat = st.number_input("Start Lat", value=st.session_state.get('start_lat', 22.30), step=0.05, format="%.2f")
+        s_lon = st.number_input("Start Lon", value=st.session_state.get('start_lon', 120.00), step=0.05, format="%.2f")
         e_lat = st.number_input("End Lat", value=25.20, step=0.05, format="%.2f")
         e_lon = st.number_input("End Lon", value=122.00, step=0.05, format="%.2f")
+        
         ship_speed_kn = 15.0 
         run_btn = st.button("🚀 Calculate Optimized Route", use_container_width=True)
 
@@ -80,7 +83,7 @@ if lat is not None:
     start_idx, goal_idx = get_idx(s_lat, s_lon), get_idx(e_lat, e_lon)
 
     # ===============================
-    # 3. A* 演算法執行 (移除虛線邏輯)
+    # 3. A* 演算法執行
     # ===============================
     path, dist_km, fuel_bonus, eta, brg_val = None, 0.0, 0.0, 0.0, "---"
 
@@ -123,13 +126,12 @@ if lat is not None:
             fuel_bonus = 12.8
 
     # ===============================
-    # 4. 儀表板
+    # 4. 儀表板 (已移除流場狀態)
     # ===============================
-    r1 = st.columns(4)
+    r1 = st.columns(3) # 改為 3 列
     r1[0].metric("🚀 航速", f"{ship_speed_kn:.1f} kn")
     r1[1].metric("⛽ 省油效益", f"{fuel_bonus:.1f}%")
     r1[2].metric("📡 衛星", "36 Pcs")
-    r1[3].metric("🌊 流場狀態", "良好")
 
     r2 = st.columns(4)
     r2[0].metric("🧭 建議航向", brg_val)
@@ -139,22 +141,18 @@ if lat is not None:
     st.markdown("---")
 
     # ===============================
-    # 5. 視覺化 (純化：移除虛線)
+    # 5. 視覺化 (僅保留紫色優化線)
     # ===============================
     fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([118.5, 123.5, 21.0, 26.5])
     
-    # 流速強度底圖 (綠色色階)
+    # 綠色流速底圖
     mesh = ax.pcolormesh(lon, lat, speed_grid, cmap='YlGn', alpha=0.8, zorder=0)
-    
-    # 陸地與海岸線
     ax.add_feature(cfeature.LAND, facecolor='#2c2c2c', zorder=2)
     ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1.5, zorder=3)
-    
-    # 海流箭頭
     ax.quiver(LON[::6, ::6], LAT[::6, ::6], u[::6, ::6], v[::6, ::6], color='cyan', alpha=0.3, scale=20, zorder=4)
 
-    # 繪製路徑 (僅保留紫色實線)
+    # 繪製路徑 (無虛線)
     if path:
         py, px = [lat[p[0]] for p in path], [lon[p[1]] for p in path]
         ax.plot(px, py, color='#FF00FF', linewidth=4, label='AI Optimized Path', zorder=5)
