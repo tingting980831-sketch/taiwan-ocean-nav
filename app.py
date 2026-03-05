@@ -7,119 +7,165 @@ import heapq
 import xarray as xr
 import pandas as pd
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # ===============================
-# 1. 自動時間對接邏輯
+# 1. 核心自動數據引擎 (無時間手動選項)
 # ===============================
-def get_nearest_t_step():
-    """根據現在 UTC 時間，計算對應的 HYCOM 預報時段 (0, 3, 6...21)"""
-    # 假設檔案基準時間是 2024-03-06 12:00 UTC (根據您的檔名)
+def get_auto_t_step():
+    """自動計算最接近當前 UTC 的預報時段 (t000-t021)"""
+    # 檔案基準為 2024-03-06 12:00 UTC (您的資料夾日期)
     base_time = datetime(2024, 3, 6, 12, tzinfo=timezone.utc)
-    now_utc = datetime.now(timezone.utc)
+    # 這裡我們模擬現在的時間，或者使用 datetime.now(timezone.utc)
+    # 為了讓您的 2024 資料能跑，我們計算相對小時差
+    now = datetime.now(timezone.utc)
+    diff_hours = (now - base_time).total_seconds() / 3600
     
-    # 計算小時差
-    diff_hours = (now_utc - base_time).total_seconds() / 3600
-    
-    # 找出最接近的 3 小時間隔 (0, 3, 6, 9, 12, 15, 18, 21)
-    available_steps = np.array([0, 3, 6, 9, 12, 15, 18, 21])
-    nearest_val = available_steps[np.argmin(np.abs(available_steps - diff_hours))]
-    
-    return f"t{nearest_val:03d}"
+    available = np.array([0, 3, 6, 9, 12, 15, 18, 21])
+    # 限制在 t000-t021 範圍內
+    nearest = available[np.argmin(np.abs(available - diff_hours))]
+    return f"t{max(0, min(21, nearest)):03d}"
 
 @st.cache_data
-def get_local_hycom_data(t_str):
+def load_hycom_auto():
+    t_str = get_auto_t_step()
     base_dir = Path(r"C:\NODASS\HYCOM\2024\03")
     file_name = f"hycom_glby_930_2024030612_{t_str}_uv3z_subscene.nc"
     full_path = base_dir / file_name
     
     if not full_path.exists():
-        return None, None, None, None, None
+        return None, None, None, None, f"找不到對應時段檔案: {t_str}"
+
     try:
         ds = xr.open_dataset(full_path, engine="netcdf4")
         subset = ds.isel(depth=0).sel(lon=slice(117.0, 125.0), lat=slice(20.0, 27.0)).load()
-        u_val = np.nan_to_num(subset.water_u.values[0]).astype(np.float32)
-        v_val = np.nan_to_num(subset.water_v.values[0]).astype(np.float32)
-        data_time = pd.to_datetime(subset.time.values[0]).strftime('%Y-%m-%d %H:%M')
-        return subset.lat.values, subset.lon.values, u_val, v_val, data_time
+        u = np.nan_to_num(subset.water_u.values[0]).astype(np.float32)
+        v = np.nan_to_num(subset.water_v.values[0]).astype(np.float32)
+        return subset.lat.values, subset.lon.values, u, v, t_str
     except:
-        return None, None, None, None, None
+        return None, None, None, None, "讀取錯誤"
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat, dlon = np.radians(lat2 - lat1), np.radians(lon2 - lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
+    return R * 2 * np.asin(np.sqrt(a))
 
 # ===============================
-# 2. 導航核心與模擬器
+# 2. 介面與動態 Session 設定
 # ===============================
-st.set_page_config(layout="wide", page_title="HELIOS V22 Dynamic Sim")
-st.title("🛰️ HELIOS 智慧導航系統 (自動時間對接 + 動態模擬)")
+st.set_page_config(layout="wide", page_title="HELIOS V23 Full Auto")
+st.title("🛰️ HELIOS 智慧導航模擬器 (全自動時間對接)")
 
-# 初始化 Session State 用於模擬下一步
-if 'current_step_idx' not in st.session_state:
-    st.session_state.current_step_idx = 0
-if 'sim_lat' not in st.session_state:
-    st.session_state.sim_lat = 22.35
-if 'sim_lon' not in st.session_state:
-    st.session_state.sim_lon = 120.10
+if 'ship_pos' not in st.session_state:
+    st.session_state.ship_pos = [22.35, 120.10] # [lat, lon]
+
+# 自動載入資料 (不顯示時間選擇器)
+lat, lon, u_2d, v_2d, current_t = load_hycom_auto()
 
 with st.sidebar:
-    st.header("🕒 時間狀態")
-    auto_t = get_nearest_t_step()
-    # 允許手動覆蓋或使用自動
-    use_auto = st.toggle("自動對接當前時段", value=True)
-    t_step = auto_t if use_auto else st.selectbox("手動選擇時段", ["t000", "t003", "t006", "t009", "t012", "t015", "t018", "t021"])
+    st.header("📍 任務導航")
+    # 顯示目前位置 (不可手動輸入，由模擬控制)
+    st.write(f"當前座標: `{st.session_state.ship_pos[0]:.4f}, {st.session_state.ship_pos[1]:.4f}`")
+    
+    e_lat = st.number_input("終點緯度", value=25.20)
+    e_lon = st.number_input("終點經度", value=122.00)
+    base_speed = st.slider("航速 (kn)", 10, 30, 15)
     
     st.divider()
-    st.header("📍 航行模擬控制")
-    # 起點會隨模擬更新
-    s_lat = st.number_input("當前緯度", value=st.session_state.sim_lat, format="%.4f")
-    s_lon = st.number_input("當前經度", value=st.session_state.sim_lon, format="%.4f")
-    e_lat = st.number_input("終點緯度", value=25.20, format="%.2f")
-    e_lon = st.number_input("終點經度", value=122.00, format="%.2f")
+    col1, col2 = st.columns(2)
+    run_plan = col1.button("🚀 規劃全路徑", use_container_width=True)
+    next_sim = col2.button("⏭️ 模擬下一步", use_container_width=True)
     
-    col_sim1, col_sim2 = st.columns(2)
-    run_btn = col_sim1.button("🚀 規劃全航程")
-    next_btn = col_sim2.button("⏭️ 模擬下一步")
-    
-    if st.button("🔄 重設航程"):
-        st.session_state.sim_lat = 22.35
-        st.session_state.sim_lon = 120.10
+    if st.button("🔄 重設起點", use_container_width=True):
+        st.session_state.ship_pos = [22.35, 120.10]
         st.rerun()
 
-# 數據加載
-lat, lon, u_2d, v_2d, data_time_label = get_local_hycom_data(t_step)
-
+# ===============================
+# 3. 模擬下一步邏輯
+# ===============================
 if lat is not None:
-    # 陸地遮罩 (包含大陸與台灣)
+    # 建立避讓遮罩 (大陸、台灣、澎湖)
     LON, LAT = np.meshgrid(lon, lat)
     forbidden = ((((LAT - 23.7) / 1.75) ** 2 + ((LON - 121.0) / 0.85) ** 2) < 1) | \
                 ((((LAT - 23.5) / 0.25) ** 2 + ((LON - 119.6) / 0.25) ** 2) < 1) | \
                 (LAT > (1.0 * LON - 93.5))
 
     def get_idx(la, lo): return np.argmin(np.abs(lat-la)), np.argmin(np.abs(lon-lo))
-    
-    # 模擬下一步的邏輯
-    if next_btn:
-        # 取得當前位置的流速
-        curr_i, curr_j = get_idx(st.session_state.sim_lat, st.session_state.sim_lon)
-        u_f, v_f = u_2d[curr_i, curr_j], v_2d[curr_i, curr_j]
-        
-        # 假設前進 3 小時 (10800秒)，航速 15 節 (~7.7 m/s)
-        # 簡單推算下一步位置 (度)
-        dt = 10800 
-        ship_speed_mps = 15 * 0.514
-        # 朝向終點的方向向量
-        dist_total = np.hypot(e_lon - s_lon, e_lat - s_lat)
-        dir_lon, dir_lat = (e_lon - s_lon)/dist_total, (e_lat - s_lat)/dist_total
-        
-        # 合成速度 = 船速 + 海流
-        new_lon = st.session_state.sim_lon + (dir_lon * ship_speed_mps + u_f) * dt / 111000
-        new_lat = st.session_state.sim_lat + (dir_lat * ship_speed_mps + v_f) * dt / 111000
-        
-        st.session_state.sim_lat = new_lat
-        st.session_state.sim_lon = new_lon
-        st.toast(f"已前進至下一時段位置: {new_lat:.2f}, {new_lon:.2f}")
-        st.rerun()
 
-    # (這裡插入 A* 演算法與繪圖程式碼，同前一版本 V21.1)
-    # ... A* 演算法 ...
+    if next_sim:
+        curr_lat, curr_lon = st.session_state.ship_pos
+        i, j = get_idx(curr_lat, curr_lon)
+        
+        # 物理計算：下一步位置 = 當前位置 + (合成向量 * 時間步長)
+        dt = 3600 * 3 # 模擬前進 3 小時
+        ship_speed_ms = base_speed * 0.5144
+        
+        # 方向向量指向終點
+        dy, dx = e_lat - curr_lat, e_lon - curr_lon
+        mag = np.hypot(dx, dy)
+        new_lat = curr_lat + ((dy/mag * ship_speed_ms + v_2d[i, j]) * dt) / 111000
+        new_lon = curr_lon + ((dx/mag * ship_speed_ms + u_2d[i, j]) * dt) / 111000
+        
+        # 檢查是否撞陸地
+        ni, nj = get_idx(new_lat, new_lon)
+        if forbidden[ni, nj]:
+            st.error("❌ 下一步將進入陸地或禁航區，模擬停止！")
+        else:
+            st.session_state.ship_pos = [new_lat, new_lon]
+            st.rerun()
+
+    # ===============================
+    # 4. A* 路徑規劃
+    # ===============================
+    path = None
+    if run_plan:
+        s_idx = get_idx(st.session_state.ship_pos[0], st.session_state.ship_pos[1])
+        g_idx = get_idx(e_lat, e_lon)
+        
+        open_set, came_from, g_score = [], {}, {s_idx: 0.0}
+        heapq.heappush(open_set, (0, s_idx))
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            if current == g_idx:
+                path = []
+                while current in came_from:
+                    path.append(current); current = came_from[current]
+                path = path[::-1]; break
+            for d in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
+                ni, nj = current[0]+d[0], current[1]+d[1]
+                if 0 <= ni < len(lat) and 0 <= nj < len(lon) and not forbidden[ni, nj]:
+                    step_d = haversine(lat[current[0]], lon[current[1]], lat[ni], lon[nj])
+                    cost = step_d * (1 - 0.7 * np.dot([lon[nj]-lon[current[1]], lat[ni]-lat[current[0]]], [u_2d[ni, nj], v_2d[ni, nj]]))
+                    tg = g_score[current] + cost
+                    if (ni, nj) not in g_score or tg < g_score[(ni, nj)]:
+                        came_from[(ni, nj)] = current
+                        g_score[(ni, nj)] = tg
+                        heapq.heappush(open_set, (tg + np.hypot(ni-g_idx[0], nj-g_idx[1]), (ni, nj)))
+
+    # ===============================
+    # 5. 地圖展示
+    # ===============================
+    st.info(f"⚡ 自動同步時段: **{current_t.upper()}** | 位置更新時間: {datetime.now().strftime('%H:%M:%S')}")
     
-    st.info(f"✅ 系統自動對接預報時段: **{t_step.upper()}** | 數據基準時間: {data_time_label}")
-    # 顯示地圖與路徑
+    fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': ccrs.PlateCarree()})
+    ax.set_extent([117.2, 124.8, 20.2, 26.8])
+    
+    # 繪製流速與陸地
+    speed = np.sqrt(u_2d**2 + v_2d**2)
+    ax.pcolormesh(lon, lat, speed, cmap='turbo', alpha=0.7, shading='auto')
+    ax.add_feature(cfeature.LAND, facecolor='#121212', zorder=5)
+    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1, zorder=6)
+    
+    # 標記當前船隻位置
+    ax.scatter(st.session_state.ship_pos[1], st.session_state.ship_pos[0], color='lime', s=150, edgecolors='black', zorder=10, label='當前船位')
+    ax.scatter(e_lon, e_lat, color='red', marker='X', s=200, zorder=10, label='目的地')
+
+    if path:
+        py, px = [lat[p[0]] for p in path], [lon[p[1]] for p in path]
+        ax.plot(px, py, color='#FF00FF', linewidth=3, zorder=9, label='最優路徑')
+    
+    ax.legend(loc='lower right')
+    st.pyplot(fig)
+else:
+    st.error("無法加載資料，請檢查硬碟路徑。")
