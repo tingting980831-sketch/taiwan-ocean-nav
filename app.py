@@ -145,8 +145,7 @@ if lat is not None:
     c2.metric("🌊 流場狀態", "HYCOM 4D Active")
     np.random.seed(int(s_lat + s_lon))
     visible_sats = np.random.randint(4, 10)
-    c3.metric("📡 衛星連線", f"Active ({visible_sats}/72)") 
-    c4.metric("🚢 航行模式", "恆定 100% 輸出")
+    c3.metric("📡 衛星連線", f"Active ({visible_sats}/15)") 
 
     c5, c6, c7 = st.columns([1, 1, 2])
     # 僅顯示數值，移除省時省油對比
@@ -160,7 +159,6 @@ if lat is not None:
     c5.metric("📏 航行距離", f"{dist_km:.1f} km")
     c6.metric("🕒 預計到達時間", f"{eta:.1f} hr")
     c7.metric("🕒 系統核心", "72 LEO Constellation / ISL Mode")
-    st.caption(f"數據同步時間: {ocean_time}")
     st.markdown("---")
 
     # ===============================
