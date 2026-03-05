@@ -9,7 +9,6 @@ import xarray as xr
 # ===============================
 # 1. 讀取 HYCOM 即時流場
 # ===============================
-
 @st.cache_data(ttl=600)
 def load_hycom():
     url = "https://tds.hycom.org/thredds/dodsC/FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd"
@@ -69,7 +68,7 @@ def astar(start, goal, lat, lon, u, v, forbidden):
                 continue
 
             dist = haversine(lat[current[0]], lon[current[1]], lat[ni], lon[nj])
-            # 目前只用距離作 cost，不計算順流
+            # 只用距離作 cost
             tentative = g[current]+dist
 
             if (ni,nj) not in g or tentative<g[(ni,nj)]:
@@ -88,9 +87,8 @@ st.title("HELIOS 即時海象導航系統 (流線 + 航線)")
 lat, lon, u, v, time_label = load_hycom()
 st.success(f"HYCOM 最新資料時間: {time_label}")
 
-LON, LAT = np.meshgrid(lon, lat)
-
 # 建立台灣與澎湖避開區
+LON, LAT = np.meshgrid(lon, lat)  # 2D 確保 pcolormesh 可以用
 mask_tw = (((LAT-23.75)/1.85)**2 + ((LON-121.0)/0.75)**2) < 1
 mask_is = (((LAT-23.5)/0.3)**2 + ((LON-119.6)/0.3)**2) < 1
 forbidden = mask_tw | mask_is
@@ -126,10 +124,11 @@ ax.set_extent([117.2,124.8,20.2,26.8])
 
 # 流速熱圖
 speed = np.sqrt(u**2 + v**2)
-mesh = ax.pcolormesh(lon, lat, speed, cmap="turbo", shading="auto", alpha=0.8)
+mesh = ax.pcolormesh(LON, LAT, speed, cmap="turbo", shading="auto", alpha=0.8, zorder=0)
 
 # 流線
-ax.streamplot(lon, lat, u, v, density=2, color=speed, linewidth=1, cmap="viridis", transform=ccrs.PlateCarree(), zorder=3)
+ax.streamplot(LON, LAT, u, v, density=2, color=speed, linewidth=1, cmap="viridis",
+              transform=ccrs.PlateCarree(), zorder=3)
 
 # 地形
 ax.add_feature(cfeature.LAND, facecolor="black")
