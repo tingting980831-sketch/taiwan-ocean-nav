@@ -118,4 +118,4 @@ if lat is not None:
     
     st.pyplot(fig)
 else:
-    st.error(f"❌ 找不到 2024030612_{current_t} 的檔案，請檢查 C:\NODASS\HYCOM\2024\03")
+    st.error(f"❌ 找不到 2024030612_{current_t} 的檔案，請檢查 " + r"C:\NODASS\HYCOM\2024\03")
