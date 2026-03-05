@@ -65,8 +65,10 @@ lat, lon, u_2d, v_2d, sync_time_label = get_v12_sync_data()
 if lat is not None:
     # 建立 2D 遮罩 (此版本不使用 4D，改用當前最準確的平面流場)
     LON, LAT = np.meshgrid(lon, lat)
-    forbidden = (((LAT - 23.7) / 1.75) ** 2 + ((LON - 121.0) / 0.85) ** 2) < 1 | \
-                (((LAT - 23.5) / 0.25) ** 2 + ((LON - 119.6) / 0.25) ** 2) < 1
+    # 修正後的遮罩邏輯：明確分開兩個橢圓判斷
+forbidden = ((((LAT - 23.7) / 1.75) ** 2 + ((LON - 121.0) / 0.85) ** 2) < 1) | \
+            ((((LAT - 23.5) / 0.25) ** 2 + ((LON - 119.6) / 0.25) ** 2) < 1)
+
 
     with st.sidebar:
         st.header("📍 導航任務")
