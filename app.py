@@ -158,7 +158,6 @@ if lat is not None:
     
     c5.metric("📏 航行距離", f"{dist_km:.1f} km")
     c6.metric("🕒 預計到達時間", f"{eta:.1f} hr")
-    c7.metric("🕒 系統核心", "72 LEO Constellation / ISL Mode")
     st.markdown("---")
 
     # ===============================
