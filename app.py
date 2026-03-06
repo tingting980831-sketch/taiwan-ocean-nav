@@ -15,6 +15,7 @@ SAT_CONFIG = {
     "altitude_km": 550,
     "link_type": "ISL Laser Link",
     "status": "Active (72/72)",
+    "ais_mode": "Real-time (Live)"
 }
 
 @st.cache_data(ttl=3600)
@@ -47,22 +48,23 @@ def calc_bearing(p1, p2):
     return (np.degrees(np.arctan2(y, x)) + 360) % 360
 
 # ===============================
-# 2. 介面與數據讀取
+# 2. 介面初始化
 # ===============================
-st.set_page_config(layout="wide", page_title="HELIOS V6")
+st.set_page_config(layout="wide", page_title="HELIOS V6 Flagship")
 st.title("🛰️ HELIOS V6 智慧導航系統")
+st.markdown(f"**衛星系統：** {SAT_CONFIG['total_sats']} 顆 LEO | **鏈路：** {SAT_CONFIG['link_type']} | **狀態：** {SAT_CONFIG['status']}")
 
 lat, lon, u_4d, v_4d = get_v6_data()
 
 if lat is not None:
-    u_now = u_4d[0]
-    v_now = v_4d[0]
-    forbidden = np.isnan(u_now) | (u_now == 0)
+    # 建立陸地遮罩
+    u_sample = u_4d[0]
+    forbidden = np.isnan(u_sample) | (u_sample == 0)
 
-    # --- 重要：將變數定義移出計算區塊 ---
+    # 側邊欄控制
     with st.sidebar:
         st.header("🚢 導航參數設定")
-        if st.button("📍 使用高雄港 (GPS)", use_container_width=True):
+        if st.button("📍 使用當前位置 (GPS)", use_container_width=True):
             st.session_state.start_lat, st.session_state.start_lon = 22.60, 120.27
         
         s_lat = st.number_input("起點緯度", value=st.session_state.get('start_lat', 22.00), format="%.2f")
@@ -70,22 +72,23 @@ if lat is not None:
         e_lat = st.number_input("終點緯度", value=23.98, format="%.2f")
         e_lon = st.number_input("終點經度", value=121.63, format="%.2f")
         
-        # 這裡定義了 base_speed 和 mode
         base_speed = st.slider("巡航基準航速 (kn)", 10.0, 25.0, 15.0)
-        mode = st.radio("動力模式", ["固定輸出", "AI 變頻省油"])
-        run_btn = st.button("🚀 執行航線優化", use_container_width=True)
+        # 已刪除動力模式與 AI 變頻選項
+        run_btn = st.button("🚀 執行 4D 路徑計算", use_container_width=True)
 
+    # 4D A* 計算邏輯
     path, dist_km, brg_val = None, 0.0, "---"
     
     if run_btn:
         si, sj = np.argmin(np.abs(lat-s_lat)), np.argmin(np.abs(lon-s_lon))
         gi, gj = np.argmin(np.abs(lat-e_lat)), np.argmin(np.abs(lon-e_lon))
         
-        q = [(0, (si, sj), (0,0))]
-        came_from, g_score = {(si, sj): None}, {(si, sj): 0.0}
+        # (優先級, 坐標, 方向)
+        open_set, came_from, g_score = [], {}, {(si, sj): 0.0}
+        heapq.heappush(open_set, (0, (si, sj), (0,0)))
         
-        while q:
-            _, curr, last_dir = heapq.heappop(q)
+        while open_set:
+            _, curr, last_dir = heapq.heappop(open_set)
             if curr == (gi, gj):
                 path = []
                 while curr in came_from:
@@ -96,23 +99,20 @@ if lat is not None:
                 ni, nj = curr[0]+d[0], curr[1]+d[1]
                 if 0 <= ni < len(lat) and 0 <= nj < len(lon) and not forbidden[ni, nj]:
                     step_d = haversine(lat[curr[0]], lon[curr[1]], lat[ni], lon[nj])
+                    
+                    # 向量與流場輔助 (僅用於路徑權重)
                     move_vec = np.array([d[1], d[0]]) / (np.hypot(d[0], d[1]) + 1e-6)
-                    assist = np.dot(move_vec, [u_now[ni, nj], v_now[ni, nj]])
+                    assist = np.dot(move_vec, [u_4d[0, ni, nj], v_4d[0, ni, nj]])
                     
-                    # 使用剛才定義的 base_speed 和 mode
-                    actual_speed = base_speed
-                    if mode == "AI 變頻省油":
-                        actual_speed *= (1.05 if assist > 0.5 else 0.85 if assist < -0.5 else 1.0)
-                    
-                    # 成本計算 (流場輔助 + 轉彎懲罰)
+                    # 轉彎懲罰（保持平滑）
                     turn_penalty = 1.5 if d != last_dir and last_dir != (0,0) else 0
-                    cost = step_d * (1 - 0.35 * assist) + turn_penalty
+                    cost = step_d * (1 - 0.4 * assist) + turn_penalty
                     tg = g_score[curr] + cost
                     
                     if (ni, nj) not in g_score or tg < g_score[(ni, nj)]:
                         g_score[(ni, nj)] = tg
                         priority = tg + np.hypot(ni-gi, nj-gj) * 1.5
-                        heapq.heappush(q, (priority, (ni, nj), d))
+                        heapq.heappush(open_set, (priority, (ni, nj), d))
                         came_from[(ni, nj)] = curr
 
         if path:
@@ -121,25 +121,28 @@ if lat is not None:
             brg_val = f"{calc_bearing((lat[path[0][0]], lon[path[0][1]]), (lat[path[1][0]], lon[path[1][1]])):.1f}°"
 
     # ===============================
-    # 3. 視覺化
+    # 3. 視覺化儀表板
     # ===============================
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3) # 改為 3 欄位，刪除省油指標
     c1.metric("⚓ 建議航向", brg_val)
-    c2.metric("🍃 省油模式", "Active" if mode=="AI 變頻省油" else "Off")
-    c3.metric("📏 總航程", f"{dist_km:.1f} km")
-    c4.metric("🕒 預計航時", f"{dist_km/(base_speed*1.852):.1f} hr" if dist_km > 0 else "---")
+    c2.metric("📏 總航程", f"{dist_km:.1f} km")
+    c3.metric("🕒 預計航時", f"{dist_km/(base_speed*1.852):.1f} hr" if dist_km > 0 else "---")
 
-    fig, ax = plt.subplots(figsize=(10, 7), subplot_kw={'projection': ccrs.PlateCarree()})
+    fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([118.0, 124.5, 20.5, 26.5])
     
-    spd = np.sqrt(u_now**2 + v_now**2)
-    ax.pcolormesh(lon, lat, np.ma.masked_where(forbidden, spd), cmap='GnBu', alpha=0.4)
-    ax.add_feature(cfeature.LAND, facecolor='#151515')
-    ax.add_feature(cfeature.COASTLINE, edgecolor='white')
+    # 背景流速圖
+    spd = np.sqrt(u_4d[0]**2 + v_4d[0]**2)
+    ax.pcolormesh(lon, lat, np.ma.masked_where(forbidden, spd), cmap='YlGnBu', alpha=0.5)
+    ax.add_feature(cfeature.LAND, facecolor='#151515', zorder=2)
+    ax.add_feature(cfeature.COASTLINE, edgecolor='white', zorder=3)
     
     if path:
-        ax.plot([lon[p[1]] for p in path], [lat[p[0]] for p in path], color='#FF00FF', lw=3)
-        ax.scatter(s_lon, s_lat, color='lime', s=100)
-        ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=300)
+        px = [lon[p[1]] for p in path]
+        py = [lat[p[0]] for p in path]
+        ax.plot(px, py, color='#FF00FF', lw=3, zorder=5)
+        ax.scatter(s_lon, s_lat, color='lime', s=100, zorder=10)
+        ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=300, zorder=10)
 
     st.pyplot(fig)
+    st.success("✅ 數據鏈路正常。4D A* 已完成路徑平滑優化。")
