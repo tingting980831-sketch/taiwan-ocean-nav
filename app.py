@@ -54,7 +54,7 @@ def calc_bearing(p1, p2):
 # 2. 介面初始化
 # ===============================
 st.set_page_config(layout="wide", page_title="HELIOS V6 Flagship")
-st.title("🛰️ HELIOS V6 智慧導航系統 - 旗艦通訊版")
+st.title("🛰️ HELIOS V6 智慧導航系統")
 st.markdown(f"**衛星系統：** {SAT_CONFIG['total_sats']} 顆 LEO | **鏈路：** {SAT_CONFIG['link_type']} | **狀態：** {SAT_CONFIG['status']}")
 
 lat, lon, u_4d, v_4d = get_v6_data()
@@ -75,8 +75,6 @@ if lat is not None:
         e_lat = st.number_input("終點緯度", value=23.98, format="%.2f")
         e_lon = st.number_input("終點經度", value=121.63, format="%.2f")
         
-        base_speed = st.slider("巡航基準航速 (kn)", 10.0, 25.0, 15.0)
-        mode = st.radio("動力模式", ["固定輸出", "AI 變頻省油"])
         run_btn = st.button("🚀 執行 4D 路徑計算", use_container_width=True)
 
     # 4D A* 計算邏輯
@@ -132,7 +130,6 @@ if lat is not None:
     # ===============================
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("⚓ 建議航向", brg_val)
-    c2.metric("🍃 省油效益", f"{fuel_bonus:.1f}%", delta="AI Inverter" if mode=="AI 變頻省油" else None)
     c3.metric("📏 總航程", f"{dist_km:.1f} km")
     c4.metric("🕒 預計航時", f"{dist_km/(base_speed*1.852):.1f} hr" if dist_km > 0 else "---")
 
