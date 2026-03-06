@@ -7,14 +7,14 @@ import heapq
 import xarray as xr
 
 # ===============================
-# 1. 系統核心設定
+# 1. 系統核心設定 (已更新衛星配置)
 # ===============================
 SAT_CONFIG = {
-    "total_sats": 72,
-    "planes": 6,
-    "altitude_km": 550,
+    "total_sats": 12,       # 3面 * 4顆 = 12顆
+    "planes": 3,            # 3個軌道面
+    "altitude_km": 400,     # 軌道高度 400km
     "link_type": "ISL Laser Link",
-    "status": "Active (72/72)",
+    "status": "Active (12/12)",
     "ais_mode": "Real-time (Live)"
 }
 
@@ -52,16 +52,14 @@ def calc_bearing(p1, p2):
 # ===============================
 st.set_page_config(layout="wide", page_title="HELIOS V6 Flagship")
 st.title("🛰️ HELIOS V6 智慧導航系統")
-st.markdown(f"**衛星系統：** {SAT_CONFIG['total_sats']} 顆 LEO | **鏈路：** {SAT_CONFIG['link_type']} | **狀態：** {SAT_CONFIG['status']}")
+st.markdown(f"**衛星系統：** {SAT_CONFIG['total_sats']} 顆 LEO (高度 {SAT_CONFIG['altitude_km']}km) | **軌道配置：** {SAT_CONFIG['planes']} Planes | **狀態：** {SAT_CONFIG['status']}")
 
 lat, lon, u_4d, v_4d = get_v6_data()
 
 if lat is not None:
-    # 建立陸地遮罩
     u_sample = u_4d[0]
     forbidden = np.isnan(u_sample) | (u_sample == 0)
 
-    # 側邊欄控制
     with st.sidebar:
         st.header("🚢 導航參數設定")
         if st.button("📍 使用當前位置 (GPS)", use_container_width=True):
@@ -73,17 +71,14 @@ if lat is not None:
         e_lon = st.number_input("終點經度", value=121.63, format="%.2f")
         
         base_speed = st.slider("巡航基準航速 (kn)", 10.0, 25.0, 15.0)
-        # 已刪除動力模式與 AI 變頻選項
         run_btn = st.button("🚀 執行 4D 路徑計算", use_container_width=True)
 
-    # 4D A* 計算邏輯
     path, dist_km, brg_val = None, 0.0, "---"
     
     if run_btn:
         si, sj = np.argmin(np.abs(lat-s_lat)), np.argmin(np.abs(lon-s_lon))
         gi, gj = np.argmin(np.abs(lat-e_lat)), np.argmin(np.abs(lon-e_lon))
         
-        # (優先級, 坐標, 方向)
         open_set, came_from, g_score = [], {}, {(si, sj): 0.0}
         heapq.heappush(open_set, (0, (si, sj), (0,0)))
         
@@ -99,12 +94,9 @@ if lat is not None:
                 ni, nj = curr[0]+d[0], curr[1]+d[1]
                 if 0 <= ni < len(lat) and 0 <= nj < len(lon) and not forbidden[ni, nj]:
                     step_d = haversine(lat[curr[0]], lon[curr[1]], lat[ni], lon[nj])
-                    
-                    # 向量與流場輔助 (僅用於路徑權重)
                     move_vec = np.array([d[1], d[0]]) / (np.hypot(d[0], d[1]) + 1e-6)
                     assist = np.dot(move_vec, [u_4d[0, ni, nj], v_4d[0, ni, nj]])
                     
-                    # 轉彎懲罰（保持平滑）
                     turn_penalty = 1.5 if d != last_dir and last_dir != (0,0) else 0
                     cost = step_d * (1 - 0.4 * assist) + turn_penalty
                     tg = g_score[curr] + cost
@@ -123,7 +115,7 @@ if lat is not None:
     # ===============================
     # 3. 視覺化儀表板
     # ===============================
-    c1, c2, c3 = st.columns(3) # 改為 3 欄位，刪除省油指標
+    c1, c2, c3 = st.columns(3)
     c1.metric("⚓ 建議航向", brg_val)
     c2.metric("📏 總航程", f"{dist_km:.1f} km")
     c3.metric("🕒 預計航時", f"{dist_km/(base_speed*1.852):.1f} hr" if dist_km > 0 else "---")
@@ -131,7 +123,6 @@ if lat is not None:
     fig, ax = plt.subplots(figsize=(12, 8), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([118.0, 124.5, 20.5, 26.5])
     
-    # 背景流速圖
     spd = np.sqrt(u_4d[0]**2 + v_4d[0]**2)
     ax.pcolormesh(lon, lat, np.ma.masked_where(forbidden, spd), cmap='YlGnBu', alpha=0.5)
     ax.add_feature(cfeature.LAND, facecolor='#151515', zorder=2)
@@ -145,4 +136,4 @@ if lat is not None:
         ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=300, zorder=10)
 
     st.pyplot(fig)
-    st.success("✅ 數據鏈路正常。4D A* 已完成路徑平滑優化。")
+    st.success(f"✅ 衛星鏈路同步完成 (LEO Cluster: {SAT_CONFIG['total_sats']} Nodes)。")
