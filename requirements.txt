@@ -7,3 +7,8 @@ xarray
 netCDF4
 pydap
 cftime
+geopandas
+fiona
+shapely
+pyproj
+rtree
