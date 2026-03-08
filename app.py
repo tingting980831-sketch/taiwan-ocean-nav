@@ -1,103 +1,116 @@
 import streamlit as st
+import xarray as xr
 import numpy as np
 import pandas as pd
-import xarray as xr
 import geopandas as gpd
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from scipy.interpolate import griddata
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import requests
 
-# =============================
-# 1️⃣ Streamlit UI 設定
-# =============================
-st.set_page_config(page_title="智慧海上導航", layout="wide")
-st.title("⚓ 智慧海象導航系統")
+st.set_page_config(layout="wide")
+st.title("⚓ 台灣海域智慧航行整合示意")
 
-# 左側選單
-layer_option = st.sidebar.selectbox("選擇底圖", ["海流流向", "風場", "波高"])
+# ---------------------------
+# 側邊欄選項
+# ---------------------------
+map_type = st.sidebar.selectbox(
+    "選擇底圖",
+    ["海流", "風向", "波高"]
+)
 
-# =============================
-# 2️⃣ 讀取禁航區與離岸風場
-# =============================
+# ---------------------------
+# 1. 禁航區 GeoJSON
+# ---------------------------
+no_go_url = "https://ocean.moi.gov.tw/Map/Achievement/LayerInfo/905?utm_source=chatgpt.com"
 try:
-    no_go_area = gpd.read_file("no_go_area.geojson")
+    no_go = gpd.read_file(no_go_url)
+    st.sidebar.success("禁航區資料載入成功")
 except:
-    st.warning("禁航區資料缺失，暫時不顯示")
-    no_go_area = None
+    no_go = None
+    st.sidebar.warning("禁航區資料缺失，暫時不顯示")
+
+# ---------------------------
+# 2. 離岸風場 GeoJSON
+# ---------------------------
+offshore_wind_url = "https://example.com/offshore_wind.geojson"  # 公開來源替換
+try:
+    wind_farm = gpd.read_file(offshore_wind_url)
+    st.sidebar.success("離岸風場資料載入成功")
+except:
+    wind_farm = None
+    st.sidebar.warning("離岸風場資料缺失，暫時不顯示")
+
+# ---------------------------
+# 3. 即時風速/波高 (CWB OpenData)
+# ---------------------------
+API_KEY = "你的CWB_API_KEY"
+cwb_url = f"https://opendata.cwb.gov.tw/fileapi/v1/opendataapi/O-A0013-001?Authorization={API_KEY}&format=JSON"
 
 try:
-    offshore_wind = gpd.read_file("offshore_wind_area.geojson")
+    r = requests.get(cwb_url, timeout=10)
+    r.raise_for_status()
+    data_json = r.json()
+    records = []
+    for station in data_json['cwbopendata']['dataset']['location']:
+        try:
+            lat = float(station['lat'])
+            lon = float(station['lon'])
+            ws = float(station['weatherElement']['WDSD']['value'])
+            wd = float(station['weatherElement']['WDIR']['value'])
+            swh = float(station['weatherElement']['WVHT']['value'])
+            records.append([station['stationName'], lat, lon, ws, wd, swh])
+        except:
+            continue
+    df_cwb = pd.DataFrame(records, columns=['Station','Lat','Lon','WindSpeed','WindDir','WaveHeight'])
+    df_cwb['Wind_u'] = df_cwb['WindSpeed'] * np.sin(np.deg2rad(df_cwb['WindDir']))
+    df_cwb['Wind_v'] = df_cwb['WindSpeed'] * np.cos(np.deg2rad(df_cwb['WindDir']))
 except:
-    st.warning("離岸風場資料缺失，暫時不顯示")
-    offshore_wind = None
+    df_cwb = None
+    st.sidebar.warning("CWB 即時風場資料抓取失敗")
 
-# =============================
-# 3️⃣ 抓取 CWB 即時海象資料
-# =============================
-# 這裡示範用 HTML 表格抓取龍洞測站資料
-url = "https://www.cwb.gov.tw/V8/C/W/OBS_Ocean/ObsOcean_Station.html"
-tables = pd.read_html(url)
-ocean_table = tables[0]
-ocean_table = ocean_table.rename(columns=lambda x: x.strip())
-df = ocean_table[['測站', '緯度', '經度', '浪高(m)', '風力 (m/s) (級)', '海流流向', '流速 (m/s) (節)']]
-df = df.replace('-', np.nan).dropna(subset=['緯度', '經度'])
+# ---------------------------
+# 4. 海流 (HYCOM)
+# ---------------------------
+hycom_file = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/2026/03/09/ocean_his_000_20260309_0000.nc"
+try:
+    ds = xr.open_dataset(hycom_file)
+    u = ds["u"][-1,:,:].values
+    v = ds["v"][-1,:,:].values
+    lons = ds["lon"][:].values
+    lats = ds["lat"][:].values
+except:
+    u = v = lons = lats = None
+    st.sidebar.warning("HYCOM 海流資料抓取失敗")
 
-# 轉風速風向為 u,v
-def wind_dir_to_uv(direction, speed):
-    dir_map = {
-        "北": 0, "北北東": 22.5, "北東": 45, "東北東": 67.5, "東": 90, "東南東": 112.5,
-        "南東": 135, "南南東": 157.5, "南": 180, "南南西": 202.5, "南西": 225, "西南西": 247.5,
-        "西": 270, "西北西": 292.5, "北西": 315, "北北西": 337.5
-    }
-    angle = dir_map.get(direction, 0) * np.pi / 180
-    u = speed * np.sin(angle)
-    v = speed * np.cos(angle)
-    return u, v
+# ---------------------------
+# 5. 繪圖
+# ---------------------------
+fig = plt.figure(figsize=(12,8))
+ax = plt.axes(projection=ccrs.PlateCarree())
+ax.set_extent([119, 123, 21, 26], crs=ccrs.PlateCarree())
 
-df['u_wind'], df['v_wind'] = zip(*df.apply(lambda row: wind_dir_to_uv('北', float(row['風力 (m/s) (級)'])), axis=1))
+# 海岸線
+ax.add_feature(cfeature.COASTLINE.with_scale('10m'))
+ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='lightgray')
 
-# =============================
-# 4️⃣ 插值到網格
-# =============================
-lon_grid = np.linspace(118, 124, 300)
-lat_grid = np.linspace(21, 26, 250)
-lon_mesh, lat_mesh = np.meshgrid(lon_grid, lat_grid)
+# 海流 / 風向 / 波高
+if map_type == "海流" and u is not None:
+    speed = np.sqrt(u**2 + v**2)
+    ax.quiver(lons, lats, u, v, speed, scale=5, cmap='Blues', alpha=0.7)
+elif map_type == "風向" and df_cwb is not None:
+    ax.quiver(df_cwb['Lon'], df_cwb['Lat'], df_cwb['Wind_u'], df_cwb['Wind_v'],
+              df_cwb['WindSpeed'], scale=5, cmap='YlOrRd', alpha=0.7)
+elif map_type == "波高" and df_cwb is not None:
+    sc = ax.scatter(df_cwb['Lon'], df_cwb['Lat'], c=df_cwb['WaveHeight'], cmap='cool', s=80, alpha=0.7)
+    plt.colorbar(sc, ax=ax, label='WaveHeight (m)')
 
-u_grid = griddata(df[['經度','緯度']].values, df['u_wind'].values, (lon_mesh, lat_mesh), method='linear', fill_value=0)
-v_grid = griddata(df[['經度','緯度']].values, df['v_wind'].values, (lon_mesh, lat_mesh), method='linear', fill_value=0)
-wind_speed_grid = np.sqrt(u_grid**2 + v_grid**2)
-wave_grid = griddata(df[['經度','緯度']].values, df['浪高(m)'].values, (lon_mesh, lat_mesh), method='linear', fill_value=0)
+# 禁航區
+if no_go is not None:
+    no_go.plot(ax=ax, facecolor='red', alpha=0.3, edgecolor='darkred')
 
-# =============================
-# 5️⃣ 計算成本函數
-# =============================
-alpha = 1.0
-beta = 2.0
-cost_grid = 1 + alpha*wind_speed_grid + beta*wave_grid
+# 離岸風場
+if wind_farm is not None:
+    wind_farm.plot(ax=ax, facecolor='yellow', alpha=0.3, edgecolor='orange')
 
-# =============================
-# 6️⃣ 畫圖
-# =============================
-fig, ax = plt.subplots(figsize=(12,8))
-
-if layer_option == "風場":
-    speed = wind_speed_grid
-    ax.quiver(lon_mesh, lat_mesh, u_grid, v_grid, speed, scale=50, cmap='autumn', alpha=0.5)
-elif layer_option == "波高":
-    ax.contourf(lon_mesh, lat_mesh, wave_grid, cmap='Blues', alpha=0.6)
-else:  # 海流流向
-    ax.quiver(lon_mesh, lat_mesh, u_grid, v_grid, np.sqrt(u_grid**2+v_grid**2), scale=50, cmap='Blues', alpha=0.5)
-
-# 畫禁航區和離岸風場
-if no_go_area is not None:
-    no_go_area.plot(ax=ax, facecolor="red", alpha=0.3, edgecolor='darkred')
-if offshore_wind is not None:
-    offshore_wind.plot(ax=ax, facecolor="yellow", alpha=0.3, edgecolor='goldenrod')
-
-ax.set_xlim(118,124)
-ax.set_ylim(21,26)
-ax.set_xlabel("經度")
-ax.set_ylabel("緯度")
 st.pyplot(fig)
-
-st.success("海象底圖顯示完成！")
