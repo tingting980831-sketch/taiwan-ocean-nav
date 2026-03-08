@@ -1,360 +1,78 @@
-import streamlit as st
-import xarray as xr
+import requests
+import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import geopandas as gpd
-import heapq
-
-st.set_page_config(layout="wide", page_title="HELIOS V9")
-st.title("HELIOS V9 智慧海洋導航系統")
-
-# ===============================
-# HYCOM 海流
-# ===============================
-
-@st.cache_data(ttl=3600)
-def load_current():
-
-    try:
-
-        url="https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
-
-        ds=xr.open_dataset(url,decode_times=False)
-
-        lat_slice=slice(21,26)
-        lon_slice=slice(118,124)
-
-        u=ds["ssu"].sel(lat=lat_slice,lon=lon_slice).isel(time=-1)
-        v=ds["ssv"].sel(lat=lat_slice,lon=lon_slice).isel(time=-1)
-
-        speed=np.sqrt(u**2+v**2)
-
-        lons=u.lon.values
-        lats=u.lat.values
-
-        return lons,lats,u.values,v.values,speed.values
-
-    except Exception as e:
-
-        st.error(f"HYCOM讀取失敗 {e}")
-        return None,None,None,None,None
-
-
-# ===============================
-# GFS 風速
-# ===============================
-
-@st.cache_data(ttl=3600)
-def load_wind():
-
-    try:
-
-        url="https://nomads.ncep.noaa.gov:9090/dods/gfs_0p25/gfs"
-
-        ds=xr.open_dataset(url)
-
-        lat_slice=slice(21,26)
-        lon_slice=slice(118,124)
-
-        u=ds["ugrd10m"].sel(lat=lat_slice,lon=lon_slice).isel(time=0)
-        v=ds["vgrd10m"].sel(lat=lat_slice,lon=lon_slice).isel(time=0)
-
-        wind=np.sqrt(u**2+v**2)
-
-        lons=u.lon.values
-        lats=u.lat.values
-
-        return lons,lats,wind.values,u.values,v.values
-
-    except Exception as e:
-
-        st.warning(f"風速讀取失敗 {e}")
-        return None,None,None,None,None
-
-
-# ===============================
-# WaveWatch 波高
-# ===============================
-
-@st.cache_data(ttl=3600)
-def load_wave():
-
-    try:
-
-        url="https://nomads.ncep.noaa.gov:9090/dods/wave/gfswave/global"
-
-        ds=xr.open_dataset(url)
-
-        lat_slice=slice(21,26)
-        lon_slice=slice(118,124)
-
-        wave=ds["htsgwsfc"].sel(lat=lat_slice,lon=lon_slice).isel(time=0)
-
-        lons=wave.lon.values
-        lats=wave.lat.values
-
-        return lons,lats,wave.values
-
-    except Exception as e:
-
-        st.warning(f"波高讀取失敗 {e}")
-        return None,None,None
-
-
-# ===============================
-# 讀取限制區
-# ===============================
-
-def load_zones():
-
-    try:
-        no_go=gpd.read_file("no_go_area.geojson")
-    except:
-        no_go=gpd.GeoDataFrame()
-
-    try:
-        windfarm=gpd.read_file("offshore_wind.geojson")
-    except:
-        windfarm=gpd.GeoDataFrame()
-
-    return no_go,windfarm
-
-
-# ===============================
-# A* 路徑
-# ===============================
-
-def astar(cost,start,goal):
-
-    rows,cols=cost.shape
-
-    open_set=[]
-    heapq.heappush(open_set,(0,start))
-
-    came={}
-    g={start:0}
-
-    dirs=[(1,0),(-1,0),(0,1),(0,-1),
-          (1,1),(1,-1),(-1,1),(-1,-1)]
-
-    while open_set:
-
-        _,cur=heapq.heappop(open_set)
-
-        if cur==goal:
-
-            path=[]
-
-            while cur in came:
-                path.append(cur)
-                cur=came[cur]
-
-            path.append(start)
-            path.reverse()
-
-            return path
-
-        for dx,dy in dirs:
-
-            nx=cur[0]+dx
-            ny=cur[1]+dy
-
-            if nx<0 or ny<0 or nx>=rows or ny>=cols:
-                continue
-
-            n=(nx,ny)
-
-            t=g[cur]+cost[nx,ny]
-
-            if n not in g or t<g[n]:
-
-                came[n]=cur
-                g[n]=t
-
-                heapq.heappush(open_set,(t,n))
-
-    return None
-
-
-# ===============================
-# Cost map
-# ===============================
-
-def build_cost(current,wind,wave):
-
-    base=np.ones_like(current)
-
-    cost=base
-
-    cost+=wave*4
-    cost+=wind*1.5
-    cost+=current*0.5
-
-    return cost
-
-
-# ===============================
-# 載入資料
-# ===============================
-
-hlons,hlats,cu,cv,current=load_current()
-flons,flats,wind,wu,wv=load_wind()
-wlons,wlats,wave=load_wave()
-
-no_go,windfarm=load_zones()
-
-
-# ===============================
-# UI
-# ===============================
-
-layer=st.sidebar.radio(
-"底圖",
-["海流","風場","波高"]
-)
-
-start=(10,10)
-goal=(80,80)
-
-
-# ===============================
-# 地圖
-# ===============================
-
-fig=plt.figure(figsize=(10,8))
-
-ax=plt.axes(projection=ccrs.PlateCarree())
-
-ax.set_extent([118,124,21,26])
-
-ax.add_feature(cfeature.LAND,facecolor="lightgray")
-ax.add_feature(cfeature.COASTLINE)
-
-gl=ax.gridlines(draw_labels=True,alpha=0.3)
-
-gl.top_labels=False
-gl.right_labels=False
-
-
-# ===============================
-# 海流
-# ===============================
-
-if layer=="海流":
-
-    im=ax.pcolormesh(
-        hlons,
-        hlats,
-        current,
-        cmap="Blues",
-        shading="auto",
-        alpha=0.8
-    )
-
-    ax.quiver(
-        hlons[::2],
-        hlats[::2],
-        cu[::2,::2],
-        cv[::2,::2],
-        color="white",
-        alpha=0.5,
-        scale=10
-    )
-
-    plt.colorbar(im,label="流速 m/s")
-
-
-# ===============================
-# 風
-# ===============================
-
-elif layer=="風場":
-
-    im=ax.pcolormesh(
-        flons,
-        flats,
-        wind,
-        cmap="Oranges",
-        shading="auto",
-        alpha=0.8
-    )
-
-    ax.quiver(
-        flons[::2],
-        flats[::2],
-        wu[::2,::2],
-        wv[::2,::2],
-        color="black",
-        alpha=0.4
-    )
-
-    plt.colorbar(im,label="風速 m/s")
-
-
-# ===============================
-# 波
-# ===============================
-
-elif layer=="波高":
-
-    im=ax.pcolormesh(
-        wlons,
-        wlats,
-        wave,
-        cmap="coolwarm",
-        shading="auto",
-        alpha=0.8
-    )
-
-    plt.colorbar(im,label="波高 m")
-
-
-# ===============================
-# 禁航區
-# ===============================
-
-if not no_go.empty:
-
-    no_go.plot(
-        ax=ax,
-        facecolor="red",
-        alpha=0.3,
-        edgecolor="darkred"
-    )
-
-
-# ===============================
-# 離岸風場
-# ===============================
-
-if not windfarm.empty:
-
-    windfarm.plot(
-        ax=ax,
-        facecolor="yellow",
-        alpha=0.3,
-        edgecolor="gold"
-    )
-
-
-# ===============================
-# 路徑
-# ===============================
-
-cost=build_cost(current,wind,wave)
-
-path=astar(cost,start,goal)
-
-if path:
-
-    xs=[hlons[p[1]] for p in path]
-    ys=[hlats[p[0]] for p in path]
-
-    ax.plot(xs,ys,color="lime",linewidth=3)
-
-
-plt.title("HELIOS V9 智慧航線")
-
-st.pyplot(fig)
+import xarray as xr
+from scipy.interpolate import griddata
+
+# ==============================
+# 1️⃣ 取得中央氣象署即時海況資料
+# ==============================
+# 這裡以「龍洞潮位站」為例，你可以抓全台灣所有站資料
+url = "https://www.cwb.gov.tw/V8/C/W/OBS_Ocean/ObsOcean_Station.html"  # 假設可抓到 HTML 表格
+tables = pd.read_html(url)
+
+# 找出包含風速、浪高、海流的表格（根據你抓到的網站，index 可能不同）
+ocean_table = tables[0]  # 例如第一個表格
+ocean_table = ocean_table.rename(columns=lambda x: x.strip())  # 去掉空白
+
+# 只保留需要欄位
+df = ocean_table[['測站', '緯度', '經度', '浪高(m)', '風力 (m/s) (級)', '海流流向', '流速 (m/s) (節)']]
+
+# 將空值補 NaN，方便運算
+df = df.replace('-', np.nan)
+df = df.dropna(subset=['緯度', '經度'])
+
+# ==============================
+# 2️⃣ 將方向速度轉換成矢量
+# ==============================
+def wind_dir_to_uv(direction, speed):
+    # 16方位轉角度
+    dir_map = {
+        "北": 0, "北北東": 22.5, "北東": 45, "東北東": 67.5, "東": 90, "東南東": 112.5,
+        "南東": 135, "南南東": 157.5, "南": 180, "南南西": 202.5, "南西": 225, "西南西": 247.5,
+        "西": 270, "西北西": 292.5, "北西": 315, "北北西": 337.5
+    }
+    angle = dir_map.get(direction, 0) * np.pi / 180
+    u = speed * np.sin(angle)  # 東向
+    v = speed * np.cos(angle)  # 北向
+    return u, v
+
+# 假設風向為北北東，風速欄位是 float
+# df['風速(m/s)'] = df['風力 (m/s) (級)'].astype(float)
+# 這裡先假設風向北
+df['u_wind'], df['v_wind'] = zip(*df.apply(lambda row: wind_dir_to_uv('北', float(row['風力 (m/s) (級)'])), axis=1))
+
+# 海流速度也可類似處理
+# df['u_current'], df['v_current'] = zip(*df.apply(lambda row: wind_dir_to_uv(row['海流流向'], float(row['流速 (m/s) (節)'])*0.51444), axis=1))
+# 1節 ≈ 0.51444 m/s
+
+# ==============================
+# 3️⃣ 插值到格點 (與 A* 演算法網格一致)
+# ==============================
+lon_grid = np.linspace(118, 124, 300)  # 你的網格範圍
+lat_grid = np.linspace(21, 26, 250)
+lon_mesh, lat_mesh = np.meshgrid(lon_grid, lat_grid)
+
+# 插值風速
+u_grid = griddata(df[['經度','緯度']].values, df['u_wind'].values, (lon_mesh, lat_mesh), method='linear', fill_value=0)
+v_grid = griddata(df[['經度','緯度']].values, df['v_wind'].values, (lon_mesh, lat_mesh), method='linear', fill_value=0)
+
+wind_speed_grid = np.sqrt(u_grid**2 + v_grid**2)
+
+# 同理可插值波高
+wave_grid = griddata(df[['經度','緯度']].values, df['浪高(m)'].values, (lon_mesh, lat_mesh), method='linear', fill_value=0)
+
+# ==============================
+# 4️⃣ 將風速、波高加入成本函數
+# ==============================
+# 假設原成本是海流阻力 cost = base_cost
+# 我們可以簡單加權：
+alpha = 1.0  # 風速權重
+beta = 2.0   # 波高權重
+
+cost_grid = 1 + alpha*wind_speed_grid + beta*wave_grid  # cost 越高表示越難走
+
+# ==============================
+# 5️⃣ 在 A* 演算法中使用 cost_grid
+# ==============================
+# path = a_star_search(start, goal, cost_grid)
