@@ -32,7 +32,7 @@ def load_hycom_data():
         latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
         
         # 修正：緯度上限切到 25.5，移除上方空白無海流區域
-        lat_slice, lon_slice = slice(20, 25.5), slice(118, 124)
+        lat_slice, lon_slice = slice(20, 26), slice(118, 124)
         u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         
@@ -136,7 +136,7 @@ if lons is not None:
     ax = plt.axes(projection=ccrs.PlateCarree())
     
     # 修正：將地圖邊界限制在有海流數據的範圍內 (北緯最高 25.4)
-    ax.set_extent([118.5, 123.5, 21.0, 25.4], crs=ccrs.PlateCarree())
+    ax.set_extent([118, 124, 20, 26], crs=ccrs.PlateCarree())
     
     ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
     ax.add_feature(cfeature.COASTLINE, zorder=3)
