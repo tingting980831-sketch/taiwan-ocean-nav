@@ -19,7 +19,6 @@ SATS_PER_PLANE = 4
 INCLINATION = 15 
 
 def get_visible_sats():
-    # 模擬在 15 度頃角下，台灣海域上空隨機可見的衛星數
     return np.random.randint(2, 5)
 
 # ==================== 2️⃣ 讀取 HYCOM 資料 ====================
@@ -31,8 +30,8 @@ def load_hycom_data():
         time_origin = pd.to_datetime(ds['time'].attrs['time_origin'])
         latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
         
-        # 修正：緯度上限切到 25.5，移除上方空白無海流區域
-        lat_slice, lon_slice = slice(21, 26), slice(118, 124)
+        # 修正：緯度上限切到 25.5，徹底移除上方空白區域
+        lat_slice, lon_slice = slice(21, 25.5), slice(118, 124)
         u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         
@@ -75,18 +74,16 @@ def astar_v6(start, goal, u, v, land_mask, safety, ship_spd_kmh):
                 dist_m = np.sqrt(d[0]**2 + d[1]**2) * 8000
                 norm_d = np.sqrt(d[0]**2 + d[1]**2)
                 flow_v = (u[cur[0], cur[1]]*(d[1]/norm_d) + v[cur[0], cur[1]]*(d[0]/norm_d))
-                
                 v_ground = max(0.5, v_ship + flow_v)
-                # 平衡模型：時間成本 + 油耗補償 (1:1)
+                
                 step_c = (dist_m / v_ground) + (-flow_v * (dist_m / v_ship) * 1.5)
-                # 加強避障：離岸 4 格內懲罰增加，防止太貼台灣
+                # 加強避障，防止太貼台灣
                 if safety[ni,nj] < 4:
-                    step_c += 12000 / (safety[ni,nj] + 0.2)**2
+                    step_c += 15000 / (safety[ni,nj] + 0.2)**2
                 
                 new_total = cost[cur] + step_c
                 if (ni,nj) not in cost or new_total < cost[(ni,nj)]:
                     cost[(ni,nj)] = new_total
-                    # 強力目的地拉力 (Heuristic)
                     priority = new_total + 4.0 * (np.sqrt((ni-goal[0])**2 + (nj-goal[1])**2) * 8000 / v_ship)
                     heapq.heappush(pq, (priority, (ni,nj)))
                     came_from[(ni,nj)] = cur
@@ -120,42 +117,38 @@ if lons is not None:
         c1.metric("⏱️ 預估航行時間", f"{dist_km/ship_speed:.1f} 小時")
         c2.metric("📏 航行距離", f"{dist_km:.1f} km")
     
-    # 模擬衛星資訊
     c3.metric("🛰️ 覆蓋衛星數", f"{get_visible_sats()} SATS (Incl: {INCLINATION}°)")
     st.caption(f"📅 數據時間: {obs_time.strftime('%Y-%m-%d %H:%M')} | 衛星軌道: 3 Planes / 12 Sats")
     st.divider()
 
-    # ==================== 5️⃣ 繪圖 (保留原配色) ====================
-    # 這裡保留你原始設定的 colors 與 levels
+    # ==================== 5️⃣ 繪圖 ====================
     colors_list = ["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF",
-              "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
-    levels = np.linspace(0, 1.2, len(colors_list))
-    cmap_custom = mcolors.LinearSegmentedColormap.from_list("custom_flow", list(zip(levels/1.2, colors_list)))
+                  "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
+    cmap_custom = mcolors.LinearSegmentedColormap.from_list("custom_flow", colors_list)
 
     fig = plt.figure(figsize=(10, 8))
     ax = plt.axes(projection=ccrs.PlateCarree())
     
-    # 修正：將地圖邊界限制在有海流數據的範圍內 (北緯最高 25.4)
-    ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
+    # 修正顯示邊界，移除空白區
+    ax.set_extent([118.5, 123.5, 21.0, 25.4], crs=ccrs.PlateCarree())
     
     ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
     ax.add_feature(cfeature.COASTLINE, zorder=3)
+    
     gl = ax.gridlines(draw_labels=True, alpha=0.2)
-
-# 只顯示左邊和下邊
-gl.top_labels = False
-gl.right_labels = False
-gl.left_labels = True
-gl.bottom_labels = True
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.left_labels = True
+    gl.bottom_labels = True
 
     speed = np.sqrt(u**2 + v**2)
     im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
-    cbar = ax.figure.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
+    
+    # 🌟 色條往右偏移：設定 pad=0.1 
+    cbar = fig.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.1)
 
-    # 繪製海流箭頭
     ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.4, scale=10, transform=ccrs.PlateCarree(), zorder=4)
 
-    # 繪製路徑
     if path:
         path_lons = [lons[p[1]] for p in path]
         path_lats = [lats[p[0]] for p in path]
