@@ -31,7 +31,7 @@ def load_hycom_data():
         latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
         
         # 修正：緯度上限切到 25.5，徹底移除上方空白區域
-        lat_slice, lon_slice = slice(21, 25.5), slice(118, 124)
+        lat_slice, lon_slice = slice(21, 26), slice(118, 124)
         u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         
@@ -145,7 +145,7 @@ if lons is not None:
     im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
     
     # 🌟 色條往右偏移：設定 pad=0.1 
-    cbar = fig.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.1)
+    cbar = fig.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.2)
 
     ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.4, scale=10, transform=ccrs.PlateCarree(), zorder=4)
 
