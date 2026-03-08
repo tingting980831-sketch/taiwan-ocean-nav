@@ -6,7 +6,6 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import requests
 
 st.set_page_config(layout="wide")
 st.title("⚓ 台灣海域智慧航行整合示意")
@@ -22,8 +21,8 @@ map_type = st.sidebar.selectbox(
 # ---------------------------
 # 1. 禁航區 GeoJSON
 # ---------------------------
-no_go_url = "https://ocean.moi.gov.tw/Map/Achievement/LayerInfo/905?utm_source=chatgpt.com"
 try:
+    no_go_url = "https://ocean.moi.gov.tw/Map/Achievement/LayerInfo/905?utm_source=chatgpt.com"
     no_go = gpd.read_file(no_go_url)
     st.sidebar.success("禁航區資料載入成功")
 except:
@@ -33,8 +32,8 @@ except:
 # ---------------------------
 # 2. 離岸風場 GeoJSON
 # ---------------------------
-offshore_wind_url = "https://example.com/offshore_wind.geojson"  # 公開來源替換
 try:
+    offshore_wind_url = "https://example.com/offshore_wind.geojson"  # 公開來源替換
     wind_farm = gpd.read_file(offshore_wind_url)
     st.sidebar.success("離岸風場資料載入成功")
 except:
@@ -42,12 +41,12 @@ except:
     st.sidebar.warning("離岸風場資料缺失，暫時不顯示")
 
 # ---------------------------
-# 3. 即時風速/波高 (CWB OpenData)
+# 3. CWB 即時風場/波高資料
 # ---------------------------
-API_KEY = "你的CWB_API_KEY"
-cwb_url = f"https://opendata.cwb.gov.tw/fileapi/v1/opendataapi/O-A0013-001?Authorization={API_KEY}&format=JSON"
-
 try:
+    API_KEY = "你的CWB_API_KEY"
+    cwb_url = f"https://opendata.cwb.gov.tw/fileapi/v1/opendataapi/O-A0013-001?Authorization={API_KEY}&format=JSON"
+    df_cwb = pd.DataFrame()  # 初始化
     r = requests.get(cwb_url, timeout=10)
     r.raise_for_status()
     data_json = r.json()
@@ -70,17 +69,13 @@ except:
     st.sidebar.warning("CWB 即時風場資料抓取失敗")
 
 # ---------------------------
-# 4. 海流 (HYCOM)
+# 4. 海流 (保持原本抓取方式)
 # ---------------------------
-hycom_file = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/2026/03/09/ocean_his_000_20260309_0000.nc"
 try:
-    ds = xr.open_dataset(hycom_file)
-    u = ds["u"][-1,:,:].values
-    v = ds["v"][-1,:,:].values
-    lons = ds["lon"][:].values
-    lats = ds["lat"][:].values
+    # 假設你原本有一個 load_hycom() 函式
+    lons, lats, u, v, ocean_time = load_hycom()  
 except:
-    u = v = lons = lats = None
+    lons = lats = u = v = None
     st.sidebar.warning("HYCOM 海流資料抓取失敗")
 
 # ---------------------------
@@ -94,7 +89,7 @@ ax.set_extent([119, 123, 21, 26], crs=ccrs.PlateCarree())
 ax.add_feature(cfeature.COASTLINE.with_scale('10m'))
 ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='lightgray')
 
-# 海流 / 風向 / 波高
+# 底圖
 if map_type == "海流" and u is not None:
     speed = np.sqrt(u**2 + v**2)
     ax.quiver(lons, lats, u, v, speed, scale=5, cmap='Blues', alpha=0.7)
