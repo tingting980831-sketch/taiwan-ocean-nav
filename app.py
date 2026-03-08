@@ -6,6 +6,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import requests
 
 st.set_page_config(layout="wide")
 st.title("⚓ 台灣海域智慧航行整合示意")
@@ -46,7 +47,6 @@ except:
 try:
     API_KEY = "你的CWB_API_KEY"
     cwb_url = f"https://opendata.cwb.gov.tw/fileapi/v1/opendataapi/O-A0013-001?Authorization={API_KEY}&format=JSON"
-    df_cwb = pd.DataFrame()  # 初始化
     r = requests.get(cwb_url, timeout=10)
     r.raise_for_status()
     data_json = r.json()
@@ -69,13 +69,28 @@ except:
     st.sidebar.warning("CWB 即時風場資料抓取失敗")
 
 # ---------------------------
-# 4. 海流 (保持原本抓取方式)
+# 4. 海流 (使用你原本的 HYCOM 方法)
 # ---------------------------
 try:
-    # 假設你原本有一個 load_hycom() 函式
-    lons, lats, u, v, ocean_time = load_hycom()  
+    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+    ds = xr.open_dataset(url, decode_times=False)
+    time_origin = pd.to_datetime(ds['time'].attrs['time_origin'])
+    time_values = time_origin + pd.to_timedelta(ds['time'].values, unit='h')
+
+    lat_slice = slice(20,26)
+    lon_slice = slice(119,123)
+    ssu = ds['ssu'].sel(lat=lat_slice, lon=lon_slice)
+    ssv = ds['ssv'].sel(lat=lat_slice, lon=lon_slice)
+
+    latest_index = -1
+    ssu_latest = ssu.isel(time=latest_index)
+    ssv_latest = ssv.isel(time=latest_index)
+    latest_time = time_values[latest_index]
+
+    lons = ds['lon'].sel(lon=lon_slice)
+    lats = ds['lat'].sel(lat=lat_slice)
 except:
-    lons = lats = u = v = None
+    ssu_latest = ssv_latest = lons = lats = None
     st.sidebar.warning("HYCOM 海流資料抓取失敗")
 
 # ---------------------------
@@ -84,15 +99,13 @@ except:
 fig = plt.figure(figsize=(12,8))
 ax = plt.axes(projection=ccrs.PlateCarree())
 ax.set_extent([119, 123, 21, 26], crs=ccrs.PlateCarree())
-
-# 海岸線
 ax.add_feature(cfeature.COASTLINE.with_scale('10m'))
 ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor='lightgray')
 
 # 底圖
-if map_type == "海流" and u is not None:
-    speed = np.sqrt(u**2 + v**2)
-    ax.quiver(lons, lats, u, v, speed, scale=5, cmap='Blues', alpha=0.7)
+if map_type == "海流" and ssu_latest is not None:
+    speed = np.sqrt(ssu_latest**2 + ssv_latest**2)
+    ax.quiver(lons, lats, ssu_latest, ssv_latest, speed, scale=3, cmap='viridis', alpha=0.7)
 elif map_type == "風向" and df_cwb is not None:
     ax.quiver(df_cwb['Lon'], df_cwb['Lat'], df_cwb['Wind_u'], df_cwb['Wind_v'],
               df_cwb['WindSpeed'], scale=5, cmap='YlOrRd', alpha=0.7)
