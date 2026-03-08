@@ -105,24 +105,28 @@ def plot_navigation(lons, lats, u, v, path, s_lon, s_lat, e_lon, e_lat):
     ax.add_feature(cfeature.LAND, facecolor='lightgray')
     ax.add_feature(cfeature.COASTLINE)
     ax.gridlines(draw_labels=True)
-    speed = np.sqrt(u**2+v**2)
+    speed = np.sqrt(u**2 + v**2)
     im = ax.pcolormesh(lons, lats, speed, cmap='YlGnBu', shading='auto', alpha=0.7, transform=ccrs.PlateCarree())
     plt.colorbar(im, label='流速 (m/s)', shrink=0.6)
-    ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='black', scale=10, transform=ccrs.PlateCarree())
+    ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.5, scale=10, transform=ccrs.PlateCarree())
     if len(path)>0:
         path_lons = [lons[p[1]] for p in path]
         path_lats = [lats[p[0]] for p in path]
         ax.plot(path_lons, path_lats, color='red', linewidth=2, transform=ccrs.PlateCarree(), label='AI航線')
     ax.scatter(s_lon, s_lat, color='green', s=150, marker='o', edgecolors='black', label='起點', transform=ccrs.PlateCarree())
     ax.scatter(e_lon, e_lat, color='yellow', s=250, marker='*', edgecolors='black', label='終點', transform=ccrs.PlateCarree())
-    ax.legend(loc='lower right')
+    ax.legend(loc='upper left')
     plt.title(f"HELIOS V6 即時監控 - {obs_time}")
     st.pyplot(fig)
 
 plot_navigation(lons, lats, u, v, path, s_lon, s_lat, e_lon, e_lat)
 
-# ==================== 7️⃣ 數據儀表板 ====================
+# ==================== 7️⃣ 上方資訊儀表板 ====================
+distance_km = np.sqrt((s_lat-e_lat)**2 + (s_lon-e_lon)**2) * 111
+average_speed_kmh = 20  # 假設航速 20 km/h
+estimated_hours = distance_km / average_speed_kmh
+
 col1, col2, col3 = st.columns(3)
-col1.metric("🛰️ 衛星高度", f"{SAT_CONFIG['altitude_km']} km")
-col2.metric("📏 直線距離", f"{np.sqrt((s_lat-e_lat)**2 + (s_lon-e_lon)**2)*111:.1f} km")
+col1.metric("⏱️ 預估航行時間", f"{estimated_hours:.1f} 小時")
+col2.metric("📏 航行距離", f"{distance_km:.1f} km")
 col3.metric("📅 觀測時間", obs_time.strftime("%m/%d %H:%M"))
