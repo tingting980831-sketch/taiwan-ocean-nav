@@ -9,7 +9,7 @@ import cartopy.feature as cfeature
 import heapq
 from scipy.ndimage import distance_transform_edt
 
-# ==================== 1️⃣ 衛星與系統設定 ====================
+# ==================== 1️⃣ 設定 ====================
 st.set_page_config(layout="wide", page_title="HELIOS V6")
 st.title("🛰️ HELIOS V6 智慧導航控制台")
 
@@ -24,7 +24,7 @@ with st.sidebar:
     ship_speed = st.number_input("🚤 船速 (km/h)", value=20.0, step=1.0)
     run_nav = st.button("🚀 啟動衛星導航計算", use_container_width=True)
 
-# ==================== 3️⃣ 讀取 HYCOM 資料 ====================
+# ==================== 3️⃣ 讀取 HYCOM ====================
 @st.cache_data(ttl=3600)
 def load_hycom_data():
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
@@ -58,7 +58,7 @@ safety = compute_safety(land_mask)
 start = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
 goal = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
 
-# ==================== 5️⃣ 改良 A* 導航，避開陸地尖角 ====================
+# ==================== 5️⃣ A* 導航 ====================
 def astar(start, goal, u, v, land_mask, safety):
     rows, cols = land_mask.shape
     dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
@@ -81,9 +81,8 @@ def astar(start, goal, u, v, land_mask, safety):
                 continue
             if land_mask[ni,nj]:
                 continue
-            # 加入鄰近海域流場平滑
             flow = u[cur]*d[1] + v[cur]*d[0]
-            land_penalty = 1/(safety[ni,nj]+2)  # 加大避開尖角效果
+            land_penalty = 1/(safety[ni,nj]+2)
             dist_step = np.sqrt(d[0]**2+d[1]**2)
             new_cost = cost[cur] + dist_step + land_penalty - 0.5*flow
             if (ni,nj) not in cost or new_cost < cost[(ni,nj)]:
@@ -106,7 +105,7 @@ path = astar(start, goal, u, v, land_mask, safety)
 # ==================== 6️⃣ 自訂海流顏色 ====================
 colors = ["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF",
           "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
-levels = [0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2]
+levels = np.linspace(0,1.2,len(colors))
 cmap = mcolors.LinearSegmentedColormap.from_list("custom_flow", list(zip(levels, colors)))
 
 # ==================== 7️⃣ 畫圖 ====================
