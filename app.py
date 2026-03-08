@@ -32,7 +32,7 @@ def load_hycom_data():
         latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
         
         # 修正：緯度上限切到 25.5，移除上方空白無海流區域
-        lat_slice, lon_slice = slice(20, 26), slice(118, 124)
+        lat_slice, lon_slice = slice(21, 26), slice(118, 124)
         u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         
@@ -101,9 +101,9 @@ def astar_v6(start, goal, u, v, land_mask, safety, ship_spd_kmh):
 with st.sidebar:
     st.header("📍 航點座標輸入")
     s_lon = st.number_input("起點經度 (118-124)", value=120.30, format="%.2f")
-    s_lat = st.number_input("起點緯度 (20-26)", value=22.60, format="%.2f")
+    s_lat = st.number_input("起點緯度 (21-26)", value=22.60, format="%.2f")
     e_lon = st.number_input("終點經度 (118-124)", value=122.00, format="%.2f")
-    e_lat = st.number_input("終點緯度 (20-26)", value=24.50, format="%.2f")
+    e_lat = st.number_input("終點緯度 (21-26)", value=24.50, format="%.2f")
     ship_speed = st.number_input("🚤 船速 (km/h)", value=20.0, step=1.0)
     run_nav = st.button("🚀 啟動衛星導航計算", use_container_width=True)
 
@@ -136,7 +136,7 @@ if lons is not None:
     ax = plt.axes(projection=ccrs.PlateCarree())
     
     # 修正：將地圖邊界限制在有海流數據的範圍內 (北緯最高 25.4)
-    ax.set_extent([118, 124, 20, 26], crs=ccrs.PlateCarree())
+    ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
     
     ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
     ax.add_feature(cfeature.COASTLINE, zorder=3)
@@ -144,7 +144,7 @@ if lons is not None:
 
     speed = np.sqrt(u**2 + v**2)
     im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
-    plt.colorbar(im, label='流速 (m/s)', shrink=0.6)
+    cbar = ax.figure.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
 
     # 繪製海流箭頭
     ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.4, scale=10, transform=ccrs.PlateCarree(), zorder=4)
