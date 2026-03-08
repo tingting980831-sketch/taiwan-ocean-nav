@@ -6,226 +6,173 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import geopandas as gpd
 import heapq
 from scipy.ndimage import distance_transform_edt
 
+# ==================== 1️⃣ 設定 ====================
 st.set_page_config(layout="wide", page_title="HELIOS V6")
 st.title("🛰️ HELIOS V6 智慧導航控制台")
 
+# 衛星設定
+PLANE_COUNT = 3
+SATS_PER_PLANE = 4
 INCLINATION = 15
 
 def get_visible_sats():
-    return np.random.randint(2,5)
+    return np.random.randint(2, 5)
 
-# ================= HYCOM 讀取 =================
+# ==================== 2️⃣ 讀取 HYCOM 海流資料 ====================
 @st.cache_data(ttl=3600)
 def load_hycom_data():
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
     try:
         ds = xr.open_dataset(url, decode_times=False)
-
         time_origin = pd.to_datetime(ds['time'].attrs['time_origin'])
         latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
-
-        lat_slice = slice(21,26)
-        lon_slice = slice(118,124)
-
+        
+        lat_slice, lon_slice = slice(21, 26), slice(118, 124)
         u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
-
+        
         lons = u_data['lon'].values
         lats = u_data['lat'].values
-
         u_val = np.nan_to_num(u_data.values)
         v_val = np.nan_to_num(v_data.values)
-
         land_mask = np.isnan(u_data.values)
-
-        return lons,lats,u_val,v_val,land_mask,latest_time
-
+        
+        return lons, lats, u_val, v_val, land_mask, latest_time
     except Exception as e:
-        st.error(f"HYCOM讀取失敗 {e}")
-        return None,None,None,None,None,None
+        st.error(f"📡 海流資料讀取失敗: {e}")
+        return None, None, None, None, None, None
 
-lons,lats,u,v,land_mask,obs_time = load_hycom_data()
+lons, lats, u, v, land_mask, obs_time = load_hycom_data()
 
-# ================= 導航 =================
+# ==================== 3️⃣ 讀取 TRITON 風場與波高 ====================
+@st.cache_data(ttl=3600)
+def load_triton_wind_swh(file_path):
+    try:
+        ds = xr.open_dataset(file_path)
+        wind_speed = ds['wind_speed'].values  # m/s
+        swh = ds['swh'].values  # significant wave height
+        lon = ds['lon'].values
+        lat = ds['lat'].values
+        return lon, lat, wind_speed, swh
+    except Exception as e:
+        st.error(f"📡 TRITON 風場資料讀取失敗: {e}")
+        return None, None, None, None
 
-def nearest_ocean_cell(lon,lat,lons,lats,land_mask):
+# 假設你有 TRITON Level2 nc 檔案
+# triton_file = "TRITON_..._roughness_windspeed_vX.X.nc"
+# triton_lons, triton_lats, wind_speed, swh = load_triton_wind_swh(triton_file)
 
-    lon_idx=np.abs(lons-lon).argmin()
-    lat_idx=np.abs(lats-lat).argmin()
+# ==================== 4️⃣ 導航與安全 ====================
+def nearest_ocean_cell(lon, lat, lons, lats, land_mask):
+    lon_idx = np.abs(lons - lon).argmin()
+    lat_idx = np.abs(lats - lat).argmin()
+    if not land_mask[lat_idx, lon_idx]:
+        return (lat_idx, lon_idx)
+    ocean = np.where(~land_mask)
+    dist = np.sqrt((lats[ocean[0]] - lat)**2 + (lons[ocean[1]] - lon)**2)
+    i = dist.argmin()
+    return (ocean[0][i], ocean[1][i])
 
-    if not land_mask[lat_idx,lon_idx]:
-        return lat_idx,lon_idx
-
-    ocean=np.where(~land_mask)
-    dist=np.sqrt((lats[ocean[0]]-lat)**2+(lons[ocean[1]]-lon)**2)
-
-    i=dist.argmin()
-    return ocean[0][i],ocean[1][i]
-
-def astar(start,goal,u,v,land_mask,safety,ship_spd):
-
-    v_ship=ship_spd*0.277
-
-    rows,cols=land_mask.shape
-
-    dirs=[(1,0),(-1,0),(0,1),(0,-1),
-          (1,1),(1,-1),(-1,1),(-1,-1)]
-
-    pq=[(0,start)]
-    cost={start:0}
-    came={}
+def astar_v6(start, goal, u, v, land_mask, safety, ship_spd_kmh):
+    v_ship = ship_spd_kmh * 0.277
+    rows, cols = land_mask.shape
+    dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+    pq, cost, came_from = [(0, start)], {start: 0}, {}
 
     while pq:
-
-        _,cur=heapq.heappop(pq)
-
-        if cur==goal:
-            break
-
+        _, cur = heapq.heappop(pq)
+        if cur == goal: break
         for d in dirs:
-
-            ni=cur[0]+d[0]
-            nj=cur[1]+d[1]
-
-            if 0<=ni<rows and 0<=nj<cols and not land_mask[ni,nj]:
-
-                dist_m=np.sqrt(d[0]**2+d[1]**2)*8000
-                norm=np.sqrt(d[0]**2+d[1]**2)
-
-                flow=(u[cur]*(d[1]/norm)+v[cur]*(d[0]/norm))
-
-                v_ground=max(0.5,v_ship+flow)
-
-                step=(dist_m/v_ground)+(-flow*(dist_m/v_ship)*1.5)
-
-                if safety[ni,nj]<4:
-                    step+=12000/(safety[ni,nj]+0.2)**2
-
-                new=cost[cur]+step
-
-                if (ni,nj) not in cost or new<cost[(ni,nj)]:
-
-                    cost[(ni,nj)]=new
-
-                    priority=new+4*np.sqrt((ni-goal[0])**2+(nj-goal[1])**2)*8000/v_ship
-
-                    heapq.heappush(pq,(priority,(ni,nj)))
-
-                    came[(ni,nj)]=cur
-
-    path=[]
-    curr=goal
-
-    while curr in came:
-        path.append(curr)
-        curr=came[curr]
-
-    if path:
-        path.append(start)
-
+            ni, nj = cur[0]+d[0], cur[1]+d[1]
+            if 0 <= ni < rows and 0 <= nj < cols and not land_mask[ni,nj]:
+                dist_m = np.sqrt(d[0]**2 + d[1]**2) * 8000
+                norm_d = np.sqrt(d[0]**2 + d[1]**2)
+                flow_v = (u[cur[0], cur[1]]*(d[1]/norm_d) + v[cur[0], cur[1]]*(d[0]/norm_d))
+                v_ground = max(0.5, v_ship + flow_v)
+                step_c = (dist_m / v_ground) + (-flow_v * (dist_m / v_ship) * 1.5)
+                if safety[ni,nj] < 4:
+                    step_c += 12000 / (safety[ni,nj] + 0.2)**2
+                new_total = cost[cur] + step_c
+                if (ni,nj) not in cost or new_total < cost[(ni,nj)]:
+                    cost[(ni,nj)] = new_total
+                    priority = new_total + 4.0 * (np.sqrt((ni-goal[0])**2 + (nj-goal[1])**2) * 8000 / v_ship)
+                    heapq.heappush(pq, (priority, (ni,nj)))
+                    came_from[(ni,nj)] = cur
+    path = []
+    curr = goal
+    while curr in came_from:
+        path.append(curr); curr = came_from[curr]
+    if path: path.append(start)
     return path[::-1]
 
-# ================= 側邊欄 =================
-
+# ==================== 5️⃣ 側邊欄 ====================
 with st.sidebar:
+    st.header("📍 航點座標輸入")
+    s_lon = st.number_input("起點經度 (118-124)", value=120.30, format="%.2f")
+    s_lat = st.number_input("起點緯度 (21-26)", value=22.60, format="%.2f")
+    e_lon = st.number_input("終點經度 (118-124)", value=122.00, format="%.2f")
+    e_lat = st.number_input("終點緯度 (21-26)", value=24.50, format="%.2f")
+    ship_speed = st.number_input("🚤 船速 (km/h)", value=20.0, step=1.0)
+    run_nav = st.button("🚀 啟動衛星導航計算", use_container_width=True)
 
-    st.header("航點")
-
-    s_lon=st.number_input("起點經度",118.0,124.0,120.3)
-    s_lat=st.number_input("起點緯度",21.0,26.0,22.6)
-
-    e_lon=st.number_input("終點經度",118.0,124.0,122.0)
-    e_lat=st.number_input("終點緯度",21.0,26.0,24.5)
-
-    ship_speed=st.number_input("船速 km/h",1.0,60.0,20.0)
-
-# ================= 計算 =================
-
+# ==================== 6️⃣ 計算路徑 ====================
 if lons is not None:
+    safety = distance_transform_edt(~land_mask)
+    start_idx = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
+    goal_idx = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
+    path = astar_v6(start_idx, goal_idx, u, v, land_mask, safety, ship_speed)
 
-    safety=distance_transform_edt(~land_mask)
-
-    start=nearest_ocean_cell(s_lon,s_lat,lons,lats,land_mask)
-    goal=nearest_ocean_cell(e_lon,e_lat,lons,lats,land_mask)
-
-    path=astar(start,goal,u,v,land_mask,safety,ship_speed)
-
-# ================= 儀表板 =================
-
-    c1,c2,c3=st.columns(3)
-
+    # 儀表板
+    c1, c2, c3 = st.columns(3)
     if path:
+        dist_km = sum(np.sqrt((lats[path[i][0]]-lats[path[i+1][0]])**2 + (lons[path[i][1]]-lons[path[i+1][1]])**2) for i in range(len(path)-1)) * 111
+        c1.metric("⏱️ 預估航行時間", f"{dist_km/ship_speed:.1f} 小時")
+        c2.metric("📏 航行距離", f"{dist_km:.1f} km")
+    c3.metric("🛰️ 覆蓋衛星數", f"{get_visible_sats()} SATS")
+    st.caption(f"📅 數據時間: {obs_time.strftime('%Y-%m-%d %H:%M')} | 衛星軌道: 3 Planes / 12 Sats")
+    st.divider()
 
-        dist_km=sum(np.sqrt(
-            (lats[path[i][0]]-lats[path[i+1][0]])**2+
-            (lons[path[i][1]]-lons[path[i+1][1]])**2
-        ) for i in range(len(path)-1))*111
+    # ==================== 7️⃣ 繪圖 ====================
+    colors_list = ["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF",
+                   "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
+    levels = np.linspace(0, 1.2, len(colors_list))
+    cmap_custom = mcolors.LinearSegmentedColormap.from_list("custom_flow", list(zip(levels/1.2, colors_list)))
 
-        c1.metric("航行時間",f"{dist_km/ship_speed:.1f} hr")
-        c2.metric("航行距離",f"{dist_km:.1f} km")
+    fig = plt.figure(figsize=(10, 8))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
+    ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
+    ax.add_feature(cfeature.COASTLINE, zorder=3)
+    gl = ax.gridlines(draw_labels=True, alpha=0.2)
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.left_labels = True
+    gl.bottom_labels = True
 
-    c3.metric("衛星數",f"{get_visible_sats()} SATS")
+    speed = np.sqrt(u**2 + v**2)
+    im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
+    ax.figure.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
 
-    st.caption(f"資料時間 {obs_time}")
+    # 風場箭頭 (微透明黃色)
+    # ax.quiver(triton_lons, triton_lats, wind_u, wind_v, color='yellow', alpha=0.3, scale=10)
 
-# ================= 繪圖 =================
+    # 繪製禁航區 (微透明紅色)
+    # 禁航區 shapefile 或 geojson
+    # forbidden_zones = gpd.read_file("forbidden_areas.geojson")
+    # forbidden_zones.plot(ax=ax, facecolor='red', alpha=0.3, edgecolor='darkred', zorder=6)
 
-    colors=[
-    "#E5F0FF","#CCE0FF","#99C2FF","#66A3FF",
-    "#3385FF","#0066FF","#0052CC","#003D99",
-    "#002966","#001433","#000E24"
-    ]
-
-    cmap=mcolors.LinearSegmentedColormap.from_list("flow",colors)
-
-    fig=plt.figure(figsize=(10,8))
-
-    ax=plt.axes(projection=ccrs.PlateCarree())
-
-    ax.set_extent([118,124,21,26])
-
-    ax.add_feature(cfeature.LAND,facecolor='lightgray')
-    ax.add_feature(cfeature.COASTLINE)
-
-    gl=ax.gridlines(draw_labels=True,alpha=0.2)
-
-    gl.top_labels=False
-    gl.right_labels=False
-    gl.left_labels=True
-    gl.bottom_labels=True
-
-    speed=np.sqrt(u**2+v**2)
-
-    im=ax.pcolormesh(
-        lons,lats,speed,
-        cmap=cmap,
-        shading='auto',
-        alpha=0.8
-    )
-
-    plt.colorbar(im,ax=ax,label="流速 m/s",pad=0.05)
-
-    ax.quiver(
-        lons[::2],lats[::2],
-        u[::2,::2],v[::2,::2],
-        color='white',
-        alpha=0.4,
-        scale=10
-    )
-
+    # 繪製路徑
     if path:
+        path_lons = [lons[p[1]] for p in path]
+        path_lats = [lats[p[0]] for p in path]
+        ax.plot(path_lons, path_lats, color='red', linewidth=2, transform=ccrs.PlateCarree(), zorder=5)
 
-        path_lons=[lons[p[1]] for p in path]
-        path_lats=[lats[p[0]] for p in path]
-
-        ax.plot(path_lons,path_lats,color='red',linewidth=2)
-
-    ax.scatter(s_lon,s_lat,color='green',s=120,edgecolors='black')
-    ax.scatter(e_lon,e_lat,color='yellow',marker='*',s=200,edgecolors='black')
-
-    plt.title("HELIOS V6 Navigation")
-
+    ax.scatter(s_lon, s_lat, color='green', s=150, edgecolors='black', label='Start', transform=ccrs.PlateCarree(), zorder=6)
+    ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=250, edgecolors='black', label='Goal', transform=ccrs.PlateCarree(), zorder=6)
+    ax.legend(loc='upper left')
+    plt.title("HELIOS V6 智慧導航監控")
     st.pyplot(fig)
