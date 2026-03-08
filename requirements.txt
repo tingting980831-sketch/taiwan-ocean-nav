@@ -1,11 +1,9 @@
 streamlit
 xarray
 numpy
-pandas
 matplotlib
 cartopy
 geopandas
+motuclient
+netcdf4
 scipy
-zarr
-fsspec
-s3fs
