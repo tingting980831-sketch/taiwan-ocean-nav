@@ -6,15 +6,15 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import geopandas as gpd
 import heapq
 from scipy.ndimage import distance_transform_edt
+import geopandas as gpd
 
-# ==================== 1️⃣ 設定 ====================
+# ==================== 1️⃣ 設定與衛星模擬 ====================
 st.set_page_config(layout="wide", page_title="HELIOS V6")
 st.title("🛰️ HELIOS V6 智慧導航控制台")
 
-# 衛星設定
+# 衛星配置
 PLANE_COUNT = 3
 SATS_PER_PLANE = 4
 INCLINATION = 15
@@ -22,7 +22,7 @@ INCLINATION = 15
 def get_visible_sats():
     return np.random.randint(2, 5)
 
-# ==================== 2️⃣ 讀取 HYCOM 海流資料 ====================
+# ==================== 2️⃣ 讀取 HYCOM 資料 ====================
 @st.cache_data(ttl=3600)
 def load_hycom_data():
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
@@ -43,30 +43,12 @@ def load_hycom_data():
         
         return lons, lats, u_val, v_val, land_mask, latest_time
     except Exception as e:
-        st.error(f"📡 海流資料讀取失敗: {e}")
+        st.error(f"📡 數據讀取失敗: {e}")
         return None, None, None, None, None, None
 
 lons, lats, u, v, land_mask, obs_time = load_hycom_data()
 
-# ==================== 3️⃣ 讀取 TRITON 風場與波高 ====================
-@st.cache_data(ttl=3600)
-def load_triton_wind_swh(file_path):
-    try:
-        ds = xr.open_dataset(file_path)
-        wind_speed = ds['wind_speed'].values  # m/s
-        swh = ds['swh'].values  # significant wave height
-        lon = ds['lon'].values
-        lat = ds['lat'].values
-        return lon, lat, wind_speed, swh
-    except Exception as e:
-        st.error(f"📡 TRITON 風場資料讀取失敗: {e}")
-        return None, None, None, None
-
-# 假設你有 TRITON Level2 nc 檔案
-# triton_file = "TRITON_..._roughness_windspeed_vX.X.nc"
-# triton_lons, triton_lats, wind_speed, swh = load_triton_wind_swh(triton_file)
-
-# ==================== 4️⃣ 導航與安全 ====================
+# ==================== 3️⃣ 導航與安全邏輯 ====================
 def nearest_ocean_cell(lon, lat, lons, lats, land_mask):
     lon_idx = np.abs(lons - lon).argmin()
     lat_idx = np.abs(lats - lat).argmin()
@@ -109,7 +91,7 @@ def astar_v6(start, goal, u, v, land_mask, safety, ship_spd_kmh):
     if path: path.append(start)
     return path[::-1]
 
-# ==================== 5️⃣ 側邊欄 ====================
+# ==================== 4️⃣ 側邊欄 ====================
 with st.sidebar:
     st.header("📍 航點座標輸入")
     s_lon = st.number_input("起點經度 (118-124)", value=120.30, format="%.2f")
@@ -119,24 +101,23 @@ with st.sidebar:
     ship_speed = st.number_input("🚤 船速 (km/h)", value=20.0, step=1.0)
     run_nav = st.button("🚀 啟動衛星導航計算", use_container_width=True)
 
-# ==================== 6️⃣ 計算路徑 ====================
 if lons is not None:
     safety = distance_transform_edt(~land_mask)
     start_idx = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
     goal_idx = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
     path = astar_v6(start_idx, goal_idx, u, v, land_mask, safety, ship_speed)
 
-    # 儀表板
+    # 儀表板置頂
     c1, c2, c3 = st.columns(3)
     if path:
         dist_km = sum(np.sqrt((lats[path[i][0]]-lats[path[i+1][0]])**2 + (lons[path[i][1]]-lons[path[i+1][1]])**2) for i in range(len(path)-1)) * 111
         c1.metric("⏱️ 預估航行時間", f"{dist_km/ship_speed:.1f} 小時")
         c2.metric("📏 航行距離", f"{dist_km:.1f} km")
-    c3.metric("🛰️ 覆蓋衛星數", f"{get_visible_sats()} SATS")
-    st.caption(f"📅 數據時間: {obs_time.strftime('%Y-%m-%d %H:%M')} | 衛星軌道: 3 Planes / 12 Sats")
+    c3.metric("🛰️ 覆蓋衛星數", f"{get_visible_sats()} SATS (Incl: {INCLINATION}°)")
+    st.caption(f"📅 數據時間: {obs_time.strftime('%Y-%m-%d %H:%M')}")
     st.divider()
 
-    # ==================== 7️⃣ 繪圖 ====================
+    # ==================== 5️⃣ 繪圖 ====================
     colors_list = ["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF",
                    "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
     levels = np.linspace(0, 1.2, len(colors_list))
@@ -145,34 +126,39 @@ if lons is not None:
     fig = plt.figure(figsize=(10, 8))
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
+    
     ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
     ax.add_feature(cfeature.COASTLINE, zorder=3)
+    
     gl = ax.gridlines(draw_labels=True, alpha=0.2)
     gl.top_labels = False
     gl.right_labels = False
-    gl.left_labels = True
-    gl.bottom_labels = True
 
+    # 海流顏色
     speed = np.sqrt(u**2 + v**2)
     im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
-    ax.figure.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
+    cbar = ax.figure.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
 
-    # 風場箭頭 (微透明黃色)
-    # ax.quiver(triton_lons, triton_lats, wind_u, wind_v, color='yellow', alpha=0.3, scale=10)
+    # 海流箭頭
+    ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.4, scale=10, transform=ccrs.PlateCarree(), zorder=4)
 
-    # 繪製禁航區 (微透明紅色)
-    # 禁航區 shapefile 或 geojson
-    # forbidden_zones = gpd.read_file("forbidden_areas.geojson")
-    # forbidden_zones.plot(ax=ax, facecolor='red', alpha=0.3, edgecolor='darkred', zorder=6)
-
-    # 繪製路徑
+    # 路徑
     if path:
         path_lons = [lons[p[1]] for p in path]
         path_lats = [lats[p[0]] for p in path]
         ax.plot(path_lons, path_lats, color='red', linewidth=2, transform=ccrs.PlateCarree(), zorder=5)
 
-    ax.scatter(s_lon, s_lat, color='green', s=150, edgecolors='black', label='Start', transform=ccrs.PlateCarree(), zorder=6)
-    ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=250, edgecolors='black', label='Goal', transform=ccrs.PlateCarree(), zorder=6)
-    ax.legend(loc='upper left')
+    # ------------------ 風場（假資料示範） ------------------
+    # 假風速場（可替換為TRITON或其他資料）
+    wind_u = np.full_like(u, 2.0)  # 向東 2 m/s
+    wind_v = np.full_like(v, 1.0)  # 向北 1 m/s
+    ax.quiver(lons[::3], lats[::3], wind_u[::3, ::3], wind_v[::3, ::3],
+              color='yellow', alpha=0.3, scale=10, transform=ccrs.PlateCarree(), zorder=3)
+
+    # ------------------ 禁航區（假圖層示範） ------------------
+    # geojson/shapefile 讀入
+    # gdf = gpd.read_file("path_to_restricted_areas.shp")
+    # gdf.plot(ax=ax, facecolor='red', alpha=0.2, edgecolor=None, transform=ccrs.PlateCarree(), zorder=6)
+
     plt.title("HELIOS V6 智慧導航監控")
     st.pyplot(fig)
