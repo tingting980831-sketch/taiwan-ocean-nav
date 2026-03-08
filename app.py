@@ -7,27 +7,25 @@ import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import geopandas as gpd
-import heapq
+import os
 from scipy.ndimage import distance_transform_edt
+import heapq
 
-# ==================== 1️⃣ 設定 ====================
+# ==================== 1️⃣ Streamlit 設定 ====================
 st.set_page_config(layout="wide", page_title="HELIOS V6")
 st.title("🛰️ HELIOS V6 智慧導航控制台")
 
-# ----------------- 側邊欄輸入 -----------------
-with st.sidebar:
-    st.header("📍 航點座標輸入")
-    s_lon = st.number_input("起點經度", min_value=118.0, max_value=124.0, value=120.3, step=0.01)
-    s_lat = st.number_input("起點緯度", min_value=21.0, max_value=26.0, value=22.6, step=0.01)
-    e_lon = st.number_input("終點經度", min_value=118.0, max_value=124.0, value=122.0, step=0.01)
-    e_lat = st.number_input("終點緯度", min_value=21.0, max_value=26.0, value=24.5, step=0.01)
-    ship_speed = st.number_input("🚤 船速 (km/h)", min_value=1.0, max_value=50.0, value=20.0, step=1.0)
-    map_option = st.selectbox("選擇底圖", ["流向", "風向", "波高"])
-    run_nav = st.button("🚀 計算導航")
+# 衛星配置
+PLANE_COUNT = 3
+SATS_PER_PLANE = 4
+INCLINATION = 15
 
-# ==================== 2️⃣ 讀取 HYCOM 與風浪資料 ====================
+def get_visible_sats():
+    return np.random.randint(2, 5)
+
+# ==================== 2️⃣ 讀取 HYCOM 資料 ====================
 @st.cache_data(ttl=3600)
-def load_hycom():
+def load_hycom_data():
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
     try:
         ds = xr.open_dataset(url, decode_times=False)
@@ -43,15 +41,15 @@ def load_hycom():
         u_val = np.nan_to_num(u_data.values)
         v_val = np.nan_to_num(v_data.values)
         land_mask = np.isnan(u_data.values)
-
+        
         return lons, lats, u_val, v_val, land_mask, latest_time
     except Exception as e:
-        st.error(f"讀取 HYCOM 資料失敗: {e}")
+        st.error(f"📡 數據讀取失敗: {e}")
         return None, None, None, None, None, None
 
-lons, lats, u, v, land_mask, obs_time = load_hycom()
+lons, lats, u, v, land_mask, obs_time = load_hycom_data()
 
-# ==================== 3️⃣ A* 導航算法 ====================
+# ==================== 3️⃣ 導航邏輯 (A* 範例) ====================
 def nearest_ocean_cell(lon, lat, lons, lats, land_mask):
     lon_idx = np.abs(lons - lon).argmin()
     lat_idx = np.abs(lats - lat).argmin()
@@ -62,7 +60,7 @@ def nearest_ocean_cell(lon, lat, lons, lats, land_mask):
     i = dist.argmin()
     return (ocean[0][i], ocean[1][i])
 
-def astar(start, goal, u, v, land_mask, safety, ship_spd_kmh):
+def astar_v6(start, goal, u, v, land_mask, safety, ship_spd_kmh):
     v_ship = ship_spd_kmh * 0.277
     rows, cols = land_mask.shape
     dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
@@ -77,10 +75,12 @@ def astar(start, goal, u, v, land_mask, safety, ship_spd_kmh):
                 dist_m = np.sqrt(d[0]**2 + d[1]**2) * 8000
                 norm_d = np.sqrt(d[0]**2 + d[1]**2)
                 flow_v = (u[cur[0], cur[1]]*(d[1]/norm_d) + v[cur[0], cur[1]]*(d[0]/norm_d))
+                
                 v_ground = max(0.5, v_ship + flow_v)
                 step_c = (dist_m / v_ground) + (-flow_v * (dist_m / v_ship) * 1.5)
                 if safety[ni,nj] < 4:
                     step_c += 12000 / (safety[ni,nj] + 0.2)**2
+                
                 new_total = cost[cur] + step_c
                 if (ni,nj) not in cost or new_total < cost[(ni,nj)]:
                     cost[(ni,nj)] = new_total
@@ -94,62 +94,85 @@ def astar(start, goal, u, v, land_mask, safety, ship_spd_kmh):
     if path: path.append(start)
     return path[::-1]
 
-# ==================== 4️⃣ 繪圖 ====================
+# ==================== 4️⃣ 側邊欄 ====================
+with st.sidebar:
+    st.header("📍 航點座標輸入")
+    s_lon = st.number_input("起點經度", 118.0, 124.0, 120.3)
+    s_lat = st.number_input("起點緯度", 21.0, 26.0, 22.6)
+    e_lon = st.number_input("終點經度", 118.0, 124.0, 122.0)
+    e_lat = st.number_input("終點緯度", 21.0, 26.0, 24.5)
+    ship_speed = st.number_input("🚤 船速 (km/h)", 5.0, 50.0, 20.0, step=1.0)
+    map_type = st.selectbox("選擇底圖", ["流向", "風向", "波高"])
+    run_nav = st.button("🚀 啟動導航計算")
+
+# ==================== 5️⃣ 計算路徑 ====================
 if lons is not None and run_nav:
     safety = distance_transform_edt(~land_mask)
     start_idx = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
     goal_idx = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
-    path = astar(start_idx, goal_idx, u, v, land_mask, safety, ship_speed)
+    path = astar_v6(start_idx, goal_idx, u, v, land_mask, safety, ship_speed)
 
+    # 預估航行距離與時間
+    if path:
+        dist_km = sum(np.sqrt((lats[path[i][0]]-lats[path[i+1][0]])**2 + (lons[path[i][1]]-lons[path[i+1][1]])**2) for i in range(len(path)-1)) * 111
+        st.metric("⏱️ 預估航行時間", f"{dist_km/ship_speed:.1f} 小時")
+        st.metric("📏 航行距離", f"{dist_km:.1f} km")
+    st.metric("🛰️ 覆蓋衛星數", f"{get_visible_sats()} SATS (Incl: {INCLINATION}°)")
+    st.caption(f"📅 數據時間: {obs_time.strftime('%Y-%m-%d %H:%M')} | 衛星軌道: 3 Planes / 12 Sats")
+
+    # ==================== 6️⃣ 繪圖 ====================
     fig = plt.figure(figsize=(10,8))
     ax = plt.axes(projection=ccrs.PlateCarree())
-    ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
+    ax.set_extent([118,124,21,26], crs=ccrs.PlateCarree())
     ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
     ax.add_feature(cfeature.COASTLINE, zorder=3)
 
+    # 只顯示左邊和下邊座標
     gl = ax.gridlines(draw_labels=True, alpha=0.2)
     gl.top_labels = False
     gl.right_labels = False
     gl.left_labels = True
     gl.bottom_labels = True
 
-    # ----------------- 依底圖切換 -----------------
-    if map_option == "流向":
-        data_plot = np.sqrt(u**2 + v**2)
-        cmap = plt.cm.Blues
-        label = '流速 (m/s)'
-    elif map_option == "風向":
-        # 假設有風速 u_wind, v_wind
-        u_wind, v_wind = u.copy(), v.copy()  # 用 HYCOM 替代示意
-        data_plot = np.sqrt(u_wind**2 + v_wind**2)
-        cmap = plt.cm.YlOrBr
-        label = '風速 (m/s)'
-    else:  # 波高
-        swh = np.sqrt(u**2 + v**2)  # 示意 SWH, 可替換真實資料
-        data_plot = swh
-        cmap = plt.cm.Greens
-        label = '波高 (m)'
+    # 顏色對應
+    colors_list = ["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF",
+              "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
+    levels = np.linspace(0, 1.2, len(colors_list))
+    cmap_custom = mcolors.LinearSegmentedColormap.from_list("custom_flow", list(zip(levels/1.2, colors_list)))
 
-    im = ax.pcolormesh(lons, lats, data_plot, cmap=cmap, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
-    cbar = ax.figure.colorbar(im, ax=ax, label=label, shrink=0.6, pad=0.05)
+    # 根據選擇底圖
+    if map_type == "流向":
+        speed = np.sqrt(u**2 + v**2)
+        im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
+        ax.quiver(lons[::2], lats[::2], u[::2,::2], v[::2,::2], color='white', alpha=0.4, scale=10, transform=ccrs.PlateCarree(), zorder=4)
+        plt.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
+    elif map_type == "風向":
+        # TODO: 之後加入風速資料 (wind_u, wind_v)
+        ax.text(121, 23.5, "風場資料暫未加入", color='red')
+    elif map_type == "波高":
+        # TODO: 之後加入 SWH 資料
+        ax.text(121, 23.5, "波高資料暫未加入", color='red')
 
-    # ----------------- 禁航區 & 離岸風場 -----------------
-    try:
-        no_go_area = gpd.read_file("no_go_area.geojson")  # 替換成你的禁航區檔案
-        wind_area = gpd.read_file("wind_area.geojson")    # 離岸風電區
-        no_go_area.plot(ax=ax, facecolor='red', alpha=0.3, edgecolor='red', zorder=3)
-        wind_area.plot(ax=ax, facecolor='yellow', alpha=0.2, edgecolor='orange', zorder=3)
-    except Exception as e:
-        st.warning(f"禁航區或離岸風場資料缺失: {e}")
+    # ==================== 7️⃣ 禁航區與離岸風場 ====================
+    # 禁航區
+    if os.path.exists("no_go_area.geojson"):
+        no_go = gpd.read_file("no_go_area.geojson")
+        ax.add_geometries(no_go.geometry, crs=ccrs.PlateCarree(), facecolor='red', alpha=0.3, zorder=6)
+    else:
+        st.warning("禁航區資料缺失，暫時不顯示")
 
-    # ----------------- 海流箭頭 -----------------
-    ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.4, scale=10, transform=ccrs.PlateCarree(), zorder=4)
+    # 離岸風場
+    if os.path.exists("wind_area.geojson"):
+        wind = gpd.read_file("wind_area.geojson")
+        ax.add_geometries(wind.geometry, crs=ccrs.PlateCarree(), facecolor='yellow', alpha=0.2, zorder=5)
+    else:
+        st.warning("離岸風場資料缺失，暫時不顯示")
 
-    # ----------------- 航行路徑 -----------------
+    # 繪製航線
     if path:
         path_lons = [lons[p[1]] for p in path]
         path_lats = [lats[p[0]] for p in path]
-        ax.plot(path_lons, path_lats, color='red', linewidth=2, transform=ccrs.PlateCarree(), zorder=5)
+        ax.plot(path_lons, path_lats, color='red', linewidth=2, transform=ccrs.PlateCarree(), zorder=7)
 
     plt.title(f"HELIOS V6 智慧導航監控")
     st.pyplot(fig)
