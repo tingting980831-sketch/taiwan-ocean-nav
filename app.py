@@ -140,7 +140,13 @@ if lons is not None:
     
     ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
     ax.add_feature(cfeature.COASTLINE, zorder=3)
-    ax.gridlines(draw_labels=True, alpha=0.2)
+    gl = ax.gridlines(draw_labels=True, alpha=0.2)
+
+# 只顯示左邊和下邊
+gl.top_labels = False
+gl.right_labels = False
+gl.left_labels = True
+gl.bottom_labels = True
 
     speed = np.sqrt(u**2 + v**2)
     im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
