@@ -7,86 +7,93 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
 # ===============================
-# 1. 系統核心設定 (400km, 3面4顆)
+# 1. 衛星與系統設定 (400km, 3面4顆)
 # ===============================
-SAT_CONFIG = {
-    "total_sats": 12,
-    "planes": 3,
-    "altitude_km": 400,
-    "status": "Active (12/12)"
-}
+SAT_CONFIG = {"total_sats": 12, "altitude_km": 400}
 
 st.set_page_config(layout="wide", page_title="HELIOS V6")
-st.title("🛰️ HELIOS V6 智慧導航系統")
-st.markdown(f"**衛星系統：** {SAT_CONFIG['total_sats']} 顆 LEO | **軌道高度：** {SAT_CONFIG['altitude_km']}km | **狀態：** {SAT_CONFIG['status']}")
+st.title("🛰️ HELIOS V6 智慧導航控制台")
 
 # ===============================
-# 2. 讀取資料 (使用你確認可跑的邏輯)
+# 2. 側邊欄：輸入起點與終點
+# ===============================
+with st.sidebar:
+    st.header("📍 航點座標輸入")
+    st.info("請輸入經緯度，系統將自動定位至最近海域。")
+    
+    # 起點輸入
+    st.subheader("🏁 出發點")
+    s_lon = st.number_input("起點經度 (119-123)", value=120.30, format="%.2f")
+    s_lat = st.number_input("起點緯度 (20-26)", value=22.60, format="%.2f")
+    
+    # 終點輸入
+    st.subheader("🏁 目的地")
+    e_lon = st.number_input("終點經度 (119-123)", value=122.00, format="%.2f")
+    e_lat = st.number_input("終點緯度 (20-26)", value=24.50, format="%.2f")
+    
+    run_nav = st.button("🚀 啟動衛星導航計算", use_container_width=True)
+
+# ===============================
+# 3. 讀取 HYCOM 資料 (你的原始邏輯)
 # ===============================
 @st.cache_data(ttl=3600)
-def load_hycom_custom():
+def load_hycom_data():
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
     try:
         ds = xr.open_dataset(url, decode_times=False)
-        
-        # 時間處理
         time_origin = pd.to_datetime(ds['time'].attrs['time_origin'])
-        time_values = time_origin + pd.to_timedelta(ds['time'].values, unit='h')
+        latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
         
-        # 範圍選取
-        lat_slice = slice(20, 26)
-        lon_slice = slice(119, 123)
+        lat_slice, lon_slice = slice(20, 26), slice(119, 123)
+        u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
+        v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         
-        # 抓取最新一筆 (isel time=-1)
-        data_u = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
-        data_v = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
-        
-        return (data_u['lon'].values, data_u['lat'].values, 
-                data_u.values, data_v.values, time_values[-1])
+        return u_data['lon'].values, u_data['lat'].values, u_data.values, v_data.values, latest_time
     except Exception as e:
-        st.error(f"資料讀取錯誤: {e}")
+        st.error(f"資料讀取失敗: {e}")
         return None, None, None, None, None
 
-lons, lats, u, v, latest_time = load_hycom_custom()
+lons, lats, u, v, obs_time = load_hycom_data()
 
+# ===============================
+# 4. 繪圖與結果顯示
+# ===============================
 if lons is not None:
-    st.sidebar.header("🚢 導航參數設定")
-    base_speed = st.sidebar.slider("巡航航速 (kn)", 10.0, 25.0, 15.0)
-    
     # 計算流速強度
     speed = np.sqrt(u**2 + v**2)
 
-    # ===============================
-    # 3. 視覺化繪圖 (Matplotlib + Cartopy)
-    # ===============================
-    # 建立畫布與地理投影
-    fig = plt.figure(figsize=(10, 8))
-    ax = plt.axes(projection=ccrs.PlateCarree())
-    
-    # 設定顯示範圍 (與你的 slice 一致)
+    # 建立 Matplotlib 圖表
+    fig, ax = plt.subplots(figsize=(10, 8), subplot_kw={'projection': ccrs.PlateCarree()})
     ax.set_extent([119, 123, 20, 26], crs=ccrs.PlateCarree())
 
-    # --- 陸地顯示為灰色 (解決你的需求) ---
+    # 視覺化設定 (灰色陸地)
     ax.add_feature(cfeature.LAND, facecolor='gray', zorder=2)
-    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=1, zorder=3)
-    ax.add_feature(cfeature.OCEAN, facecolor='#001525', zorder=0) # 深藍海域底色
+    ax.add_feature(cfeature.COASTLINE, edgecolor='white', zorder=3)
     
-    # 繪製流速熱圖 (背景)
-    im = ax.pcolormesh(lons, lats, speed, cmap='viridis', shading='auto', alpha=0.6, zorder=1)
-    plt.colorbar(im, label='流速 (m/s)', shrink=0.7)
+    # 背景海流
+    im = ax.pcolormesh(lons, lats, speed, cmap='YlGnBu', alpha=0.7, shading='auto', zorder=1)
+    plt.colorbar(im, label='流速 (m/s)', shrink=0.6)
 
-    # 繪製海流箭頭 (Quiver)
-    # 透過 [::2] 抽樣讓箭頭不要太擠
-    skip = (slice(None, None, 2), slice(None, None, 2))
-    ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], 
-              color='white', scale=10, width=0.003, zorder=4, alpha=0.8)
+    # 繪製海流箭頭
+    ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='black', scale=10, zorder=4)
 
-    plt.title(f'台灣海域即時海流圖 (衛星同步時間: {latest_time})', color='black')
-    
-    # --- 重要：使用 Streamlit 顯示 ---
+    # 在地圖上標註「你輸入的」座標
+    ax.scatter(s_lon, s_lat, color='lime', s=150, marker='o', label='起點', edgecolors='black', zorder=10)
+    ax.scatter(e_lon, e_lat, color='yellow', s=250, marker='*', label='終點', edgecolors='black', zorder=10)
+
+    # 如果按下按鈕，畫一條直線模擬導航 (之後可以換成 A* 曲線)
+    if run_nav:
+        ax.plot([s_lon, e_lon], [s_lat, e_lat], color='red', linestyle='--', linewidth=2, label='預計航線', zorder=5)
+        st.success(f"✅ 已鎖定目標航線：從 ({s_lat}, {s_lon}) 前往 ({e_lat}, {e_lon})")
+
+    ax.legend(loc='lower right')
+    plt.title(f"HELIOS V6 即時監控 - {obs_time}")
+
+    # --- 顯示圖片 ---
     st.pyplot(fig)
-    
-    # 狀態面板
-    c1, c2 = st.columns(2)
-    c1.info(f"📅 資料觀測時間: {latest_time}")
-    c2.success(f"📡 衛星鏈路正常 (LEO Alt: {SAT_CONFIG['altitude_km']}km)")
+
+    # 數據儀表板
+    col1, col2, col3 = st.columns(3)
+    col1.metric("🛰️ 衛星高度", f"{SAT_CONFIG['altitude_km']} km")
+    col2.metric("📏 直線距離", f"{np.sqrt((s_lat-e_lat)**2 + (s_lon-e_lon)**2)*111:.1f} km")
+    col3.metric("📅 觀測時間", obs_time.strftime("%m/%d %H:%M"))
