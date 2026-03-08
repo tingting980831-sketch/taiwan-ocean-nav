@@ -2,198 +2,147 @@ import streamlit as st
 import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import geopandas as gpd
-from datetime import datetime, timedelta
-from motuclient import MotuClient
-import os
 
 st.set_page_config(layout="wide", page_title="HELIOS V7")
-st.title("HELIOS V7 智慧海洋導航系統")
+st.title("HELIOS V7 海洋導航環境監測")
 
 # =========================
 # HYCOM 海流
 # =========================
 
 @st.cache_data(ttl=3600)
-def load_hycom():
-
-    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+def load_current():
 
     try:
+
+        url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
 
         ds = xr.open_dataset(url, decode_times=False)
 
         lat_slice = slice(21,26)
         lon_slice = slice(118,124)
 
-        u = ds["ssu"].sel(lat=lat_slice,lon=lon_slice).isel(time=-1).values
-        v = ds["ssv"].sel(lat=lat_slice,lon=lon_slice).isel(time=-1).values
-
-        lons = ds["lon"].sel(lon=lon_slice).values
-        lats = ds["lat"].sel(lat=lat_slice).values
+        u = ds["ssu"].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
+        v = ds["ssv"].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
 
         speed = np.sqrt(u**2 + v**2)
 
-        return lons,lats,u,v,speed
+        lons = u.lon.values
+        lats = u.lat.values
+
+        return lons, lats, u.values, v.values, speed.values
 
     except Exception as e:
 
-        st.error(f"HYCOM讀取失敗 {e}")
+        st.error(f"HYCOM資料讀取失敗: {e}")
         return None,None,None,None,None
 
 
 # =========================
-# CMEMS 下載
+# CMEMS 風 + 波
 # =========================
 
-def download_wave_wind():
-
-    if os.path.exists("taiwan_wave_wind.nc"):
-        return
-
-    username="你的email"
-    password="你的密碼"
-
-    now=datetime.utcnow()
-    start=now-timedelta(hours=3)
-
-    date_min=start.strftime("%Y-%m-%d %H:%M:%S")
-    date_max=now.strftime("%Y-%m-%d %H:%M:%S")
-
-    client=MotuClient()
-
-    try:
-
-        client.execute(
-            motu='https://nrt.cmems-du.eu/motu-web/Motu',
-            service_id='GLOBAL_ANALYSIS_FORECAST_WAV_001_027',
-            product_id='global-analysis-forecast-waves-001-027',
-
-            longitude_min=118,
-            longitude_max=123,
-            latitude_min=21,
-            latitude_max=26,
-
-            date_min=date_min,
-            date_max=date_max,
-
-            variable=['swh','uwind','vwind'],
-
-            out_dir='.',
-            out_name='taiwan_wave_wind.nc',
-
-            user=username,
-            pwd=password
-        )
-
-        st.success("CMEMS下載完成")
-
-    except Exception as e:
-
-        st.warning(f"CMEMS下載失敗 {e}")
-
-
-# =========================
-# 讀取風與波
-# =========================
-
-@st.cache_data
+@st.cache_data(ttl=3600)
 def load_wave_wind():
 
     try:
 
-        ds=xr.open_dataset("taiwan_wave_wind.nc")
+        url = "https://nrt.cmems-du.eu/thredds/dodsC/global-analysis-forecast-waves-001-027"
 
-        u=ds["uwind"].isel(time=0).values
-        v=ds["vwind"].isel(time=0).values
+        ds = xr.open_dataset(url)
 
-        wind_speed=np.sqrt(u**2+v**2)
-        wind_dir=(270-np.degrees(np.arctan2(v,u)))%360
+        lat_slice = slice(21,26)
+        lon_slice = slice(118,124)
 
-        wave=ds["swh"].isel(time=0).values
+        wave = ds["swh"].sel(latitude=lat_slice, longitude=lon_slice).isel(time=0)
 
-        lons=ds["longitude"].values
-        lats=ds["latitude"].values
+        u = ds["uwnd"].sel(latitude=lat_slice, longitude=lon_slice).isel(time=0)
+        v = ds["vwnd"].sel(latitude=lat_slice, longitude=lon_slice).isel(time=0)
 
-        return lons,lats,wind_speed,wave,u,v
+        wind_speed = np.sqrt(u**2 + v**2)
+
+        lons = wave.longitude.values
+        lats = wave.latitude.values
+
+        return lons, lats, wind_speed.values, wave.values, u.values, v.values
 
     except Exception as e:
 
-        st.warning(f"波浪資料讀取失敗 {e}")
+        st.warning(f"CMEMS資料讀取失敗: {e}")
         return None,None,None,None,None,None
 
 
 # =========================
-# 讀取限制區
+# 限制區
 # =========================
 
 def load_zones():
 
     try:
-        no_go=gpd.read_file("no_go_area.geojson")
+        no_go = gpd.read_file("no_go_area.geojson")
     except:
-        no_go=gpd.GeoDataFrame()
+        no_go = gpd.GeoDataFrame()
 
     try:
-        windfarm=gpd.read_file("offshore_wind.geojson")
+        windfarm = gpd.read_file("offshore_wind.geojson")
     except:
-        windfarm=gpd.GeoDataFrame()
+        windfarm = gpd.GeoDataFrame()
 
-    return no_go,windfarm
+    return no_go, windfarm
 
 
 # =========================
-# 下載資料
+# 載入資料
 # =========================
 
-download_wave_wind()
+hlons, hlats, cu, cv, current_speed = load_current()
 
-hlons,hlats,u,v,current_speed=load_hycom()
+wlons, wlats, wind_speed, wave_height, wu, wv = load_wave_wind()
 
-wlons,wlats,wind_speed,wave_height,wu,wv=load_wave_wind()
+no_go, windfarm = load_zones()
 
-no_go,windfarm=load_zones()
 
 # =========================
 # UI
 # =========================
 
-layer=st.sidebar.radio(
+layer = st.sidebar.radio(
 "選擇底圖",
 ["海流","風場","波高"]
 )
 
 # =========================
-# 繪圖
+# 地圖
 # =========================
 
-fig=plt.figure(figsize=(10,8))
+fig = plt.figure(figsize=(10,8))
 
-ax=plt.axes(projection=ccrs.PlateCarree())
+ax = plt.axes(projection=ccrs.PlateCarree())
 
 ax.set_extent([118,124,21,26])
 
-ax.add_feature(cfeature.LAND,facecolor="lightgray")
+ax.add_feature(cfeature.LAND, facecolor="lightgray")
 
 ax.add_feature(cfeature.COASTLINE)
 
-gl=ax.gridlines(draw_labels=True,alpha=0.3)
+gl = ax.gridlines(draw_labels=True, alpha=0.3)
 
-gl.top_labels=False
-gl.right_labels=False
+gl.top_labels = False
+gl.right_labels = False
+
 
 # =========================
 # 海流
 # =========================
 
-if layer=="海流":
+if layer == "海流":
 
     if current_speed is not None:
 
-        im=ax.pcolormesh(
+        im = ax.pcolormesh(
             hlons,
             hlats,
             current_speed,
@@ -205,25 +154,25 @@ if layer=="海流":
         ax.quiver(
             hlons[::2],
             hlats[::2],
-            u[::2,::2],
-            v[::2,::2],
+            cu[::2,::2],
+            cv[::2,::2],
             color="white",
             alpha=0.5,
             scale=10
         )
 
-        plt.colorbar(im,ax=ax,label="流速 m/s")
+        plt.colorbar(im, ax=ax, label="流速 m/s")
 
 
 # =========================
 # 風場
 # =========================
 
-elif layer=="風場":
+elif layer == "風場":
 
     if wind_speed is not None:
 
-        im=ax.pcolormesh(
+        im = ax.pcolormesh(
             wlons,
             wlats,
             wind_speed,
@@ -241,18 +190,18 @@ elif layer=="風場":
             alpha=0.4
         )
 
-        plt.colorbar(im,ax=ax,label="風速 m/s")
+        plt.colorbar(im, ax=ax, label="風速 m/s")
 
 
 # =========================
 # 波高
 # =========================
 
-elif layer=="波高":
+elif layer == "波高":
 
     if wave_height is not None:
 
-        im=ax.pcolormesh(
+        im = ax.pcolormesh(
             wlons,
             wlats,
             wave_height,
@@ -261,7 +210,7 @@ elif layer=="波高":
             alpha=0.8
         )
 
-        plt.colorbar(im,ax=ax,label="波高 m")
+        plt.colorbar(im, ax=ax, label="波高 m")
 
 
 # =========================
@@ -277,6 +226,7 @@ if not no_go.empty:
         edgecolor="darkred"
     )
 
+
 # =========================
 # 離岸風場
 # =========================
@@ -291,6 +241,6 @@ if not windfarm.empty:
     )
 
 
-plt.title("HELIOS V7 海洋導航環境監測")
+plt.title("HELIOS V7 海洋導航系統")
 
 st.pyplot(fig)
