@@ -1,88 +1,296 @@
 import streamlit as st
 import xarray as xr
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import geopandas as gpd
-from scipy.ndimage import distance_transform_edt
+from datetime import datetime, timedelta
+from motuclient import MotuClient
+import os
 
-# ==================== 1️⃣ 網頁設定 ====================
 st.set_page_config(layout="wide", page_title="HELIOS V7")
-st.title("🛰️ HELIOS V7 智慧導航控制台")
+st.title("HELIOS V7 智慧海洋導航系統")
 
-# ==================== 2️⃣ 讀取 HYCOM 海流資料 ====================
+# =========================
+# HYCOM 海流
+# =========================
+
 @st.cache_data(ttl=3600)
 def load_hycom():
+
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+
     try:
+
         ds = xr.open_dataset(url, decode_times=False)
-        lat_slice, lon_slice = slice(21, 26), slice(118, 124)
-        u = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1).values
-        v = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1).values
-        lons = ds['lon'].sel(lon=lon_slice).values
-        lats = ds['lat'].sel(lat=lat_slice).values
-        land_mask = np.isnan(u)
-        return lons, lats, u, v, land_mask
-    except Exception as e:
-        st.error(f"HYCOM資料讀取失敗: {e}")
-        return None, None, None, None, None
 
-lons, lats, u, v, land_mask = load_hycom()
+        lat_slice = slice(21,26)
+        lon_slice = slice(118,124)
 
-# ==================== 3️⃣ 讀取禁航區與離岸風場 ====================
-try:
-    no_go_area = gpd.read_file("no_go_area.geojson")
-except:
-    st.warning("禁航區資料缺失，暫時不顯示")
-    no_go_area = gpd.GeoDataFrame()
+        u = ds["ssu"].sel(lat=lat_slice,lon=lon_slice).isel(time=-1).values
+        v = ds["ssv"].sel(lat=lat_slice,lon=lon_slice).isel(time=-1).values
 
-try:
-    offshore_wind = gpd.read_file("offshore_wind.geojson")
-except:
-    st.warning("離岸風場資料缺失，暫時不顯示")
-    offshore_wind = gpd.GeoDataFrame()
+        lons = ds["lon"].sel(lon=lon_slice).values
+        lats = ds["lat"].sel(lat=lat_slice).values
 
-# ==================== 4️⃣ 側邊欄選擇 ====================
-plot_type = st.sidebar.radio("選擇底圖", ["海流", "風場", "波高"])
-
-# ==================== 5️⃣ 繪圖 ====================
-if lons is not None:
-    fig = plt.figure(figsize=(10,8))
-    ax = plt.axes(projection=ccrs.PlateCarree())
-    ax.set_extent([118,124,21,26], crs=ccrs.PlateCarree())
-    ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
-    ax.add_feature(cfeature.COASTLINE, zorder=3)
-
-    gl = ax.gridlines(draw_labels=True, alpha=0.3)
-    gl.top_labels = False
-    gl.right_labels = False
-
-    if plot_type == "海流":
         speed = np.sqrt(u**2 + v**2)
-        colors_list = ["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF",
-                       "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
-        levels = np.linspace(0, 1.2, len(colors_list))
-        cmap_custom = mcolors.LinearSegmentedColormap.from_list("custom_flow", list(zip(levels/1.2, colors_list)))
-        im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, zorder=1)
-        ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.4, scale=10, zorder=4)
-        cbar = ax.figure.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
 
-    elif plot_type == "風場":
-        st.info("風場資料目前未接入")
+        return lons,lats,u,v,speed
 
-    elif plot_type == "波高":
-        st.info("波高資料目前未接入")
+    except Exception as e:
 
-    # 繪製禁航區（微透明紅色）
-    if not no_go_area.empty:
-        no_go_area.plot(ax=ax, facecolor='red', alpha=0.3, edgecolor='darkred', zorder=5)
+        st.error(f"HYCOM讀取失敗 {e}")
+        return None,None,None,None,None
 
-    # 繪製離岸風場（微透明黃色）
-    if not offshore_wind.empty:
-        offshore_wind.plot(ax=ax, facecolor='yellow', alpha=0.3, edgecolor='goldenrod', zorder=6)
 
-    plt.title(f"HELIOS V7 智慧導航監控 - {plot_type}")
-    st.pyplot(fig)
+# =========================
+# CMEMS 下載
+# =========================
+
+def download_wave_wind():
+
+    if os.path.exists("taiwan_wave_wind.nc"):
+        return
+
+    username="你的email"
+    password="你的密碼"
+
+    now=datetime.utcnow()
+    start=now-timedelta(hours=3)
+
+    date_min=start.strftime("%Y-%m-%d %H:%M:%S")
+    date_max=now.strftime("%Y-%m-%d %H:%M:%S")
+
+    client=MotuClient()
+
+    try:
+
+        client.execute(
+            motu='https://nrt.cmems-du.eu/motu-web/Motu',
+            service_id='GLOBAL_ANALYSIS_FORECAST_WAV_001_027',
+            product_id='global-analysis-forecast-waves-001-027',
+
+            longitude_min=118,
+            longitude_max=123,
+            latitude_min=21,
+            latitude_max=26,
+
+            date_min=date_min,
+            date_max=date_max,
+
+            variable=['swh','uwind','vwind'],
+
+            out_dir='.',
+            out_name='taiwan_wave_wind.nc',
+
+            user=username,
+            pwd=password
+        )
+
+        st.success("CMEMS下載完成")
+
+    except Exception as e:
+
+        st.warning(f"CMEMS下載失敗 {e}")
+
+
+# =========================
+# 讀取風與波
+# =========================
+
+@st.cache_data
+def load_wave_wind():
+
+    try:
+
+        ds=xr.open_dataset("taiwan_wave_wind.nc")
+
+        u=ds["uwind"].isel(time=0).values
+        v=ds["vwind"].isel(time=0).values
+
+        wind_speed=np.sqrt(u**2+v**2)
+        wind_dir=(270-np.degrees(np.arctan2(v,u)))%360
+
+        wave=ds["swh"].isel(time=0).values
+
+        lons=ds["longitude"].values
+        lats=ds["latitude"].values
+
+        return lons,lats,wind_speed,wave,u,v
+
+    except Exception as e:
+
+        st.warning(f"波浪資料讀取失敗 {e}")
+        return None,None,None,None,None,None
+
+
+# =========================
+# 讀取限制區
+# =========================
+
+def load_zones():
+
+    try:
+        no_go=gpd.read_file("no_go_area.geojson")
+    except:
+        no_go=gpd.GeoDataFrame()
+
+    try:
+        windfarm=gpd.read_file("offshore_wind.geojson")
+    except:
+        windfarm=gpd.GeoDataFrame()
+
+    return no_go,windfarm
+
+
+# =========================
+# 下載資料
+# =========================
+
+download_wave_wind()
+
+hlons,hlats,u,v,current_speed=load_hycom()
+
+wlons,wlats,wind_speed,wave_height,wu,wv=load_wave_wind()
+
+no_go,windfarm=load_zones()
+
+# =========================
+# UI
+# =========================
+
+layer=st.sidebar.radio(
+"選擇底圖",
+["海流","風場","波高"]
+)
+
+# =========================
+# 繪圖
+# =========================
+
+fig=plt.figure(figsize=(10,8))
+
+ax=plt.axes(projection=ccrs.PlateCarree())
+
+ax.set_extent([118,124,21,26])
+
+ax.add_feature(cfeature.LAND,facecolor="lightgray")
+
+ax.add_feature(cfeature.COASTLINE)
+
+gl=ax.gridlines(draw_labels=True,alpha=0.3)
+
+gl.top_labels=False
+gl.right_labels=False
+
+# =========================
+# 海流
+# =========================
+
+if layer=="海流":
+
+    if current_speed is not None:
+
+        im=ax.pcolormesh(
+            hlons,
+            hlats,
+            current_speed,
+            cmap="Blues",
+            shading="auto",
+            alpha=0.8
+        )
+
+        ax.quiver(
+            hlons[::2],
+            hlats[::2],
+            u[::2,::2],
+            v[::2,::2],
+            color="white",
+            alpha=0.5,
+            scale=10
+        )
+
+        plt.colorbar(im,ax=ax,label="流速 m/s")
+
+
+# =========================
+# 風場
+# =========================
+
+elif layer=="風場":
+
+    if wind_speed is not None:
+
+        im=ax.pcolormesh(
+            wlons,
+            wlats,
+            wind_speed,
+            cmap="Oranges",
+            shading="auto",
+            alpha=0.8
+        )
+
+        ax.quiver(
+            wlons[::2],
+            wlats[::2],
+            wu[::2,::2],
+            wv[::2,::2],
+            color="black",
+            alpha=0.4
+        )
+
+        plt.colorbar(im,ax=ax,label="風速 m/s")
+
+
+# =========================
+# 波高
+# =========================
+
+elif layer=="波高":
+
+    if wave_height is not None:
+
+        im=ax.pcolormesh(
+            wlons,
+            wlats,
+            wave_height,
+            cmap="coolwarm",
+            shading="auto",
+            alpha=0.8
+        )
+
+        plt.colorbar(im,ax=ax,label="波高 m")
+
+
+# =========================
+# 禁航區
+# =========================
+
+if not no_go.empty:
+
+    no_go.plot(
+        ax=ax,
+        facecolor="red",
+        alpha=0.3,
+        edgecolor="darkred"
+    )
+
+# =========================
+# 離岸風場
+# =========================
+
+if not windfarm.empty:
+
+    windfarm.plot(
+        ax=ax,
+        facecolor="yellow",
+        alpha=0.3,
+        edgecolor="gold"
+    )
+
+
+plt.title("HELIOS V7 海洋導航環境監測")
+
+st.pyplot(fig)
