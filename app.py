@@ -13,10 +13,9 @@ from scipy.ndimage import distance_transform_edt
 st.set_page_config(layout="wide", page_title="HELIOS V6")
 st.title("🛰️ HELIOS V6 智慧導航控制台")
 
-# 衛星配置：3 軌道面，每面 4 顆，頃角 15 度
 PLANE_COUNT = 3
 SATS_PER_PLANE = 4
-INCLINATION = 15 
+INCLINATION = 15
 
 def get_visible_sats():
     return np.random.randint(2, 5)
@@ -29,18 +28,14 @@ def load_hycom_data():
         ds = xr.open_dataset(url, decode_times=False)
         time_origin = pd.to_datetime(ds['time'].attrs['time_origin'])
         latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
-        
-        # 修正：緯度上限切到 25.5，徹底移除上方空白區域
         lat_slice, lon_slice = slice(21, 26), slice(118, 124)
         u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
         v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
-        
         lons = u_data['lon'].values
         lats = u_data['lat'].values
         u_val = np.nan_to_num(u_data.values)
         v_val = np.nan_to_num(v_data.values)
         land_mask = np.isnan(u_data.values)
-        
         return lons, lats, u_val, v_val, land_mask, latest_time
     except Exception as e:
         st.error(f"📡 數據讀取失敗: {e}")
@@ -75,12 +70,9 @@ def astar_v6(start, goal, u, v, land_mask, safety, ship_spd_kmh):
                 norm_d = np.sqrt(d[0]**2 + d[1]**2)
                 flow_v = (u[cur[0], cur[1]]*(d[1]/norm_d) + v[cur[0], cur[1]]*(d[0]/norm_d))
                 v_ground = max(0.5, v_ship + flow_v)
-                
                 step_c = (dist_m / v_ground) + (-flow_v * (dist_m / v_ship) * 1.5)
-                # 加強避障，防止太貼台灣
                 if safety[ni,nj] < 4:
-                    step_c += 15000 / (safety[ni,nj] + 0.2)**2
-                
+                    step_c += 12000 / (safety[ni,nj] + 0.2)**2
                 new_total = cost[cur] + step_c
                 if (ni,nj) not in cost or new_total < cost[(ni,nj)]:
                     cost[(ni,nj)] = new_total
@@ -90,11 +82,12 @@ def astar_v6(start, goal, u, v, land_mask, safety, ship_spd_kmh):
     path = []
     curr = goal
     while curr in came_from:
-        path.append(curr); curr = came_from[curr]
+        path.append(curr)
+        curr = came_from[curr]
     if path: path.append(start)
     return path[::-1]
 
-# ==================== 4️⃣ 側邊欄與儀表板 ====================
+# ==================== 4️⃣ 側邊欄 ====================
 with st.sidebar:
     st.header("📍 航點座標輸入")
     s_lon = st.number_input("起點經度 (118-124)", value=120.30, format="%.2f")
@@ -104,6 +97,7 @@ with st.sidebar:
     ship_speed = st.number_input("🚤 船速 (km/h)", value=20.0, step=1.0)
     run_nav = st.button("🚀 啟動衛星導航計算", use_container_width=True)
 
+# ==================== 5️⃣ 計算與繪圖 ====================
 if lons is not None:
     safety = distance_transform_edt(~land_mask)
     start_idx = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
@@ -116,25 +110,23 @@ if lons is not None:
         dist_km = sum(np.sqrt((lats[path[i][0]]-lats[path[i+1][0]])**2 + (lons[path[i][1]]-lons[path[i+1][1]])**2) for i in range(len(path)-1)) * 111
         c1.metric("⏱️ 預估航行時間", f"{dist_km/ship_speed:.1f} 小時")
         c2.metric("📏 航行距離", f"{dist_km:.1f} km")
-    
     c3.metric("🛰️ 覆蓋衛星數", f"{get_visible_sats()} SATS (Incl: {INCLINATION}°)")
     st.caption(f"📅 數據時間: {obs_time.strftime('%Y-%m-%d %H:%M')} | 衛星軌道: 3 Planes / 12 Sats")
     st.divider()
 
-    # ==================== 5️⃣ 繪圖 ====================
+    # --- 繪圖 ---
     colors_list = ["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF",
-                  "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
-    cmap_custom = mcolors.LinearSegmentedColormap.from_list("custom_flow", colors_list)
+                   "#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
+    levels = np.linspace(0, 1.2, len(colors_list))
+    cmap_custom = mcolors.LinearSegmentedColormap.from_list("custom_flow", list(zip(levels/1.2, colors_list)))
 
     fig = plt.figure(figsize=(10, 8))
     ax = plt.axes(projection=ccrs.PlateCarree())
-    
-    # 修正顯示邊界，移除空白區
-    ax.set_extent([118.5, 123.5, 21.0, 25.4], crs=ccrs.PlateCarree())
-    
+    ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
     ax.add_feature(cfeature.LAND, facecolor='lightgray', zorder=2)
     ax.add_feature(cfeature.COASTLINE, zorder=3)
-    
+
+    # 經緯度：只顯示左與下
     gl = ax.gridlines(draw_labels=True, alpha=0.2)
     gl.top_labels = False
     gl.right_labels = False
@@ -143,9 +135,7 @@ if lons is not None:
 
     speed = np.sqrt(u**2 + v**2)
     im = ax.pcolormesh(lons, lats, speed, cmap=cmap_custom, shading='auto', alpha=0.8, transform=ccrs.PlateCarree(), zorder=1)
-    
-    # 🌟 色條往右偏移：設定 pad=0.1 
-    cbar = fig.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.2)
+    cbar = ax.figure.colorbar(im, ax=ax, label='流速 (m/s)', shrink=0.6, pad=0.05)
 
     ax.quiver(lons[::2], lats[::2], u[::2, ::2], v[::2, ::2], color='white', alpha=0.4, scale=10, transform=ccrs.PlateCarree(), zorder=4)
 
@@ -156,7 +146,7 @@ if lons is not None:
 
     ax.scatter(s_lon, s_lat, color='green', s=150, edgecolors='black', label='Start', transform=ccrs.PlateCarree(), zorder=6)
     ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=250, edgecolors='black', label='Goal', transform=ccrs.PlateCarree(), zorder=6)
-    
+
     ax.legend(loc='upper left')
     plt.title(f"HELIOS V6 智慧導航監控")
     st.pyplot(fig)
