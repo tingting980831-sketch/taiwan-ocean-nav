@@ -6,4 +6,5 @@ matplotlib
 cartopy
 scipy
 plotly
+requests
 netCDF4
