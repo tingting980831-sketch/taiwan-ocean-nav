@@ -2,16 +2,16 @@ import streamlit as st
 import numpy as np
 import requests
 import xarray as xr
-from scipy.ndimage import distance_transform_edt
+import pandas as pd
+import pydeck as pdk
 
 st.set_page_config(layout="wide")
 
 # ===============================
-# 海象資料 (波高 + 風速)
+# 海象資料 (波高 + 風)
 # ===============================
 def get_realtime_marine_data(lat, lon):
 
-    # 波高
     marine_url = "https://marine-api.open-meteo.com/v1/marine"
     marine_params = {
         "latitude": lat,
@@ -20,9 +20,6 @@ def get_realtime_marine_data(lat, lon):
         "timezone": "Asia/Taipei"
     }
 
-    marine = requests.get(marine_url, params=marine_params).json()
-
-    # 風
     weather_url = "https://api.open-meteo.com/v1/forecast"
     weather_params = {
         "latitude": lat,
@@ -31,6 +28,7 @@ def get_realtime_marine_data(lat, lon):
         "timezone": "Asia/Taipei"
     }
 
+    marine = requests.get(marine_url, params=marine_params).json()
     weather = requests.get(weather_url, params=weather_params).json()
 
     try:
@@ -49,7 +47,7 @@ def get_realtime_marine_data(lat, lon):
 
 
 # ===============================
-# HYCOM 海流
+# HYCOM海流
 # ===============================
 @st.cache_data
 def load_hycom():
@@ -57,7 +55,6 @@ def load_hycom():
     try:
 
         url = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/latest"
-
         ds = xr.open_dataset(url)
 
         lats = ds["lat"].values
@@ -72,7 +69,6 @@ def load_hycom():
 
     except:
 
-        # fallback
         lons = np.linspace(118,124,120)
         lats = np.linspace(21,26,120)
 
@@ -83,36 +79,39 @@ def load_hycom():
 
 
 # ===============================
-# 最近海格點
+# 最近格點
 # ===============================
-def nearest_ocean_cell(lon,lat,lons,lats):
+def nearest_cell(lon,lat,lons,lats):
 
     j = np.argmin(np.abs(lons-lon))
     i = np.argmin(np.abs(lats-lat))
 
-    return (i,j)
+    return i,j
 
 
 # ===============================
-# 簡化A*航線
+# 簡化航線
 # ===============================
-def astar(start,goal):
-
-    path=[start]
+def build_route(start,goal,lons,lats):
 
     i0,j0=start
     i1,j1=goal
 
-    steps=100
+    path=[]
+
+    steps=80
 
     for k in range(steps):
 
         i=int(i0+(i1-i0)*k/steps)
         j=int(j0+(j1-j0)*k/steps)
 
-        path.append((i,j))
+        lat=lats[i]
+        lon=lons[j]
 
-    path.append(goal)
+        path.append([lon,lat])
+
+    path.append([lons[j1],lats[i1]])
 
     return path
 
@@ -121,6 +120,7 @@ def astar(start,goal):
 # 假衛星數
 # ===============================
 def get_visible_sats():
+
     return np.random.randint(18,32)
 
 
@@ -130,21 +130,21 @@ def get_visible_sats():
 
 st.title("HELIOS 海洋導航系統")
 
-col1,col2=st.columns(2)
+col1,col2 = st.columns(2)
 
 with col1:
 
-    s_lat=st.number_input("起點緯度",value=24.0)
-    s_lon=st.number_input("起點經度",value=120.0)
+    s_lat = st.number_input("起點緯度",value=24.0)
+    s_lon = st.number_input("起點經度",value=120.0)
 
 with col2:
 
-    e_lat=st.number_input("終點緯度",value=23.0)
-    e_lon=st.number_input("終點經度",value=121.0)
+    e_lat = st.number_input("終點緯度",value=23.5)
+    e_lon = st.number_input("終點經度",value=121.2)
 
-ship_speed=st.slider("船速 (km/h)",10,60,30)
+ship_speed = st.slider("船速 km/h",10,60,30)
 
-run=st.button("計算航線")
+run = st.button("計算航線")
 
 
 # ===============================
@@ -155,10 +155,10 @@ if run:
 
     lons,lats,u,v,obs_time = load_hycom()
 
-    start=nearest_ocean_cell(s_lon,s_lat,lons,lats)
-    goal=nearest_ocean_cell(e_lon,e_lat,lons,lats)
+    start = nearest_cell(s_lon,s_lat,lons,lats)
+    goal  = nearest_cell(e_lon,e_lat,lons,lats)
 
-    path=astar(start,goal)
+    route = build_route(start,goal,lons,lats)
 
     # 海象
     wave,wind_speed,wind_dir = get_realtime_marine_data(
@@ -166,47 +166,99 @@ if run:
         (s_lon+e_lon)/2
     )
 
-    # 風場轉向量
-    if wind_speed is not None and wind_dir is not None:
+    # 風向轉向量
+    if wind_speed and wind_dir:
 
-        theta=np.deg2rad(270-wind_dir)
+        theta = np.deg2rad(270-wind_dir)
 
-        wind_u=wind_speed*np.cos(theta)
-        wind_v=wind_speed*np.sin(theta)
+        wind_u = wind_speed*np.cos(theta)
+        wind_v = wind_speed*np.sin(theta)
 
     else:
 
         wind_u=0
         wind_v=0
 
-    # 距離
-    dist_km=sum(np.sqrt(
-        (lats[path[i][0]]-lats[path[i+1][0]])**2+
-        (lons[path[i][1]]-lons[path[i+1][1]])**2
-    ) for i in range(len(path)-1))*111
 
-    time_hr=dist_km/ship_speed
+    # ===============================
+    # 距離
+    # ===============================
+
+    dist_km=0
+
+    for i in range(len(route)-1):
+
+        lat1=route[i][1]
+        lon1=route[i][0]
+
+        lat2=route[i+1][1]
+        lon2=route[i+1][0]
+
+        dist_km += np.sqrt((lat1-lat2)**2+(lon1-lon2)**2)*111
+
+    time_hr = dist_km/ship_speed
 
 
     # ===============================
     # Dashboard
     # ===============================
 
-    c1,c2,c3=st.columns(3)
+    c1,c2,c3 = st.columns(3)
 
     c1.metric("航行時間",f"{time_hr:.1f} hr")
     c2.metric("航行距離",f"{dist_km:.1f} km")
     c3.metric("衛星數",f"{get_visible_sats()} SATS")
 
-    wave_status="OK" if wave is not None else "未接到"
-    wind_status="OK" if wind_speed is not None else "未接到"
+
+    wave_status = "OK" if wave is not None else "未接到"
+    wind_status = "OK" if wind_speed is not None else "未接到"
 
     st.caption(
-        f"HYCOM資料時間 {obs_time} | 波高資料: {wave_status}, 風速資料: {wind_status}"
+        f"HYCOM資料時間 {obs_time} | 波高資料: {wave_status} | 風速資料: {wind_status}"
     )
 
-    if wave is not None:
-        st.write(f"波高: {wave:.2f} m")
 
-    if wind_speed is not None:
-        st.write(f"風速: {wind_speed:.2f} m/s")
+    # ===============================
+    # 地圖
+    # ===============================
+
+    route_df = pd.DataFrame(route,columns=["lon","lat"])
+
+    line_layer = pdk.Layer(
+        "PathLayer",
+        data=[{"path":route}],
+        get_path="path",
+        width_scale=20,
+        width_min_pixels=3,
+        get_color=[255,0,0]
+    )
+
+    start_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=pd.DataFrame([[s_lon,s_lat]],columns=["lon","lat"]),
+        get_position='[lon,lat]',
+        get_color=[0,255,0],
+        get_radius=5000
+    )
+
+    end_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=pd.DataFrame([[e_lon,e_lat]],columns=["lon","lat"]),
+        get_position='[lon,lat]',
+        get_color=[255,0,0],
+        get_radius=5000
+    )
+
+    view = pdk.ViewState(
+        latitude=(s_lat+e_lat)/2,
+        longitude=(s_lon+e_lon)/2,
+        zoom=6
+    )
+
+    deck = pdk.Deck(
+        layers=[line_layer,start_layer,end_layer],
+        initial_view_state=view,
+        map_style="mapbox://styles/mapbox/light-v9"
+    )
+
+    st.pydeck_chart(deck)
