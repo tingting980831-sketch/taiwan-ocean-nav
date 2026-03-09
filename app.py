@@ -43,16 +43,16 @@ def load_hycom_data():
 lons,lats,u,v,land_mask,obs_time = load_hycom_data()
 
 # ===============================
-# 波高 + 風速 API（只改波高抓取方式）
+# 波高 + 風速 API（只改波高抓取方法）
 # ===============================
 @st.cache_data(ttl=1800)
 def get_realtime_marine_data(lat, lon):
-    # 波高 (新的 marine API)
+    # 只換波高 API
     marine_url = "https://marine-api.open-meteo.com/v1/marine"
     marine_params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": ["wave_height"],  # 只抓波高
+        "hourly": ["wave_height"],
         "timezone": "Asia/Taipei",
         "forecast_days": 1
     }
@@ -63,7 +63,7 @@ def get_realtime_marine_data(lat, lon):
     except:
         wave = None
 
-    # 風速 (保留原本的 Open-Meteo forecast API)
+    # 風速保持原本方法
     weather_url = "https://api.open-meteo.com/v1/forecast"
     weather_params = {
         "latitude": lat,
