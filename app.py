@@ -43,10 +43,10 @@ def load_hycom_data():
 lons, lats, u, v, land_mask, obs_time = load_hycom_data()
 
 # ===============================
-# 取得風速 API
+# 風速 API (僅保留風速)
 # ===============================
 @st.cache_data(ttl=1800)
-def get_realtime_wind(lat, lon):
+def get_realtime_weather_data(lat, lon):
     now = datetime.now(timezone.utc)
     wind_speed, wind_dir = None, None
     try:
@@ -109,6 +109,7 @@ def astar(start,goal,u,v,land_mask,safety,ship_spd,wind_factor=0):
                 flow = (u[cur]*(d[1]/norm) + v[cur]*(d[0]/norm))
                 v_ground = max(0.5,v_ship+flow)
                 step = (dist_m/v_ground)+(-flow*(dist_m/v_ship)*1.5)
+                # 僅計入風速成本影響
                 step += wind_factor*40
                 if safety[ni,nj]<4:
                     step += 12000/(safety[ni,nj]+0.2)**2
@@ -146,15 +147,10 @@ if lons is not None:
     start = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
     goal  = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
 
-    wind_speed, wind_dir = get_realtime_wind((s_lat + e_lat)/2, (s_lon + e_lon)/2)
-
-    # 風向轉向量
-    if wind_speed is None or wind_dir is None:
-        wind_u, wind_v = 0,0
-    else:
-        theta = np.deg2rad(270 - wind_dir)
-        wind_u = wind_speed*np.cos(theta)
-        wind_v = wind_speed*np.sin(theta)
+    wind_speed, wind_dir = get_realtime_weather_data(
+        (s_lat + e_lat)/2,
+        (s_lon + e_lon)/2
+    )
 
     path = astar(
         start,
@@ -193,13 +189,17 @@ if lons is not None:
     ax.set_extent([118,124,21,26])
     ax.add_feature(cfeature.LAND, facecolor='lightgray')
     ax.add_feature(cfeature.COASTLINE)
+    
+    # 強度計算移除波高項
     total_factor = np.sqrt(u**2 + v**2) + (wind_speed if wind_speed else 0)
     im = ax.pcolormesh(lons, lats, total_factor, cmap=cmap, shading='auto', alpha=0.8)
     plt.colorbar(im, ax=ax, label="海象強度")
+    
     if path:
         path_lons = [lons[p[1]] for p in path]
         path_lats = [lats[p[0]] for p in path]
         ax.plot(path_lons, path_lats, color='red', linewidth=2)
+    
     ax.scatter(s_lon, s_lat, color='green', s=120, edgecolors='black')
     ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=200, edgecolors='black')
     plt.title("HELIOS V7 Navigation")
