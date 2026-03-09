@@ -38,7 +38,7 @@ def load_hycom_data():
     u_val = np.nan_to_num(u_data.values)
     v_val = np.nan_to_num(v_data.values)
     land_mask = np.isnan(u_data.values)
-    return lons,lats,u_val,v_val,land_mask,latest_time
+    return lons, lats, u_val, v_val, land_mask, latest_time
 
 lons,lats,u,v,land_mask,obs_time = load_hycom_data()
 
@@ -47,26 +47,37 @@ lons,lats,u,v,land_mask,obs_time = load_hycom_data()
 # ===============================
 @st.cache_data(ttl=1800)
 def get_realtime_marine_data(lat, lon):
-    url = "https://marine-api.open-meteo.com/v1/marine"
-    params = {
+    # 波高 (新的 marine API)
+    marine_url = "https://marine-api.open-meteo.com/v1/marine"
+    marine_params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": ["wave_height","wind_speed_10m","wind_direction_10m"],
+        "hourly": ["wave_height"],  # 只抓波高
         "timezone": "Asia/Taipei",
         "forecast_days": 1
     }
-    data = requests.get(url, params=params).json()
-    hourly = data.get("hourly", {})
+    marine = requests.get(marine_url, params=marine_params).json()
+    try:
+        wave_list = marine.get("hourly", {}).get("wave_height", [None])
+        wave = float(wave_list[0]) if wave_list[0] is not None else None
+    except:
+        wave = None
 
-    # 波高
-    wave_list = hourly.get("wave_height", [None])
-    wave = float(wave_list[0]) if wave_list[0] is not None else None
-
-    # 風速 & 風向 (保持原本做法)
-    wind_list = hourly.get("wind_speed_10m", [None])
-    wind_speed = float(wind_list[0]) if wind_list[0] is not None else None
-    wind_dir_list = hourly.get("wind_direction_10m", [None])
-    wind_dir = float(wind_dir_list[0]) if wind_dir_list[0] is not None else None
+    # 風速 (保留原本的 Open-Meteo forecast API)
+    weather_url = "https://api.open-meteo.com/v1/forecast"
+    weather_params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ["wind_speed_10m","wind_direction_10m"],
+        "timezone": "Asia/Taipei"
+    }
+    weather = requests.get(weather_url, params=weather_params).json()
+    try:
+        wind_speed = float(weather.get("hourly", {}).get("wind_speed_10m", [None])[0])
+        wind_dir   = float(weather.get("hourly", {}).get("wind_direction_10m", [None])[0])
+    except:
+        wind_speed = None
+        wind_dir = None
 
     return wave, wind_speed, wind_dir
 
@@ -87,7 +98,7 @@ def nearest_ocean_cell(lon,lat,lons,lats,land_mask):
 # A* 航線
 # ===============================
 def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
-    v_ship = ship_spd*0.277
+    v_ship = ship_spd*0.277  # km/h -> m/s
     rows,cols = land_mask.shape
     dirs=[(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
     pq=[(0,start)]
@@ -105,7 +116,7 @@ def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
                 flow = (u[cur]*(d[1]/norm) + v[cur]*(d[0]/norm))
                 v_ground = max(0.5,v_ship+flow)
                 step = (dist_m/v_ground)+(-flow*(dist_m/v_ship)*1.5)
-                step += (wave_factor**2)*60 + (wind_factor if wind_factor else 0)*40
+                step += (wave_factor**2)*60 + wind_factor*40
                 if safety[ni,nj]<4:
                     step += 12000/(safety[ni,nj]+0.2)**2
                 new = cost[cur]+step
@@ -142,7 +153,10 @@ if lons is not None:
     start = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
     goal  = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
 
-    wave, wind_speed, wind_dir = get_realtime_marine_data((s_lat + e_lat)/2, (s_lon + e_lon)/2)
+    wave, wind_speed, wind_dir = get_realtime_marine_data(
+        (s_lat + e_lat)/2,
+        (s_lon + e_lon)/2
+    )
 
     # 風向轉向量
     if wind_speed is None or wind_dir is None:
@@ -153,7 +167,13 @@ if lons is not None:
         wind_v = wind_speed*np.sin(theta)
 
     path = astar(
-        start, goal, u, v, land_mask, safety, ship_speed,
+        start,
+        goal,
+        u,
+        v,
+        land_mask,
+        safety,
+        ship_speed,
         wave_factor=wave if wave else 0,
         wind_factor=wind_speed if wind_speed else 0
     )
@@ -164,7 +184,7 @@ if lons is not None:
     c1, c2, c3 = st.columns(3)
     if path:
         dist_km = sum(np.sqrt(
-            (lats[path[i][0]]-lats[path[i+1][0]])**2 +
+            (lats[path[i][0]]-lats[path[i+1][0]])**2+
             (lons[path[i][1]]-lons[path[i+1][1]])**2
         ) for i in range(len(path)-1))*111
         c1.metric("航行時間",f"{dist_km/ship_speed:.1f} hr")
@@ -178,11 +198,7 @@ if lons is not None:
     # ===============================
     # 2D 地圖
     # ===============================
-    colors=[
-        "#E5F0FF","#CCE0FF","#99C2FF","#66A3FF",
-        "#3385FF","#0066FF","#0052CC","#003D99",
-        "#002966","#001433","#000E24"
-    ]
+    colors=["#E5F0FF","#CCE0FF","#99C2FF","#66A3FF","#3385FF","#0066FF","#0052CC","#003D99","#002966","#001433","#000E24"]
     cmap = mcolors.LinearSegmentedColormap.from_list("flow", colors)
     fig = plt.figure(figsize=(10,8))
     ax = plt.axes(projection=ccrs.PlateCarree())
@@ -208,10 +224,7 @@ if lons is not None:
     lon_grid, lat_grid = np.meshgrid(lons, lats)
     flow_speed = np.sqrt(u**2+v**2)
     fig3d = go.Figure()
-    fig3d.add_trace(go.Surface(
-        x=lon_grid, y=lat_grid, z=flow_speed,
-        colorscale="Blues", opacity=0.8
-    ))
+    fig3d.add_trace(go.Surface(x=lon_grid, y=lat_grid, z=flow_speed, colorscale="Blues", opacity=0.8))
     skip = 3
     fig3d.add_trace(go.Cone(
         x=lon_grid[::skip,::skip].flatten(),
