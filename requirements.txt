@@ -7,3 +7,4 @@ geopandas
 motuclient
 netcdf4
 scipy
+plotly
