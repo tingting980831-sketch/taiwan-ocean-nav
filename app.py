@@ -57,8 +57,10 @@ def get_realtime_marine_data(lat, lon):
     }
     response = requests.get(url, params=params)
     data = response.json()
-    df = pd.DataFrame(data['hourly'])
-    df['time'] = pd.to_datetime(df['time'])
+    df = pd.DataFrame(data.get('hourly', {}))
+    if df.empty:
+        df = pd.DataFrame({'wave_height':[None], 'wind_speed_10m':[None], 'wind_direction_10m':[None]})
+    df['time'] = pd.to_datetime(df.get('time', [pd.Timestamp.now()]))
     return df
 
 # ===============================
@@ -115,22 +117,6 @@ def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
     return path[::-1]
 
 # ===============================
-# AI航線評分
-# ===============================
-def route_scores(path, lons, lats, u, v, wave, wind_speed, ship_speed):
-    if not path: return 0,0,0
-    dist_km = sum(np.sqrt(
-        (lats[path[i][0]]-lats[path[i+1][0]])**2 +
-        (lons[path[i][1]]-lons[path[i+1][1]])**2
-    ) for i in range(len(path)-1))*111
-    flow_vals = [np.sqrt(u[p]**2+v[p]**2) for p in path]
-    mean_flow = np.mean(flow_vals)
-    risk = min(100, wave*20 + wind_speed*5 + mean_flow*10)
-    comfort = max(0, 100 - risk)
-    fuel = max(0, 100 - (dist_km/ship_speed)*2 - wave*10 - wind_speed*2)
-    return round(risk,1), round(comfort,1), round(fuel,1)
-
-# ===============================
 # 側邊欄
 # ===============================
 with st.sidebar:
@@ -153,24 +139,25 @@ if lons is not None:
 
     # 安全取值
     try: wave = float(marine_df["wave_height"].iloc[0])
-    except: wave = 0.5
+    except: wave = None
     try: wind_speed = float(marine_df["wind_speed_10m"].iloc[0])
-    except: wind_speed = 0
+    except: wind_speed = None
     try: wind_dir = float(marine_df["wind_direction_10m"].iloc[0])
     except: wind_dir = 0
 
-    wind_u = wind_speed*np.sin(np.deg2rad(wind_dir))
-    wind_v = wind_speed*np.cos(np.deg2rad(wind_dir))
+    if wind_speed is None: wind_u, wind_v = 0, 0
+    else:
+        wind_u = wind_speed*np.sin(np.deg2rad(wind_dir))
+        wind_v = wind_speed*np.cos(np.deg2rad(wind_dir))
 
     path = astar(start, goal, u, v, land_mask, safety, ship_speed,
-                 wave_factor=wave, wind_factor=wind_speed)
-
-    risk, comfort, fuel = route_scores(path, lons, lats, u, v, wave, wind_speed, ship_speed)
+                 wave_factor=wave if wave is not None else 0,
+                 wind_factor=wind_speed if wind_speed is not None else 0)
 
     # ===============================
     # 儀表板
     # ===============================
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1, c2, c3 = st.columns(3)
     if path:
         dist_km = sum(np.sqrt(
             (lats[path[i][0]]-lats[path[i+1][0]])**2+
@@ -179,10 +166,11 @@ if lons is not None:
         c1.metric("航行時間",f"{dist_km/ship_speed:.1f} hr")
         c2.metric("航行距離",f"{dist_km:.1f} km")
     c3.metric("衛星數",f"{get_visible_sats()} SATS")
-    c4.metric("航線風險",f"{risk}/100")
-    c5.metric("舒適度",f"{comfort}/100")
-    c6.metric("燃油效率",f"{fuel}/100")
-    st.caption(f"HYCOM資料時間 {obs_time}")
+
+    # 波高與風速抓取狀態
+    wave_status = "OK" if wave is not None else "未接到"
+    wind_status = "OK" if wind_speed is not None else "未接到"
+    st.caption(f"HYCOM資料時間 {obs_time}  | 波高資料: {wave_status}, 風速資料: {wind_status}")
 
     # ===============================
     # 2D 地圖
@@ -198,7 +186,7 @@ if lons is not None:
     ax.set_extent([118,124,21,26])
     ax.add_feature(cfeature.LAND, facecolor='lightgray')
     ax.add_feature(cfeature.COASTLINE)
-    total_factor = np.sqrt(u**2 + v**2) + wave + wind_speed
+    total_factor = np.sqrt(u**2 + v**2) + (wave if wave is not None else 0) + (wind_speed if wind_speed is not None else 0)
     im = ax.pcolormesh(lons, lats, total_factor, cmap=cmap, shading='auto', alpha=0.8)
     plt.colorbar(im, ax=ax, label="海象強度")
     if path:
