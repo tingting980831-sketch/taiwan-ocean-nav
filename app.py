@@ -10,7 +10,7 @@ import heapq
 from scipy.ndimage import distance_transform_edt
 import plotly.graph_objects as go
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 st.set_page_config(layout="wide", page_title="HELIOS V7")
 st.title("🛰️ HELIOS V7 智慧海象導航系統")
@@ -41,63 +41,62 @@ def load_hycom_data():
     land_mask = np.isnan(u_data.values)
     return lons, lats, u_val, v_val, land_mask, latest_time
 
-lons,lats,u,v,land_mask,obs_time = load_hycom_data()
+lons, lats, u, v, land_mask, obs_time = load_hycom_data()
 
 # ===============================
-# 波高 + 風速 API (新方法)
+# 波高 + 風速 API
 # ===============================
 @st.cache_data(ttl=1800)
 def get_realtime_marine_data(lat, lon):
-    current_hour = datetime.now().hour
+    now = datetime.now(timezone.utc)
 
-    # 1. 取得波高 (Marine API)
-    marine_url = "https://marine-api.open-meteo.com/v1/marine"
-    marine_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "wave_height",
-        "timezone": "Asia/Taipei",
-        "forecast_days": 1
-    }
+    # --- 波高 (Marine API)
     wave = None
     try:
-        response = requests.get(marine_url, params=marine_params, timeout=5)
-        if response.status_code == 200:
-            marine_data = response.json()
-            waves = marine_data.get("hourly", {}).get("wave_height", [])
-            if len(waves) > current_hour and waves[current_hour] is not None:
-                wave = float(waves[current_hour])
-            else:
-                valid_waves = [w for w in waves if w is not None]
-                if valid_waves:
-                    wave = float(valid_waves[0])
+        marine_url = "https://marine-api.open-meteo.com/v1/marine"
+        marine_params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": ["wave_height"],
+            "timezone": "Asia/Taipei",
+            "forecast_days": 1
+        }
+        r = requests.get(marine_url, params=marine_params, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            times = data.get("hourly", {}).get("time", [])
+            heights = data.get("hourly", {}).get("wave_height", [])
+            if times and heights:
+                times_dt = [datetime.fromisoformat(t) for t in times]
+                diffs = [abs((t - now).total_seconds()) for t in times_dt]
+                idx = diffs.index(min(diffs))
+                wave = heights[idx]
     except Exception as e:
         print(f"Marine API Error: {e}")
 
-    # 2. 取得風速 (Weather API)
-    weather_url = "https://api.open-meteo.com/v1/forecast"
-    weather_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": ["wind_speed_10m","wind_direction_10m"],
-        "timezone": "Asia/Taipei",
-        "forecast_days": 1
-    }
+    # --- 風速 (Weather API)
     wind_speed, wind_dir = None, None
     try:
+        weather_url = "https://api.open-meteo.com/v1/forecast"
+        weather_params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": ["wind_speed_10m","wind_direction_10m"],
+            "timezone": "Asia/Taipei",
+            "forecast_days": 1
+        }
         w_res = requests.get(weather_url, params=weather_params, timeout=5)
         if w_res.status_code == 200:
             w_data = w_res.json()
             speeds = w_data.get("hourly", {}).get("wind_speed_10m", [])
             dirs = w_data.get("hourly", {}).get("wind_direction_10m", [])
-            if len(speeds) > current_hour and speeds[current_hour] is not None:
-                wind_speed = float(speeds[current_hour])
-                wind_dir = float(dirs[current_hour])
-            else:
-                valid_speeds = [s for s in speeds if s is not None]
-                valid_dirs = [d for d in dirs if d is not None]
-                if valid_speeds: wind_speed = float(valid_speeds[0])
-                if valid_dirs: wind_dir = float(valid_dirs[0])
+            times = w_data.get("hourly", {}).get("time", [])
+            if times and speeds and dirs:
+                times_dt = [datetime.fromisoformat(t) for t in times]
+                diffs = [abs((t - now).total_seconds()) for t in times_dt]
+                idx = diffs.index(min(diffs))
+                wind_speed = speeds[idx]
+                wind_dir = dirs[idx]
     except Exception as e:
         print(f"Weather API Error: {e}")
 
