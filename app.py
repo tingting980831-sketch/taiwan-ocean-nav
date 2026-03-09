@@ -8,9 +8,8 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
 from scipy.ndimage import distance_transform_edt
-import plotly.graph_objects as go
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 st.set_page_config(layout="wide", page_title="HELIOS V7")
 st.title("🛰️ HELIOS V7 智慧海象導航系統")
@@ -41,67 +40,39 @@ def load_hycom_data():
     land_mask = np.isnan(u_data.values)
     return lons, lats, u_val, v_val, land_mask, latest_time
 
-lons,lats,u,v,land_mask,obs_time = load_hycom_data()
+lons, lats, u, v, land_mask, obs_time = load_hycom_data()
 
 # ===============================
-# 波高 + 風速 API (新方法)
+# 取得風速 API
 # ===============================
 @st.cache_data(ttl=1800)
-def get_realtime_marine_data(lat, lon):
-    current_hour = datetime.now().hour
-
-    # 1. 取得波高 (Marine API)
-    marine_url = "https://marine-api.open-meteo.com/v1/marine"
-    marine_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "wave_height",
-        "timezone": "Asia/Taipei",
-        "forecast_days": 1
-    }
-    wave = None
-    try:
-        response = requests.get(marine_url, params=marine_params, timeout=5)
-        if response.status_code == 200:
-            marine_data = response.json()
-            waves = marine_data.get("hourly", {}).get("wave_height", [])
-            if len(waves) > current_hour and waves[current_hour] is not None:
-                wave = float(waves[current_hour])
-            else:
-                valid_waves = [w for w in waves if w is not None]
-                if valid_waves:
-                    wave = float(valid_waves[0])
-    except Exception as e:
-        print(f"Marine API Error: {e}")
-
-    # 2. 取得風速 (Weather API)
-    weather_url = "https://api.open-meteo.com/v1/forecast"
-    weather_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": ["wind_speed_10m","wind_direction_10m"],
-        "timezone": "Asia/Taipei",
-        "forecast_days": 1
-    }
+def get_realtime_wind(lat, lon):
+    now = datetime.now(timezone.utc)
     wind_speed, wind_dir = None, None
     try:
+        weather_url = "https://api.open-meteo.com/v1/forecast"
+        weather_params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": ["wind_speed_10m","wind_direction_10m"],
+            "timezone": "Asia/Taipei",
+            "forecast_days": 1
+        }
         w_res = requests.get(weather_url, params=weather_params, timeout=5)
         if w_res.status_code == 200:
             w_data = w_res.json()
             speeds = w_data.get("hourly", {}).get("wind_speed_10m", [])
             dirs = w_data.get("hourly", {}).get("wind_direction_10m", [])
-            if len(speeds) > current_hour and speeds[current_hour] is not None:
-                wind_speed = float(speeds[current_hour])
-                wind_dir = float(dirs[current_hour])
-            else:
-                valid_speeds = [s for s in speeds if s is not None]
-                valid_dirs = [d for d in dirs if d is not None]
-                if valid_speeds: wind_speed = float(valid_speeds[0])
-                if valid_dirs: wind_dir = float(valid_dirs[0])
+            times = w_data.get("hourly", {}).get("time", [])
+            if times and speeds and dirs:
+                times_dt = [datetime.fromisoformat(t) for t in times]
+                diffs = [abs((t - now).total_seconds()) for t in times_dt]
+                idx = diffs.index(min(diffs))
+                wind_speed = speeds[idx]
+                wind_dir = dirs[idx]
     except Exception as e:
         print(f"Weather API Error: {e}")
-
-    return wave, wind_speed, wind_dir
+    return wind_speed, wind_dir
 
 # ===============================
 # 最近海洋格點
@@ -119,7 +90,7 @@ def nearest_ocean_cell(lon,lat,lons,lats,land_mask):
 # ===============================
 # A* 航線
 # ===============================
-def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
+def astar(start,goal,u,v,land_mask,safety,ship_spd,wind_factor=0):
     v_ship = ship_spd*0.277  # km/h -> m/s
     rows,cols = land_mask.shape
     dirs=[(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
@@ -138,7 +109,7 @@ def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
                 flow = (u[cur]*(d[1]/norm) + v[cur]*(d[0]/norm))
                 v_ground = max(0.5,v_ship+flow)
                 step = (dist_m/v_ground)+(-flow*(dist_m/v_ship)*1.5)
-                step += (wave_factor**2)*60 + wind_factor*40
+                step += wind_factor*40
                 if safety[ni,nj]<4:
                     step += 12000/(safety[ni,nj]+0.2)**2
                 new = cost[cur]+step
@@ -175,10 +146,7 @@ if lons is not None:
     start = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
     goal  = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
 
-    wave, wind_speed, wind_dir = get_realtime_marine_data(
-        (s_lat + e_lat)/2,
-        (s_lon + e_lon)/2
-    )
+    wind_speed, wind_dir = get_realtime_wind((s_lat + e_lat)/2, (s_lon + e_lon)/2)
 
     # 風向轉向量
     if wind_speed is None or wind_dir is None:
@@ -196,7 +164,6 @@ if lons is not None:
         land_mask,
         safety,
         ship_speed,
-        wave_factor=wave if wave else 0,
         wind_factor=wind_speed if wind_speed else 0
     )
 
@@ -213,9 +180,8 @@ if lons is not None:
         c2.metric("航行距離",f"{dist_km:.1f} km")
     c3.metric("衛星數",f"{get_visible_sats()} SATS")
 
-    wave_status = "OK" if wave is not None else "未接到"
     wind_status = "OK" if wind_speed is not None else "未接到"
-    st.caption(f"HYCOM資料時間 {obs_time} | 波高資料: {wave_status} | 風速資料: {wind_status}")
+    st.caption(f"HYCOM資料時間 {obs_time} | 風速資料: {wind_status}")
 
     # ===============================
     # 2D 地圖
@@ -227,7 +193,7 @@ if lons is not None:
     ax.set_extent([118,124,21,26])
     ax.add_feature(cfeature.LAND, facecolor='lightgray')
     ax.add_feature(cfeature.COASTLINE)
-    total_factor = np.sqrt(u**2 + v**2) + (wave if wave else 0) + (wind_speed if wind_speed else 0)
+    total_factor = np.sqrt(u**2 + v**2) + (wind_speed if wind_speed else 0)
     im = ax.pcolormesh(lons, lats, total_factor, cmap=cmap, shading='auto', alpha=0.8)
     plt.colorbar(im, ax=ax, label="海象強度")
     if path:
@@ -238,41 +204,3 @@ if lons is not None:
     ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=200, edgecolors='black')
     plt.title("HELIOS V7 Navigation")
     st.pyplot(fig)
-
-    # ===============================
-    # 3D 海象
-    # ===============================
-    st.subheader("🌊 3D 海象模型")
-    lon_grid, lat_grid = np.meshgrid(lons, lats)
-    flow_speed = np.sqrt(u**2+v**2)
-    fig3d = go.Figure()
-    fig3d.add_trace(go.Surface(x=lon_grid, y=lat_grid, z=flow_speed, colorscale="Blues", opacity=0.8))
-    skip = 3
-    fig3d.add_trace(go.Cone(
-        x=lon_grid[::skip,::skip].flatten(),
-        y=lat_grid[::skip,::skip].flatten(),
-        z=flow_speed[::skip,::skip].flatten(),
-        u=u[::skip,::skip].flatten(),
-        v=v[::skip,::skip].flatten(),
-        w=np.zeros_like(u[::skip,::skip].flatten()),
-        sizemode="scaled",
-        sizeref=0.5
-    ))
-    if path:
-        path_lons = [lons[p[1]] for p in path]
-        path_lats = [lats[p[0]] for p in path]
-        fig3d.add_trace(go.Scatter3d(
-            x=path_lons, y=path_lats,
-            z=np.full(len(path_lons), flow_speed.max()+1),
-            mode="lines",
-            line=dict(color="red", width=6)
-        ))
-    fig3d.update_layout(
-        scene=dict(
-            xaxis_title="經度",
-            yaxis_title="緯度",
-            zaxis_title="流速"
-        ),
-        height=700
-    )
-    st.plotly_chart(fig3d, use_container_width=True)
