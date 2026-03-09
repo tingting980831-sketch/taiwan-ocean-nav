@@ -1,10 +1,9 @@
 streamlit
 xarray
 numpy
+pandas
 matplotlib
 cartopy
-geopandas
-motuclient
-netcdf4
 scipy
 plotly
+netCDF4
