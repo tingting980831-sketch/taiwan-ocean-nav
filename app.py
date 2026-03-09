@@ -8,8 +8,8 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
 from scipy.ndimage import distance_transform_edt
-import plotly.graph_objects as go
 import requests
+import plotly.graph_objects as go
 
 st.set_page_config(layout="wide", page_title="HELIOS V6")
 st.title("🛰️ HELIOS V6 智慧導航控制台")
@@ -27,51 +27,67 @@ def get_visible_sats():
 def load_hycom_data():
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
     ds = xr.open_dataset(url, decode_times=False)
+
     time_origin = pd.to_datetime(ds['time'].attrs['time_origin'])
     latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
+
     lat_slice = slice(21,26)
     lon_slice = slice(118,124)
+
     u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
     v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
+
     lons = u_data['lon'].values
     lats = u_data['lat'].values
+
     u_val = np.nan_to_num(u_data.values)
     v_val = np.nan_to_num(v_data.values)
+
     land_mask = np.isnan(u_data.values)
+
     return lons,lats,u_val,v_val,land_mask,latest_time
 
 lons,lats,u,v,land_mask,obs_time = load_hycom_data()
 
 # ===============================
-# 讀取 Open-Meteo 海象
+# 抓 Open-Meteo 波高與風速
 # ===============================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)
 def get_marine(lat, lon):
-    # 波高
     try:
+        # 波高
         wave_url = "https://marine-api.open-meteo.com/v1/marine"
-        wave_params = {"latitude": lat,"longitude": lon,"hourly":["wave_height"],"timezone":"Asia/Taipei","forecast_days":1}
+        wave_params = {
+            "latitude": lat, "longitude": lon,
+            "hourly": ["wave_height", "wave_direction"],
+            "timezone": "Asia/Taipei",
+            "forecast_days": 1
+        }
         wave_res = requests.get(wave_url, params=wave_params).json()
-        current_wave = float(wave_res.get('hourly', {}).get('wave_height', [0.5])[0])
-    except:
-        current_wave = 0.5
-
-    # 風速
-    try:
+        df_wave = pd.DataFrame(wave_res['hourly'])
+        df_wave['time'] = pd.to_datetime(df_wave['time'])
+        current_wave = float(df_wave['wave_height'].iloc[0])
+        
+        # 風速
         wind_url = "https://api.open-meteo.com/v1/forecast"
-        wind_params = {"latitude": lat,"longitude": lon,"hourly":["wind_speed_10m","wind_direction_10m"],
-                       "wind_speed_unit":"m/s","timezone":"Asia/Taipei","forecast_days":1}
+        wind_params = {
+            "latitude": lat, "longitude": lon,
+            "hourly": ["wind_speed_10m", "wind_direction_10m"],
+            "wind_speed_unit": "m/s",
+            "timezone": "Asia/Taipei",
+            "forecast_days": 1
+        }
         wind_res = requests.get(wind_url, params=wind_params).json()
-        wind_speed_list = wind_res.get('hourly', {}).get('wind_speed_10m', [0])
-        wind_dir_list   = wind_res.get('hourly', {}).get('wind_direction_10m', [0])
-        current_wind_speed = float(wind_speed_list[0])
-        current_wind_dir   = float(wind_dir_list[0])
-        wind_u = current_wind_speed * np.sin(np.deg2rad(current_wind_dir))
-        wind_v = current_wind_speed * np.cos(np.deg2rad(current_wind_dir))
+        df_wind = pd.DataFrame(wind_res['hourly'])
+        df_wind['time'] = pd.to_datetime(df_wind['time'])
+        current_wind_speed = df_wind['wind_speed_10m'].iloc[0]
+        current_wind_dir = df_wind['wind_direction_10m'].iloc[0]
+        # 轉成 u,v 分量
+        wind_u = current_wind_speed * np.sin(np.radians(current_wind_dir))
+        wind_v = current_wind_speed * np.cos(np.radians(current_wind_dir))
+        return current_wave, wind_u, wind_v
     except:
-        wind_u, wind_v = 0, 0
-
-    return current_wave, wind_u, wind_v
+        return 0.5, 0, 0
 
 # ===============================
 # 導航函數
@@ -105,8 +121,8 @@ def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
                 flow=(u[cur]*(d[1]/norm)+v[cur]*(d[0]/norm))
                 v_ground=max(0.5,v_ship+flow)
                 step=(dist_m/v_ground)+(-flow*(dist_m/v_ship)*1.5)
-                # 波高與風速加成
-                step += wave_factor*100 + wind_factor*50
+                # 加波高與風速影響
+                step += wave_factor*5000 + wind_factor*3000
                 if safety[ni,nj]<4:
                     step+=12000/(safety[ni,nj]+0.2)**2
                 new=cost[cur]+step
@@ -135,122 +151,128 @@ with st.sidebar:
     ship_speed=st.number_input("船速 km/h",1.0,60.0,20.0)
 
 # ===============================
-# 計算
+# 計算航線
 # ===============================
 if lons is not None:
     safety=distance_transform_edt(~land_mask)
     start=nearest_ocean_cell(s_lon,s_lat,lons,lats,land_mask)
     goal=nearest_ocean_cell(e_lon,e_lat,lons,lats,land_mask)
+    
+    # 取得中心點海象
     wave, wind_u, wind_v = get_marine((s_lat+e_lat)/2,(s_lon+e_lon)/2)
+    
     path=astar(start,goal,u,v,land_mask,safety,ship_speed,wave_factor=wave,wind_factor=np.sqrt(wind_u**2+wind_v**2))
 
-    # ===============================
-    # 儀表板
-    # ===============================
-    c1,c2,c3=st.columns(3)
-    if path:
-        dist_km=sum(np.sqrt(
-            (lats[path[i][0]]-lats[path[i+1][0]])**2+
-            (lons[path[i][1]]-lons[path[i+1][1]])**2
-        ) for i in range(len(path)-1))*111
-        c1.metric("航行時間",f"{dist_km/ship_speed:.1f} hr")
-        c2.metric("航行距離",f"{dist_km:.1f} km")
-    c3.metric("衛星數",f"{get_visible_sats()} SATS")
-    st.caption(f"資料時間 {obs_time}")
+# ===============================
+# 儀表板
+# ===============================
+c1,c2,c3=st.columns(3)
+if path:
+    dist_km=sum(np.sqrt(
+        (lats[path[i][0]]-lats[path[i+1][0]])**2+
+        (lons[path[i][1]]-lons[path[i+1][1]])**2
+    ) for i in range(len(path)-1))*111
+    c1.metric("航行時間",f"{dist_km/ship_speed:.1f} hr")
+    c2.metric("航行距離",f"{dist_km:.1f} km")
+c3.metric("衛星數",f"{get_visible_sats()} SATS")
+st.caption(f"資料時間 {obs_time}")
 
-    # ===============================
-    # 2D 地圖 (全部因子融入底圖)
-    # ===============================
-    colors=[
-        "#E5F0FF","#CCE0FF","#99C2FF","#66A3FF",
-        "#3385FF","#0066FF","#0052CC","#003D99",
-        "#002966","#001433","#000E24"
-    ]
-    cmap=mcolors.LinearSegmentedColormap.from_list("flow",colors)
-    fig=plt.figure(figsize=(10,8))
-    ax=plt.axes(projection=ccrs.PlateCarree())
-    ax.set_extent([118,124,21,26])
-    ax.add_feature(cfeature.LAND,facecolor='lightgray')
-    ax.add_feature(cfeature.COASTLINE)
-    # 將海流 + 波高 + 風速融入底圖
-    total_factor=np.sqrt(u**2+v**2) + wave + np.sqrt(wind_u**2+wind_v**2)
-    im=ax.pcolormesh(lons,lats,total_factor,cmap=cmap,shading='auto',alpha=0.8)
-    plt.colorbar(im,ax=ax,label="海象強度",pad=0.05)
-    # 航路
-    if path:
-        path_lons=[lons[p[1]] for p in path]
-        path_lats=[lats[p[0]] for p in path]
-        ax.plot(path_lons,path_lats,color='red',linewidth=2)
-    ax.scatter(s_lon,s_lat,color='green',s=120,edgecolors='black')
-    ax.scatter(e_lon,e_lat,color='yellow',marker='*',s=200,edgecolors='black')
-    plt.title("HELIOS V6 Navigation")
-    st.pyplot(fig)
+# ===============================
+# 2D 底圖 (海象因子加總)
+# ===============================
+colors=[
+    "#E5F0FF","#CCE0FF","#99C2FF","#66A3FF",
+    "#3385FF","#0066FF","#0052CC","#003D99",
+    "#002966","#001433","#000E24"
+]
+cmap=mcolors.LinearSegmentedColormap.from_list("flow",colors)
 
-    # ===============================
-    # 3D 海象模型
-    # ===============================
-    st.subheader("🌊 3D 海象模型")
-    lon_grid,lat_grid=np.meshgrid(lons,lats)
-    flow_speed=np.sqrt(u**2+v**2)
-    wave_height = wave + 0.5  # 放大可見性
-    wind_speed3d=np.sqrt(wind_u**2+wind_v**2)
+fig=plt.figure(figsize=(10,8))
+ax=plt.axes(projection=ccrs.PlateCarree())
+ax.set_extent([118,124,21,26])
+ax.add_feature(cfeature.LAND,facecolor='lightgray')
+ax.add_feature(cfeature.COASTLINE)
 
-    fig3d=go.Figure()
-    # 波高
-    fig3d.add_trace(go.Surface(
-        x=lon_grid, y=lat_grid, z=wave_height*np.ones_like(flow_speed),
-        colorscale='Viridis', opacity=0.8, name="波高"
+# 底圖 = 海流速度 + 波高 + 風速 (簡單相加)
+base_speed = np.sqrt(u**2 + v**2) + wave + np.sqrt(wind_u**2 + wind_v**2)
+im=ax.pcolormesh(lons,lats,base_speed,cmap=cmap,shading='auto',alpha=0.8)
+
+# 海流箭頭
+ax.quiver(lons[::2],lats[::2],u[::2,::2],v[::2,::2],color='white',alpha=0.4,scale=10)
+
+# 航線
+if path:
+    path_lons=[lons[p[1]] for p in path]
+    path_lats=[lats[p[0]] for p in path]
+    ax.plot(path_lons,path_lats,color='red',linewidth=2)
+ax.scatter(s_lon,s_lat,color='green',s=120,edgecolors='black')
+ax.scatter(e_lon,e_lat,color='yellow',marker='*',s=200,edgecolors='black')
+plt.title("HELIOS V6 Navigation")
+st.pyplot(fig)
+
+# ===============================
+# 3D 海象模型 (三明治式)
+# ===============================
+st.subheader("🌊 3D 海象模型")
+
+lon_grid, lat_grid = np.meshgrid(lons, lats)
+flow_speed = np.sqrt(u**2 + v**2)
+wave_height = wave  # 波高當底層
+
+fig3d = go.Figure()
+
+# 底層：波高
+fig3d.add_trace(go.Surface(
+    x=lon_grid, y=lat_grid, z=wave_height,
+    colorscale='Blues', opacity=0.9, name="波高", showscale=True
+))
+
+# 中層：海流表面
+fig3d.add_trace(go.Surface(
+    x=lon_grid, y=lat_grid, z=flow_speed + wave_height*0.2,
+    colorscale='Viridis', opacity=0.6, name="海流速度", showscale=True
+))
+
+# 海流箭頭
+skip=3
+fig3d.add_trace(go.Cone(
+    x=lon_grid[::skip, ::skip].flatten(),
+    y=lat_grid[::skip, ::skip].flatten(),
+    z=(flow_speed + wave_height*0.2)[::skip, ::skip].flatten(),
+    u=u[::skip, ::skip].flatten(),
+    v=v[::skip, ::skip].flatten(),
+    w=np.zeros_like(u[::skip, ::skip].flatten()),
+    sizemode="scaled", sizeref=0.5, anchor="tail", colorscale="Reds",
+    showscale=False, name="海流方向"
+))
+
+# 風速箭頭
+fig3d.add_trace(go.Cone(
+    x=lon_grid[::skip, ::skip].flatten(),
+    y=lat_grid[::skip, ::skip].flatten(),
+    z=(flow_speed + wave_height*0.5)[::skip, ::skip].flatten(),
+    u=np.full_like(u[::skip, ::skip].flatten(), wind_u),
+    v=np.full_like(v[::skip, ::skip].flatten(), wind_v),
+    w=np.zeros_like(u[::skip, ::skip].flatten()),
+    sizemode="scaled", sizeref=1.0, anchor="tail", colorscale="Purples",
+    showscale=True, name="風速方向"
+))
+
+# 航線
+if path:
+    path_lons=[lons[p[1]] for p in path]
+    path_lats=[lats[p[0]] for p in path]
+    fig3d.add_trace(go.Scatter3d(
+        x=path_lons,
+        y=path_lats,
+        z=np.full(len(path_lons), (flow_speed + wave_height*0.5).max()+0.5),
+        mode='lines',
+        line=dict(color='red', width=6),
+        name="航線"
     ))
-    # 海流
-    fig3d.add_trace(go.Surface(
-        x=lon_grid, y=lat_grid, z=flow_speed,
-        colorscale='Blues', opacity=0.6, name="流速"
-    ))
-    # 海流箭頭
-    skip=3
-    fig3d.add_trace(go.Cone(
-        x=lon_grid[::skip,::skip].flatten(),
-        y=lat_grid[::skip,::skip].flatten(),
-        z=flow_speed[::skip,::skip].flatten()+0.5,
-        u=u[::skip,::skip].flatten(),
-        v=v[::skip,::skip].flatten(),
-        w=np.zeros_like(u[::skip,::skip].flatten()),
-        sizemode="scaled",
-        sizeref=0.5,
-        showscale=False
-    ))
-    # 風速箭頭
-    fig3d.add_trace(go.Cone(
-        x=lon_grid[::skip,::skip].flatten(),
-        y=lat_grid[::skip,::skip].flatten(),
-        z=(flow_speed+wave_height)[::skip,::skip].flatten()+0.8,
-        u=np.full_like(u[::skip,::skip].flatten(),wind_u),
-        v=np.full_like(v[::skip,::skip].flatten(),wind_v),
-        w=np.zeros_like(u[::skip,::skip].flatten()),
-        sizemode="scaled",
-        sizeref=0.5,
-        showscale=False,
-        anchor="tail",
-        colorscale="Reds"
-    ))
-    # 航路
-    if path:
-        path_lons=[lons[p[1]] for p in path]
-        path_lats=[lats[p[0]] for p in path]
-        fig3d.add_trace(go.Scatter3d(
-            x=path_lons,
-            y=path_lats,
-            z=np.full(len(path_lons),flow_speed.max()+1),
-            mode='lines',
-            line=dict(color='red',width=6)
-        ))
-    fig3d.update_layout(
-        scene=dict(
-            xaxis_title="經度",
-            yaxis_title="緯度",
-            zaxis_title="強度",
-            camera=dict(eye=dict(x=1.5, y=1.5, z=0.8))
-        ),
-        height=700
-    )
-    st.plotly_chart(fig3d,use_container_width=True)
+
+fig3d.update_layout(
+    scene=dict(xaxis_title="經度", yaxis_title="緯度", zaxis_title="高度 / 強度", aspectratio=dict(x=1, y=1, z=0.5)),
+    height=700
+)
+st.plotly_chart(fig3d,use_container_width=True)
