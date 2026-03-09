@@ -124,10 +124,19 @@ path = astar(start, goal, cost_grid)
 # ----------------------------
 # 8️⃣ 可視化結果 (xarray -> numpy 轉換)
 # ----------------------------
+# 先選出經緯度範圍
+lons = ds['lon'].sel(lon=lon_slice)
+lats = ds['lat'].sel(lat=lat_slice)
+
+# 轉成 NumPy
 lons_np = lons.values
 lats_np = lats.values
+ssu_np = ssu_latest.values
+ssv_np = ssv_latest.values
+flow_speed_np = flow_speed.values
+
 plt.figure(figsize=(8,6))
-plt.quiver(lons_np, lats_np, ssu_latest.values, ssv_latest.values, flow_speed.values, scale=3, cmap='viridis')
+plt.quiver(lons_np, lats_np, ssu_np, ssv_np, flow_speed_np, scale=3, cmap='viridis')
 if path:
     px, py = zip(*path)
     plt.plot(lons_np[py], lats_np[px], color='red', linewidth=2, label='航線')
@@ -137,4 +146,3 @@ plt.ylabel('Latitude')
 plt.title(f'航線規劃 + 流場\n波高: {wave_height} m, 風速: {wind_speed} kn')
 plt.legend()
 plt.show()
-
