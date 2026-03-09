@@ -43,22 +43,31 @@ def load_hycom_data():
 lons,lats,u,v,land_mask,obs_time = load_hycom_data()
 
 # ===============================
-# 波高 + 風速 API
+# 波高 + 風速 API（只改波高抓取方式）
 # ===============================
 @st.cache_data(ttl=1800)
 def get_realtime_marine_data(lat, lon):
-    marine_url = "https://marine-api.open-meteo.com/v1/marine"
+    url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
         "latitude": lat,
         "longitude": lon,
         "hourly": ["wave_height","wind_speed_10m","wind_direction_10m"],
-        "timezone": "Asia/Taipei"
+        "timezone": "Asia/Taipei",
+        "forecast_days": 1
     }
-    marine = requests.get(marine_url, params=params).json()
-    hourly = marine.get("hourly", {})
-    wave = hourly.get("wave_height", [None])[0]
-    wind_speed = hourly.get("wind_speed_10m", [None])[0]
-    wind_dir = hourly.get("wind_direction_10m", [None])[0]
+    data = requests.get(url, params=params).json()
+    hourly = data.get("hourly", {})
+
+    # 波高
+    wave_list = hourly.get("wave_height", [None])
+    wave = float(wave_list[0]) if wave_list[0] is not None else None
+
+    # 風速 & 風向 (保持原本做法)
+    wind_list = hourly.get("wind_speed_10m", [None])
+    wind_speed = float(wind_list[0]) if wind_list[0] is not None else None
+    wind_dir_list = hourly.get("wind_direction_10m", [None])
+    wind_dir = float(wind_dir_list[0]) if wind_dir_list[0] is not None else None
+
     return wave, wind_speed, wind_dir
 
 # ===============================
@@ -232,4 +241,3 @@ if lons is not None:
         height=700
     )
     st.plotly_chart(fig3d, use_container_width=True)
-    
