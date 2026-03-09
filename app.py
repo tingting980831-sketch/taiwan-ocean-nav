@@ -120,9 +120,10 @@ h, w = cost_grid.shape
 start = (0,0)
 goal = (h-1, w-1)
 path = astar(start, goal, cost_grid)
+print("A* path 長度:", len(path))  # debug
 
 # ----------------------------
-# 8️⃣ 可視化結果 (使用 meshgrid 修正索引)
+# 8️⃣ 可視化結果 (meshgrid + 保證出現)
 # ----------------------------
 lons = ds['lon'].sel(lon=lon_slice)
 lats = ds['lat'].sel(lat=lat_slice)
@@ -133,14 +134,18 @@ ssu_np = ssu_latest.values
 ssv_np = ssv_latest.values
 flow_speed_np = flow_speed.values
 
-# 生成二維經緯度格點
 lon2d, lat2d = np.meshgrid(lons_np, lats_np)
 
-plt.figure(figsize=(8,6))
-plt.quiver(lon2d, lat2d, ssu_np, ssv_np, flow_speed_np, scale=3, cmap='viridis')
+plt.figure(figsize=(10,8))
+# 流場箭頭 scale 自動調整
+plt.quiver(lon2d, lat2d, ssu_np, ssv_np, flow_speed_np, scale=None, cmap='viridis')
+
 if path:
     px, py = zip(*path)
     plt.plot(lon2d[px, py], lat2d[px, py], color='red', linewidth=2, label='航線')
+else:
+    print("A* 沒有找到航線，請檢查起點終點或成本設定")
+
 plt.colorbar(label='流速 (m/s)')
 plt.xlabel('Longitude')
 plt.ylabel('Latitude')
