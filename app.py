@@ -3,7 +3,6 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
@@ -13,18 +12,18 @@ import requests
 
 st.set_page_config(layout="wide", page_title="HELIOS")
 
-st.title("🛰️ HELIOS 海象智慧導航系統")
+st.title("🛰 HELIOS 海象智慧導航")
 
-# ===============================
+# ======================
 # 模擬衛星
-# ===============================
+# ======================
 
 def get_visible_sats():
     return np.random.randint(2,5)
 
-# ===============================
-# HYCOM 海流資料
-# ===============================
+# ======================
+# HYCOM 海流
+# ======================
 
 @st.cache_data(ttl=3600)
 def load_hycom():
@@ -45,54 +44,59 @@ def load_hycom():
     u_val=np.nan_to_num(u.values)
     v_val=np.nan_to_num(v.values)
 
-    land=np.isnan(u.values)
+    land_mask=np.isnan(u.values)
 
-    return lons,lats,u_val,v_val,land
+    return lons,lats,u_val,v_val,land_mask
 
 lons,lats,u,v,land_mask=load_hycom()
 
-# ===============================
-# Open-Meteo 海象
-# ===============================
+# ======================
+# Open Meteo
+# ======================
 
 @st.cache_data(ttl=1800)
 def get_marine(lat,lon):
 
-    url="https://marine-api.open-meteo.com/v1/marine"
+    try:
 
-    params={
-        "latitude":lat,
-        "longitude":lon,
-        "hourly":[
-            "wave_height",
-            "wind_speed_10m",
-            "wind_direction_10m"
-        ],
-        "timezone":"Asia/Taipei"
-    }
+        url="https://marine-api.open-meteo.com/v1/marine"
 
-    r=requests.get(url,params=params).json()
+        params={
+            "latitude":lat,
+            "longitude":lon,
+            "hourly":[
+                "wave_height",
+                "wind_speed_10m",
+                "wind_direction_10m"
+            ],
+            "timezone":"Asia/Taipei"
+        }
 
-    df=pd.DataFrame(r["hourly"])
+        r=requests.get(url,params=params).json()
 
-    df["time"]=pd.to_datetime(df["time"])
+        df=pd.DataFrame(r["hourly"])
 
-    now=pd.Timestamp.now().floor("h")
+        df["time"]=pd.to_datetime(df["time"])
 
-    row=df[df["time"]==now]
+        now=pd.Timestamp.now().floor("h")
 
-    if row.empty:
+        row=df[df["time"]==now]
+
+        if row.empty:
+            return 0,0,0
+
+        wave=float(row["wave_height"].iloc[0])
+        wind=float(row["wind_speed_10m"].iloc[0])
+        wdir=float(row["wind_direction_10m"].iloc[0])
+
+        return wave,wind,wdir
+
+    except:
         return 0,0,0
 
-    wave=float(row["wave_height"])
-    wind=float(row["wind_speed_10m"])
-    wdir=float(row["wind_direction_10m"])
-
-    return wave,wind,wdir
-
-# ===============================
-# A*導航
-# ===============================
+# ======================
+# A* 導航
+# ======================
 
 def nearest_ocean(lon,lat):
 
@@ -110,10 +114,9 @@ def nearest_ocean(lon,lat):
 
     return ocean[0][i],ocean[1][i]
 
+def astar(start,goal,ship_speed):
 
-def astar(start,goal,speed):
-
-    v_ship=speed*0.277
+    v_ship=ship_speed*0.277
 
     rows,cols=land_mask.shape
 
@@ -175,9 +178,9 @@ def astar(start,goal,speed):
 
     return path[::-1]
 
-# ===============================
+# ======================
 # 側邊欄
-# ===============================
+# ======================
 
 with st.sidebar:
 
@@ -191,9 +194,9 @@ with st.sidebar:
 
     ship_speed=st.number_input("船速 km/h",1.0,60.0,20.0)
 
-# ===============================
+# ======================
 # 海象
-# ===============================
+# ======================
 
 wave,wind_speed,wind_dir=get_marine(
     (s_lat+e_lat)/2,
@@ -203,32 +206,32 @@ wave,wind_speed,wind_dir=get_marine(
 wind_u=wind_speed*np.sin(np.radians(wind_dir))
 wind_v=wind_speed*np.cos(np.radians(wind_dir))
 
-# ===============================
+# ======================
 # 航線
-# ===============================
+# ======================
 
 start=nearest_ocean(s_lon,s_lat)
 goal=nearest_ocean(e_lon,e_lat)
 
 path=astar(start,goal,ship_speed)
 
-# ===============================
+# ======================
 # 儀表板
-# ===============================
+# ======================
 
-c1,c2,c3,c4,c5=st.columns(5)
+c1,c2,c3,c4=st.columns(4)
 
 c1.metric("波高",f"{wave:.2f} m")
 c2.metric("風速",f"{wind_speed:.1f} m/s")
-c3.metric("船速",f"{ship_speed} km/h")
-c4.metric("衛星",get_visible_sats())
-c5.metric("節點數",len(path))
+c3.metric("衛星",get_visible_sats())
+c4.metric("航線節點",len(path))
 
-# ===============================
+# ======================
 # 2D 海圖
-# ===============================
+# ======================
 
 fig=plt.figure(figsize=(10,8))
+
 ax=plt.axes(projection=ccrs.PlateCarree())
 
 ax.set_extent([118,124,21,26])
@@ -238,7 +241,7 @@ ax.add_feature(cfeature.COASTLINE)
 
 speed=np.sqrt(u**2+v**2)
 
-im=ax.pcolormesh(lons,lats,speed,cmap="Blues",alpha=0.8)
+ax.pcolormesh(lons,lats,speed,cmap="Blues",alpha=0.8)
 
 ax.quiver(
     lons[::2],lats[::2],
@@ -255,7 +258,7 @@ ax.quiver(
 ax.contourf(
     lons,lats,
     np.full_like(speed,wave),
-    alpha=0.2,
+    alpha=0.25,
     cmap="cool"
 )
 
@@ -268,9 +271,9 @@ if path:
 
 st.pyplot(fig)
 
-# ===============================
+# ======================
 # 3D 三明治模型
-# ===============================
+# ======================
 
 st.subheader("🌊 3D 海象模型")
 
@@ -280,7 +283,6 @@ wave_surface=np.full_like(lon_grid,wave)
 
 fig3d=go.Figure()
 
-# 波高
 fig3d.add_trace(go.Surface(
     x=lon_grid,
     y=lat_grid,
@@ -289,7 +291,6 @@ fig3d.add_trace(go.Surface(
     opacity=0.8
 ))
 
-# 流速
 fig3d.add_trace(go.Cone(
     x=lon_grid.flatten(),
     y=lat_grid.flatten(),
@@ -301,7 +302,6 @@ fig3d.add_trace(go.Cone(
     showscale=False
 ))
 
-# 風速
 fig3d.add_trace(go.Cone(
     x=lon_grid.flatten(),
     y=lat_grid.flatten(),
@@ -313,7 +313,6 @@ fig3d.add_trace(go.Cone(
     colorscale="Reds"
 ))
 
-# 航線
 if path:
 
     plon=[lons[p[1]] for p in path]
