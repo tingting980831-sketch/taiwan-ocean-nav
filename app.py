@@ -58,12 +58,10 @@ flow_dir = np.arctan2(ssv_latest, ssu_latest) * 180 / np.pi
 # ----------------------------
 # 3️⃣ 避障距離權重
 # ----------------------------
-# 建立陸地掩膜 (coastline 為 1，其餘為 0, 可自行調整)
-# 這裡假設簡單: lat<21.5 或 lat>25.5 或 lon<118.5 或 lon>122.5 視為陸地
 land_mask = np.zeros(ssu_latest.shape)
 land_mask[(ssu_latest.lat<21.5) | (ssu_latest.lat>25.5) | (ssu_latest.lon<118.5) | (ssu_latest.lon>122.5)] = 1
 distance = distance_transform_edt(1-land_mask)
-buffer_cost = np.exp(-distance/2)  # 指數衰減
+buffer_cost = np.exp(-distance/2)
 
 # ----------------------------
 # 4️⃣ 即時風浪加入成本
@@ -81,7 +79,7 @@ else:
 # ----------------------------
 # 5️⃣ 定義成本函數
 # ----------------------------
-alpha, beta, gamma = 1.0, 1.5, 1.0  # 權重，可調整
+alpha, beta, gamma = 1.0, 1.5, 1.0
 cost_grid = 1 + alpha*flow_speed + beta*wave_height + gamma*wind_speed + buffer_cost
 
 # ----------------------------
@@ -124,18 +122,19 @@ goal = (h-1, w-1)
 path = astar(start, goal, cost_grid)
 
 # ----------------------------
-# 8️⃣ 可視化結果
+# 8️⃣ 可視化結果 (xarray -> numpy 轉換)
 # ----------------------------
-lons = ds['lon'].sel(lon=lon_slice)
-lats = ds['lat'].sel(lat=lat_slice)
+lons_np = lons.values
+lats_np = lats.values
 plt.figure(figsize=(8,6))
-plt.quiver(lons, lats, ssu_latest, ssv_latest, flow_speed, scale=3, cmap='viridis')
+plt.quiver(lons_np, lats_np, ssu_latest.values, ssv_latest.values, flow_speed.values, scale=3, cmap='viridis')
 if path:
     px, py = zip(*path)
-    plt.plot(lons[py], lats[px], color='red', linewidth=2, label='航線')
+    plt.plot(lons_np[py], lats_np[px], color='red', linewidth=2, label='航線')
 plt.colorbar(label='流速 (m/s)')
 plt.xlabel('Longitude')
 plt.ylabel('Latitude')
 plt.title(f'航線規劃 + 流場\n波高: {wave_height} m, 風速: {wind_speed} kn')
 plt.legend()
 plt.show()
+
