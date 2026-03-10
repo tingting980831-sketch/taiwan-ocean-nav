@@ -8,3 +8,5 @@ scipy
 plotly
 requests
 netCDF4
+pyproj
+geojson
