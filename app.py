@@ -201,7 +201,7 @@ if time_idx >= len(ds['time']):
 u_data = ds['ssu'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
 v_data = ds['ssv'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
 speed = np.sqrt(u_data**2 + v_data**2)
-mesh=ax.pcolormesh(lons,lats,speed,cmap="Blues",vmin=0,vmax=2,shading="auto")  # 固定色條
+mesh=ax.pcolormesh(lons,lats,speed,cmap="Blues",vmin=0,vmax=1.6,shading="auto")  # 固定色條0-1.6
 fig.colorbar(mesh,ax=ax,label="Current Speed (m/s)")
 
 # No-go zones
@@ -224,14 +224,14 @@ done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
 ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
-# 船圖標 (尖端對準航向)
+# 船圖標 (正三角形，尖端對準航向)
 current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
 ship_lon = lons[current_pos[1]]
 ship_lat = lats[current_pos[0]]
 
-# 尖端在正前方
+# 正三角形
 ship_shape = np.array([
-    [0.0, 0.06],   # 尖端
+    [0, 0.06],    # 尖端
     [-0.03, -0.03],
     [0.03, -0.03]
 ])
