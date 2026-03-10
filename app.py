@@ -10,7 +10,7 @@ from scipy.ndimage import distance_transform_edt
 from matplotlib.path import Path
 
 st.set_page_config(layout="wide", page_title="HELIOS Dynamic Navigation")
-st.title("🛰️ HELIOS Dynamic Ocean Navigation with Ship Icon")
+st.title("🛰️ HELIOS Dynamic Ocean Navigation with Hourly Flow Update")
 
 # ===============================
 # No-Go Zones & Offshore Wind
@@ -126,13 +126,24 @@ if "full_path" not in st.session_state:
     st.session_state.full_path = astar_with_wind_and_coast(start, goal)
 if "ship_step_idx" not in st.session_state:
     st.session_state.ship_step_idx = 0
+if "elapsed_hours" not in st.session_state:
+    st.session_state.elapsed_hours = 0.0  # 累積航行時間
 
+# ===============================
+# Move Ship
+# ===============================
 if st.session_state.get("next_step_button", False):
     if st.session_state.ship_step_idx < len(st.session_state.full_path)-1:
+        # 計算下一格距離時間
+        y0,x0 = st.session_state.full_path[st.session_state.ship_step_idx]
+        y1,x1 = st.session_state.full_path[st.session_state.ship_step_idx+1]
+        step_dist = np.hypot(lats[y1]-lats[y0],lons[x1]-lons[x0])*111  # km
+        step_time = step_dist / ship_speed  # 小時
+        st.session_state.elapsed_hours += step_time
         st.session_state.ship_step_idx += 1
 
 # ===============================
-# Distance & Time, Direction
+# Distance & Remaining Time
 # ===============================
 def calc_stats(path, step_idx):
     dist=0
@@ -145,31 +156,27 @@ def calc_stats(path, step_idx):
         y0,x0=path[i]
         y1,x1=path[i+1]
         remaining_dist+=np.hypot(lats[y1]-lats[y0],lons[x1]-lons[x0])*111
-    hours_passed = dist/ship_speed
-    hours_remaining = remaining_dist/ship_speed
-
+    # 計算建議方向
     if step_idx < len(path)-1:
         y0,x0=path[step_idx]
         y1,x1=path[step_idx+1]
         dx = lons[x1]-lons[x0]
-        dy = lats[y1]-lats[x0]
+        dy = lats[y1]-lats[y0]
         angle_deg = np.degrees(np.arctan2(dy, dx))
     else:
         angle_deg = 0
-    return dist, hours_passed, remaining_dist, hours_remaining, angle_deg
+    return remaining_dist, angle_deg
 
-dist_traveled, hours_passed, remaining_dist, hours_remaining, heading_deg = calc_stats(
-    st.session_state.full_path, st.session_state.ship_step_idx
-)
+remaining_dist, heading_deg = calc_stats(st.session_state.full_path, st.session_state.ship_step_idx)
 
 # ===============================
 # Satellite Visibility
 # ===============================
 def visible_sats(ship_lat, ship_lon):
-    return np.random.randint(3, 13)
+    return np.random.randint(3,13)
 
-sat_count = visible_sats(lats[st.session_state.full_path[st.session_state.ship_step_idx][0]],
-                         lons[st.session_state.full_path[st.session_state.ship_step_idx][1]])
+current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
+sat_count = visible_sats(lats[current_pos[0]], lons[current_pos[1]])
 
 # ===============================
 # Dashboard
@@ -177,7 +184,7 @@ sat_count = visible_sats(lats[st.session_state.full_path[st.session_state.ship_s
 st.subheader("Navigation Dashboard")
 c1,c2,c3,c4=st.columns(4)
 c1.metric("Remaining Distance (km)", f"{remaining_dist:.2f}")
-c2.metric("Remaining Time (hr)", f"{hours_remaining:.2f}")
+c2.metric("Remaining Time (hr)", f"{int(st.session_state.elapsed_hours)}")
 c3.metric("Heading (°)", f"{heading_deg:.1f}")
 c4.metric("Satellites in View", sat_count)
 st.caption(f"HYCOM observation time: {obs_time}")
@@ -191,52 +198,43 @@ ax.set_extent([118,124,21,26])
 ax.add_feature(cfeature.LAND, facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
-time_idx = st.session_state.ship_step_idx
-if time_idx >= len(ds['time']):
-    time_idx = -1
-u_data = ds['ssu'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
-v_data = ds['ssv'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
+# 更新流場每滿 1 小時
+flow_update_idx = int(st.session_state.elapsed_hours)
+if flow_update_idx >= len(ds['time']):
+    flow_update_idx = -1
+u_data = ds['ssu'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=flow_update_idx).values
+v_data = ds['ssv'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=flow_update_idx).values
 speed = np.sqrt(u_data**2 + v_data**2)
-mesh=ax.pcolormesh(lons,lats,speed,cmap="Blues",vmin=0,vmax=1.6,shading="auto")  # 固定色條0-1.6
+mesh=ax.pcolormesh(lons,lats,speed,cmap="Blues",shading="auto", vmin=0, vmax=1.6)
 fig.colorbar(mesh,ax=ax,label="Current Speed (m/s)")
 
+# No-go zones
 for zone in NO_GO_ZONES:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="red",alpha=0.4)
+
+# Offshore wind zones
 for zone in OFFSHORE_WIND:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="yellow",alpha=0.4)
 
+# 完整路徑 (粉色)
 full_lons = [lons[p[1]] for p in st.session_state.full_path]
 full_lats = [lats[p[0]] for p in st.session_state.full_path]
 ax.plot(full_lons, full_lats, color="pink", linewidth=2)
+
+# 已走過航跡 (紅色)
 done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
 ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
-# ===============================
-# Ship Icon (正三角形)
-# ===============================
-current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
-ship_lon = lons[current_pos[1]]
-ship_lat = lats[current_pos[0]]
+# 船圖標 (灰色尖頭，尖端對應 heading_deg)
+ax.scatter(
+    lons[current_pos[1]], lats[current_pos[0]],
+    color="gray", s=120, edgecolors="black", marker="^"
+)
 
-# 正三角形，三邊相等，尖端朝前
-h = 0.06  # 高度
-half_base = h / np.sqrt(3)  # 使邊長相等
-ship_shape = np.array([
-    [0, h/2],          # 尖端
-    [-half_base, -h/2],
-    [half_base, -h/2]
-])
-theta = np.radians(heading_deg)
-R = np.array([[np.cos(theta), -np.sin(theta)],
-              [np.sin(theta),  np.cos(theta)]])
-rotated_ship = ship_shape @ R.T
-rotated_ship[:,0] += ship_lon
-rotated_ship[:,1] += ship_lat
-ax.fill(rotated_ship[:,0], rotated_ship[:,1], color="gray", edgecolor="black", zorder=5)
-
+# 起點/終點
 ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")
 ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")
 
