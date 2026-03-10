@@ -8,283 +8,266 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
 from scipy.ndimage import distance_transform_edt
+import plotly.graph_objects as go
 import requests
-import re
-from matplotlib.path import Path
 
 st.set_page_config(layout="wide", page_title="HELIOS V8")
 st.title("🛰️ HELIOS V8 智慧海象導航系統")
 
-# =====================================================
-# ⭐ 禁航區自動解析器（核心升級）
-# =====================================================
+# ===============================
+# 模擬可視衛星
+# ===============================
+def get_visible_sats():
+    return np.random.randint(8,12)
 
-RAW_RESTRICTED_TEXT = """
-A[22.953536,120.171678],G[22.934628,120.175472],
-H[22.933136,120.170942],B[22.957810,120.160780]
-[22.943956,120.172358],[22.939717,120.173944],
-[22.928353,120.157372],[22.936636,120.153547]
-[23.280833,119.5],[23.280833,119.509722],
-[23.274444,119.509722],[23.274444,119.5]
-[24.831074,120.914995],[24.831032,120.915097],
-[24.822774,120.909618],[24.818237,120.907696]
-[25.0936,121.4439],[25.1109,121.4150],
-[25.1257,121.4223],[25.1212,121.4534]
-"""
-
-def parse_restricted(text):
-
-    pairs = re.findall(
-        r"\[\s*([\d\.]+)\s*,\s*([\d\.]+)\s*\]", text
-    )
-
-    coords = [(float(lat), float(lon)) for lat,lon in pairs]
-
-    zones=[]
-    temp=[]
-
-    for p in coords:
-        temp.append(p)
-        if len(temp)>=4:
-            zones.append(temp.copy())
-            temp=[]
-
-    return zones
-
-RESTRICTED_ZONES = parse_restricted(RAW_RESTRICTED_TEXT)
-
-def in_restricted(lat,lon):
-    for zone in RESTRICTED_ZONES:
-        poly = Path([(p[1],p[0]) for p in zone])
-        if poly.contains_point((lon,lat)):
-            return True
-    return False
-
-# =====================================================
-# HYCOM
-# =====================================================
-
+# ===============================
+# 讀取 HYCOM 海流
+# ===============================
 @st.cache_data(ttl=3600)
-def load_hycom():
+def load_hycom_data():
+    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+    ds = xr.open_dataset(url, decode_times=False)
+    time_origin = pd.to_datetime(ds['time'].attrs['time_origin'])
+    latest_time = time_origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
 
-    url="https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
-    ds=xr.open_dataset(url,decode_times=False)
+    lat_slice = slice(21,26)
+    lon_slice = slice(118,124)
+    u_data = ds['ssu'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
+    v_data = ds['ssv'].sel(lat=lat_slice, lon=lon_slice).isel(time=-1)
 
-    origin=pd.to_datetime(ds['time'].attrs['time_origin'])
-    obs_time=origin+pd.to_timedelta(ds['time'].values[-1],unit='h')
+    lons = u_data['lon'].values
+    lats = u_data['lat'].values
+    u_val = np.nan_to_num(u_data.values)
+    v_val = np.nan_to_num(v_data.values)
+    land_mask = np.isnan(u_data.values)
 
-    lat_slice=slice(21,26)
-    lon_slice=slice(118,124)
+    return lons,lats,u_val,v_val,land_mask,latest_time
 
-    u=ds['ssu'].sel(lat=lat_slice,lon=lon_slice).isel(time=-1)
-    v=ds['ssv'].sel(lat=lat_slice,lon=lon_slice).isel(time=-1)
+lons,lats,u,v,land_mask,obs_time = load_hycom_data()
 
-    lons=u.lon.values
-    lats=u.lat.values
-
-    u_val=np.nan_to_num(u.values)
-    v_val=np.nan_to_num(v.values)
-
-    land_mask=np.isnan(u.values)
-
-    return lons,lats,u_val,v_val,land_mask,obs_time
-
-lons,lats,u,v,land_mask,obs_time=load_hycom()
-
-# =====================================================
-# 風速
-# =====================================================
-
+# ===============================
+# 波高 + 風速 API
+# ===============================
 @st.cache_data(ttl=1800)
-def get_wind(lat,lon):
-
-    url="https://api.open-meteo.com/v1/forecast"
-
-    params={
-        "latitude":lat,
-        "longitude":lon,
-        "hourly":"wind_speed_10m,wind_direction_10m",
-        "timezone":"Asia/Taipei"
+def get_realtime_marine_data(lat, lon):
+    marine_url = "https://marine-api.open-meteo.com/v1/marine"
+    marine_params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "wave_height",
+        "timezone": "Asia/Taipei"
     }
-
-    data=requests.get(url,params=params).json()
-
+    weather_url = "https://api.open-meteo.com/v1/forecast"
+    weather_params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "wind_speed_10m,wind_direction_10m",
+        "timezone": "Asia/Taipei"
+    }
+    marine = requests.get(marine_url, params=marine_params).json()
+    weather = requests.get(weather_url, params=weather_params).json()
     try:
-        ws=float(data["hourly"]["wind_speed_10m"][0])
-        wd=float(data["hourly"]["wind_direction_10m"][0])
+        wave = float(marine["hourly"]["wave_height"][0])
     except:
-        ws,wd=None,None
+        wave = None
+    try:
+        wind_speed = float(weather["hourly"]["wind_speed_10m"][0])
+        wind_dir = float(weather["hourly"]["wind_direction_10m"][0])
+    except:
+        wind_speed = None
+        wind_dir = None
+    return wave, wind_speed, wind_dir
 
-    return ws,wd
-
-# =====================================================
+# ===============================
 # 最近海洋格點
-# =====================================================
+# ===============================
+def nearest_ocean_cell(lon,lat,lons,lats,land_mask):
+    lon_idx = np.abs(lons-lon).argmin()
+    lat_idx = np.abs(lats-lat).argmin()
+    if not land_mask[lat_idx, lon_idx]:
+        return lat_idx, lon_idx
+    ocean = np.where(~land_mask)
+    dist = np.sqrt((lats[ocean[0]]-lat)**2 + (lons[ocean[1]]-lon)**2)
+    i = dist.argmin()
+    return ocean[0][i], ocean[1][i]
 
-def nearest_cell(lon,lat):
-
-    lon_i=np.abs(lons-lon).argmin()
-    lat_i=np.abs(lats-lat).argmin()
-
-    if not land_mask[lat_i,lon_i]:
-        return lat_i,lon_i
-
-    ocean=np.where(~land_mask)
-
-    dist=np.sqrt(
-        (lats[ocean[0]]-lat)**2+
-        (lons[ocean[1]]-lon)**2
-    )
-
-    i=dist.argmin()
-    return ocean[0][i],ocean[1][i]
-
-# =====================================================
-# A*
-# =====================================================
-
-def astar(start,goal,safety,ship_speed):
-
-    v_ship=ship_speed*0.277
-    rows,cols=land_mask.shape
-
-    dirs=[(1,0),(-1,0),(0,1),(0,-1),
-          (1,1),(1,-1),(-1,1),(-1,-1)]
-
+# ===============================
+# A* 航線
+# ===============================
+def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
+    v_ship = ship_spd*0.277
+    rows,cols = land_mask.shape
+    dirs=[(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
     pq=[(0,start)]
     cost={start:0}
     came={}
-
     while pq:
-
         _,cur=heapq.heappop(pq)
-
         if cur==goal:
             break
-
         for d in dirs:
-
-            ni=cur[0]+d[0]
-            nj=cur[1]+d[1]
-
-            if not(0<=ni<rows and 0<=nj<cols):
-                continue
-
-            if land_mask[ni,nj]:
-                continue
-
-            lat=lats[ni]
-            lon=lons[nj]
-
-            if in_restricted(lat,lon):
-                continue
-
-            dist_m=np.sqrt(d[0]**2+d[1]**2)*8000
-
-            flow=(u[cur]*(d[1])+
-                  v[cur]*(d[0]))
-
-            v_ground=max(0.5,v_ship+flow)
-
-            step=dist_m/v_ground
-
-            if safety[ni,nj]<4:
-                step+=8000
-
-            new=cost[cur]+step
-
-            if (ni,nj) not in cost or new<cost[(ni,nj)]:
-                cost[(ni,nj)]=new
-                priority=new+np.hypot(
-                    ni-goal[0],nj-goal[1]
-                )
-
-                heapq.heappush(pq,(priority,(ni,nj)))
-                came[(ni,nj)]=cur
-
+            ni = cur[0]+d[0]
+            nj = cur[1]+d[1]
+            if 0<=ni<rows and 0<=nj<cols and not land_mask[ni,nj]:
+                dist_m = np.sqrt(d[0]**2+d[1]**2)*8000
+                norm = np.sqrt(d[0]**2+d[1]**2)
+                flow = (u[cur]*(d[1]/norm) + v[cur]*(d[0]/norm))
+                v_ground = max(0.5,v_ship+flow)
+                step = (dist_m/v_ground)+(-flow*(dist_m/v_ship)*1.5)
+                step += (wave_factor**2)*60 + wind_factor*40
+                if safety[ni,nj]<4:
+                    step += 12000/(safety[ni,nj]+0.2)**2
+                new = cost[cur]+step
+                if (ni,nj) not in cost or new<cost[(ni,nj)]:
+                    cost[(ni,nj)] = new
+                    priority = new + 4*np.sqrt((ni-goal[0])**2+(nj-goal[1])**2)*8000/v_ship
+                    heapq.heappush(pq,(priority,(ni,nj)))
+                    came[(ni,nj)] = cur
     path=[]
-    c=goal
-    while c in came:
-        path.append(c)
-        c=came[c]
-
+    curr = goal
+    while curr in came:
+        path.append(curr)
+        curr = came[curr]
     if path:
         path.append(start)
-
     return path[::-1]
 
-# =====================================================
-# Sidebar
-# =====================================================
-
+# ===============================
+# 側邊欄
+# ===============================
 with st.sidebar:
+    st.header("航點設定")
+    s_lon = st.number_input("起點經度",118.0,124.0,120.3)
+    s_lat = st.number_input("起點緯度",21.0,26.0,22.6)
+    e_lon = st.number_input("終點經度",118.0,124.0,122.0)
+    e_lat = st.number_input("終點緯度",21.0,26.0,24.5)
+    ship_speed = st.number_input("船速 km/h",1.0,60.0,20.0)
 
-    s_lon=st.number_input("起點經度",118.0,124.0,120.3)
-    s_lat=st.number_input("起點緯度",21.0,26.0,22.6)
-
-    e_lon=st.number_input("終點經度",118.0,124.0,122.0)
-    e_lat=st.number_input("終點緯度",21.0,26.0,24.5)
-
-    ship_speed=st.number_input("船速 km/h",1.0,60.0,20.0)
-
-# =====================================================
-# 計算
-# =====================================================
-
-safety=distance_transform_edt(~land_mask)
-
-start=nearest_cell(s_lon,s_lat)
-goal=nearest_cell(e_lon,e_lat)
-
-path=astar(start,goal,safety,ship_speed)
-
-# =====================================================
-# 2D MAP（原配色完全保留）
-# =====================================================
-
-colors=[
-"#E5F0FF","#CCE0FF","#99C2FF","#66A3FF",
-"#3385FF","#0066FF","#0052CC","#003D99",
-"#002966","#001433","#000E24"
+# ===============================
+# 禁航區座標範例 (請依你的資料自行替換)
+# ===============================
+RESTRICTED_ZONES = [
+    # 範例：A1區域
+    [(22.36,120.26),(22.362,120.261),(22.361,120.263),(22.359,120.262)],
+    # 範例：B1區域
+    [(22.355,120.265),(22.357,120.266),(22.356,120.268),(22.354,120.267)],
 ]
 
-cmap=mcolors.LinearSegmentedColormap.from_list("flow",colors)
+# ===============================
+# 計算航線
+# ===============================
+if lons is not None:
+    safety = distance_transform_edt(~land_mask)
+    start = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
+    goal  = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
+    wave, wind_speed, wind_dir = get_realtime_marine_data(
+        (s_lat + e_lat)/2,
+        (s_lon + e_lon)/2
+    )
+    # 風向轉向量
+    if wind_speed is None or wind_dir is None:
+        wind_u, wind_v = 0,0
+    else:
+        theta = np.deg2rad(270 - wind_dir)
+        wind_u = wind_speed*np.cos(theta)
+        wind_v = wind_speed*np.sin(theta)
+    path = astar(
+        start, goal, u, v, land_mask, safety, ship_speed,
+        wave_factor=wave if wave else 0,
+        wind_factor=wind_speed if wind_speed else 0
+    )
 
-fig=plt.figure(figsize=(10,8))
-ax=plt.axes(projection=ccrs.PlateCarree())
+    # ===============================
+    # 儀表板
+    # ===============================
+    c1, c2, c3 = st.columns(3)
+    if path:
+        dist_km = sum(np.sqrt(
+            (lats[path[i][0]]-lats[path[i+1][0]])**2+
+            (lons[path[i][1]]-lons[path[i+1][1]])**2
+        ) for i in range(len(path)-1))*111
+        c1.metric("航行時間",f"{dist_km/ship_speed:.1f} hr")
+        c2.metric("航行距離",f"{dist_km:.1f} km")
+    c3.metric("衛星數",f"{get_visible_sats()} SATS")
+    wave_status = "OK" if wave is not None else "未接到"
+    wind_status = "OK" if wind_speed is not None else "未接到"
+    st.caption(f"HYCOM資料時間 {obs_time} | 波高資料: {wave_status} | 風速資料: {wind_status}")
 
-ax.set_extent([118,124,21,26])
+    # ===============================
+    # 2D 地圖
+    # ===============================
+    colors=[
+        "#E5F0FF","#CCE0FF","#99C2FF","#66A3FF",
+        "#3385FF","#0066FF","#0052CC","#003D99",
+        "#002966","#001433","#000E24"
+    ]
+    cmap = mcolors.LinearSegmentedColormap.from_list("flow", colors)
+    fig = plt.figure(figsize=(10,8))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent([118,124,21,26])
+    ax.add_feature(cfeature.LAND, facecolor='lightgray')
+    ax.add_feature(cfeature.COASTLINE)
+    total_factor = np.sqrt(u**2 + v**2) + (wave if wave else 0) + (wind_speed if wind_speed else 0)
+    im = ax.pcolormesh(lons, lats, total_factor, cmap=cmap, shading='auto', alpha=0.8)
+    plt.colorbar(im, ax=ax, label="海象強度")
 
-ax.add_feature(cfeature.LAND,facecolor='lightgray')
-ax.add_feature(cfeature.COASTLINE)
+    # ⭐ 畫禁航區
+    for zone in RESTRICTED_ZONES:
+        xs = [p[1] for p in zone] + [zone[0][1]]
+        ys = [p[0] for p in zone] + [zone[0][0]]
+        ax.fill(xs, ys, color="red", alpha=0.6, transform=ccrs.PlateCarree(), zorder=5)
 
-flow=np.sqrt(u**2+v**2)
+    if path:
+        path_lons = [lons[p[1]] for p in path]
+        path_lats = [lats[p[0]] for p in path]
+        ax.plot(path_lons, path_lats, color='red', linewidth=2)
 
-im=ax.pcolormesh(lons,lats,flow,
-                 cmap=cmap,
-                 shading='auto',
-                 alpha=0.8)
+    ax.scatter(s_lon, s_lat, color='green', s=120, edgecolors='black')
+    ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=200, edgecolors='black')
+    plt.title("HELIOS V8 Navigation")
+    st.pyplot(fig)
 
-plt.colorbar(im,ax=ax,label="海流強度")
-
-# ⭐ 半透明禁航區
-for zone in RESTRICTED_ZONES:
-    xs=[p[1] for p in zone]
-    ys=[p[0] for p in zone]
-    ax.fill(xs,ys,
-            color="red",
-            alpha=0.25,
-            transform=ccrs.PlateCarree())
-
-# 航線
-if path:
-    ax.plot([lons[p[1]] for p in path],
-            [lats[p[0]] for p in path],
-            color='red',linewidth=2)
-
-ax.scatter(s_lon,s_lat,color='green',s=120,edgecolors='black')
-ax.scatter(e_lon,e_lat,color='yellow',marker='*',s=200,edgecolors='black')
-
-plt.title("HELIOS V8 Navigation")
-
-st.pyplot(fig)
+    # ===============================
+    # 3D 海象
+    # ===============================
+    st.subheader("🌊 3D 海象模型")
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+    flow_speed = np.sqrt(u**2+v**2)
+    fig3d = go.Figure()
+    fig3d.add_trace(go.Surface(
+        x=lon_grid,
+        y=lat_grid,
+        z=flow_speed,
+        colorscale="Blues",
+        opacity=0.8
+    ))
+    skip = 3
+    fig3d.add_trace(go.Cone(
+        x=lon_grid[::skip,::skip].flatten(),
+        y=lat_grid[::skip,::skip].flatten(),
+        z=flow_speed[::skip,::skip].flatten(),
+        u=u[::skip,::skip].flatten(),
+        v=v[::skip,::skip].flatten(),
+        w=np.zeros_like(u[::skip,::skip].flatten()),
+        sizemode="scaled",
+        sizeref=0.5
+    ))
+    if path:
+        path_lons = [lons[p[1]] for p in path]
+        path_lats = [lats[p[0]] for p in path]
+        fig3d.add_trace(go.Scatter3d(
+            x=path_lons,
+            y=path_lats,
+            z=np.full(len(path_lons), flow_speed.max()+1),
+            mode="lines",
+            line=dict(color="red", width=6)
+        ))
+    fig3d.update_layout(
+        scene=dict(
+            xaxis_title="經度",
+            yaxis_title="緯度",
+            zaxis_title="流速"
+        ),
+        height=700
+    )
+    st.plotly_chart(fig3d, use_container_width=True)
