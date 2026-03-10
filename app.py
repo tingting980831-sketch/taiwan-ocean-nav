@@ -152,7 +152,7 @@ def calc_stats(path, step_idx):
         y0,x0=path[step_idx]
         y1,x1=path[step_idx+1]
         dx = lons[x1]-lons[x0]
-        dy = lats[y1]-lats[y0]
+        dy = lats[y1]-lats[x0]
         angle_deg = np.degrees(np.arctan2(dy, dx))
     else:
         angle_deg = 0
@@ -214,16 +214,20 @@ done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
 ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
-# 船圖標 (正三角形尖端朝前)
+# ===============================
+# Ship Icon (正三角形)
+# ===============================
 current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
 ship_lon = lons[current_pos[1]]
 ship_lat = lats[current_pos[0]]
 
-# 正三角形，尖端朝上(0,0.06)為尖端
+# 正三角形，三邊相等，尖端朝前
+h = 0.06  # 高度
+half_base = h / np.sqrt(3)  # 使邊長相等
 ship_shape = np.array([
-    [0, 0.06],    # 尖端
-    [-0.03, -0.03],
-    [0.03, -0.03]
+    [0, h/2],          # 尖端
+    [-half_base, -h/2],
+    [half_base, -h/2]
 ])
 theta = np.radians(heading_deg)
 R = np.array([[np.cos(theta), -np.sin(theta)],
