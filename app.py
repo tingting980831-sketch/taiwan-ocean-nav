@@ -62,7 +62,7 @@ with st.sidebar:
     e_lon=st.number_input("End Lon",118.0,124.0,122.0)
     e_lat=st.number_input("End Lat",21.0,26.0,24.5)
     ship_speed=st.number_input("Ship Speed (km/h)",1.0,60.0,20.0)
-    st.button("下一步", key="next_step_button")  # 側邊按鈕
+    st.button("下一步", key="next_step_button")  # 移到側邊
 
 # ===============================
 # Helper Functions
@@ -127,13 +127,13 @@ if "full_path" not in st.session_state:
 if "ship_step_idx" not in st.session_state:
     st.session_state.ship_step_idx = 0
 
-# 下一步
+# 進一步移動
 if st.session_state.get("next_step_button", False):
     if st.session_state.ship_step_idx < len(st.session_state.full_path)-1:
         st.session_state.ship_step_idx += 1
 
 # ===============================
-# Distance & Time, Heading
+# Distance & Time, Direction
 # ===============================
 def calc_stats(path, step_idx):
     dist=0
@@ -149,6 +149,7 @@ def calc_stats(path, step_idx):
     hours_passed = dist/ship_speed
     hours_remaining = remaining_dist/ship_speed
 
+    # 建議航向 (下一步方向)
     if step_idx < len(path)-1:
         y0,x0=path[step_idx]
         y1,x1=path[step_idx+1]
@@ -157,6 +158,7 @@ def calc_stats(path, step_idx):
         angle_deg = np.degrees(np.arctan2(dy, dx))
     else:
         angle_deg = 0
+
     return dist, hours_passed, remaining_dist, hours_remaining, angle_deg
 
 dist_traveled, hours_passed, remaining_dist, hours_remaining, heading_deg = calc_stats(
@@ -167,15 +169,13 @@ dist_traveled, hours_passed, remaining_dist, hours_remaining, heading_deg = calc
 # Satellite Visibility
 # ===============================
 def visible_sats(ship_lat, ship_lon):
-    R_earth = 6371
-    h = 400
-    d_max = np.sqrt((R_earth+h)**2 - R_earth**2)
+    R_earth = 6371  # km
+    h = 400  # km
+    d_max = np.sqrt((R_earth+h)**2 - R_earth**2)  # km
     return np.random.randint(3, 13)
 
-sat_count = visible_sats(
-    lats[st.session_state.full_path[st.session_state.ship_step_idx][0]],
-    lons[st.session_state.full_path[st.session_state.ship_step_idx][1]]
-)
+sat_count = visible_sats(lats[st.session_state.full_path[st.session_state.ship_step_idx][0]],
+                         lons[st.session_state.full_path[st.session_state.ship_step_idx][1]])
 
 # ===============================
 # Dashboard
@@ -191,51 +191,53 @@ st.caption(f"HYCOM observation time: {obs_time}")
 # ===============================
 # Map
 # ===============================
-fig = plt.figure(figsize=(10,8))
-ax = fig.add_axes([0.05, 0.05, 0.78, 0.9], projection=ccrs.PlateCarree())
+fig=plt.figure(figsize=(10,8))
+ax=plt.axes(projection=ccrs.PlateCarree())
 ax.set_extent([118,124,21,26])
 ax.add_feature(cfeature.LAND, facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
+# 當前流場
 time_idx = st.session_state.ship_step_idx
 if time_idx >= len(ds['time']):
     time_idx = -1
-
 u_data = ds['ssu'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
 v_data = ds['ssv'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
 speed = np.sqrt(u_data**2 + v_data**2)
-mesh = ax.pcolormesh(lons,lats,speed,cmap="Blues",shading="auto")
-
-# 固定色條
-cax = fig.add_axes([0.86, 0.15, 0.02, 0.7])
-fig.colorbar(mesh, cax=cax, label="Current Speed (m/s)")
+mesh=ax.pcolormesh(lons,lats,speed,cmap="Blues",shading="auto")
+fig.colorbar(mesh,ax=ax,label="Current Speed (m/s)")
 
 # No-go zones
 for zone in NO_GO_ZONES:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="red",alpha=0.4)
-# Offshore wind
+
+# Offshore wind zones
 for zone in OFFSHORE_WIND:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="yellow",alpha=0.4)
 
-# Full path & done path
+# 完整路徑 (粉色)
 full_lons = [lons[p[1]] for p in st.session_state.full_path]
 full_lats = [lats[p[0]] for p in st.session_state.full_path]
-ax.plot(full_lons, full_lats, color="pink", linewidth=2)  # full
+ax.plot(full_lons, full_lats, color="pink", linewidth=2)
+
+# 已走過航跡 (紅色)
 done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
-ax.plot(done_lons, done_lats, color="red", linewidth=2)  # done
+ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
-# Ship icon (rotates with heading)
+# 船圖標 (尖端對準航向)
 current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
 ship_lon = lons[current_pos[1]]
 ship_lat = lats[current_pos[0]]
+
 ship_shape = np.array([
-    [0.00,  0.06],   # tip
-    [-0.025,-0.025],
-    [0.025,-0.025]
+    [0.0, 0.06],   # 尖端
+    [-0.03, -0.03],
+    [0.03, -0.03]
 ])
+
 theta = np.radians(heading_deg)
 R = np.array([[np.cos(theta), -np.sin(theta)],
               [np.sin(theta),  np.cos(theta)]])
@@ -244,9 +246,9 @@ rotated_ship[:,0] += ship_lon
 rotated_ship[:,1] += ship_lat
 ax.fill(rotated_ship[:,0], rotated_ship[:,1], color="gray", edgecolor="black", zorder=5)
 
-# 起點 / 終點
-ax.scatter(s_lon, s_lat, color="#B15BFF", s=70, edgecolors="black", zorder=6)
-ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black", zorder=6)
+# 起點/終點
+ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")  # 起點
+ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")  # 終點
 
 plt.title("HELIOS Dynamic Navigation Map")
 st.pyplot(fig)
