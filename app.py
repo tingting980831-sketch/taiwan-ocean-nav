@@ -10,10 +10,10 @@ from scipy.ndimage import distance_transform_edt
 from matplotlib.path import Path
 
 st.set_page_config(layout="wide", page_title="HELIOS Dynamic Navigation")
-st.title("🛰️ HELIOS Dynamic Ocean Navigation")
+st.title("🛰️ HELIOS Dynamic Ocean Navigation with Ship Icon")
 
 # ===============================
-# No-Go Zones
+# No-Go Zones & Offshore Wind
 # ===============================
 NO_GO_ZONES = [
     [[22.953536,120.171678],[22.934628,120.175472],[22.933136,120.170942],[22.957810,120.160780]],
@@ -21,9 +21,6 @@ NO_GO_ZONES = [
     [[23.7885,119.598368],[23.784251,119.598368],[23.784251,119.602022],[23.7885,119.602022]],
 ]
 
-# ===============================
-# Offshore Wind Farms
-# ===============================
 OFFSHORE_WIND = [
     [[24.18,120.12],[24.22,120.28],[24.05,120.35],[24.00,120.15]],
     [[24.00,120.10],[24.05,120.32],[23.90,120.38],[23.85,120.15]],
@@ -90,17 +87,12 @@ def coast_penalty(y,x):
         return COAST_PENALTY * (MAX_DIST - d)/MAX_DIST
     return 0.0
 
-# ===============================
-# Simple local A* for one step
-# ===============================
 dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
-def astar_next_step(current, goal, u_data, v_data):
+def astar_with_wind_and_coast(start, goal):
     rows, cols = land_mask.shape
-    pq=[]
-    heapq.heappush(pq,(0,current))
+    pq = [(0,start)]
     came = {}
-    cost = {current:0}
-
+    cost = {start:0}
     while pq:
         _, cur = heapq.heappop(pq)
         if cur == goal:
@@ -108,24 +100,21 @@ def astar_next_step(current, goal, u_data, v_data):
         for d in dirs:
             ni, nj = cur[0]+d[0], cur[1]+d[1]
             if 0<=ni<rows and 0<=nj<cols and not land_mask[ni,nj]:
-                base = np.hypot(d[0],d[1])
-                new_cost = cost[cur]+base + offshore_penalty(ni,nj) + coast_penalty(ni,nj)
-                if (ni,nj) not in cost or new_cost<cost[(ni,nj)]:
-                    cost[(ni,nj)] = new_cost
-                    heapq.heappush(pq,(new_cost,(ni,nj)))
+                base_distance = np.hypot(d[0], d[1])
+                new = cost[cur] + base_distance + offshore_penalty(ni,nj) + coast_penalty(ni,nj)
+                if (ni,nj) not in cost or new < cost[(ni,nj)]:
+                    cost[(ni,nj)] = new
+                    heapq.heappush(pq,(new,(ni,nj)))
                     came[(ni,nj)] = cur
-
-    # 從當前點選擇最短路徑一步
+    # reconstruct path
     path=[]
     curr=goal
     while curr in came:
         path.append(curr)
         curr=came[curr]
     if path:
-        path.append(current)
-    if len(path)>1:
-        return path[-2]  # 下一步格點
-    return current
+        path.append(start)
+    return path[::-1]
 
 # ===============================
 # Initialize Session State
@@ -133,24 +122,17 @@ def astar_next_step(current, goal, u_data, v_data):
 start = nearest_ocean_cell(s_lon,s_lat)
 goal = nearest_ocean_cell(e_lon,e_lat)
 
-if "ship_path" not in st.session_state:
-    st.session_state.ship_path = [start]
-if "current_time_idx" not in st.session_state:
-    st.session_state.current_time_idx = 0
+if "full_path" not in st.session_state:
+    st.session_state.full_path = astar_with_wind_and_coast(start, goal)
+if "ship_step_idx" not in st.session_state:
+    st.session_state.ship_step_idx = 0
 
 # ===============================
 # Next Step Button
 # ===============================
 if st.button("下一步"):
-    time_idx = st.session_state.current_time_idx
-    if time_idx >= len(ds['time']):
-        st.warning("已到 HYCOM 最新時間")
-    else:
-        u_data = ds['ssu'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
-        v_data = ds['ssv'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
-        next_pos = astar_next_step(st.session_state.ship_path[-1], goal, u_data, v_data)
-        st.session_state.ship_path.append(next_pos)
-        st.session_state.current_time_idx += 1
+    if st.session_state.ship_step_idx < len(st.session_state.full_path)-1:
+        st.session_state.ship_step_idx += 1
 
 # ===============================
 # Distance & Time
@@ -164,16 +146,16 @@ def calc_stats(path):
     hours=dist/ship_speed
     return dist,hours
 
-distance_km, time_hr = calc_stats(st.session_state.ship_path)
+distance_km, time_hr = calc_stats(st.session_state.full_path[:st.session_state.ship_step_idx+1])
 
 # ===============================
 # Dashboard
 # ===============================
 st.subheader("Navigation Dashboard")
 c1,c2,c3=st.columns(3)
-c1.metric("Total Distance (km)",f"{distance_km:.2f}")
-c2.metric("Travel Time (hr)",f"{time_hr:.2f}")
-c3.metric("HYCOM Time Index",st.session_state.current_time_idx)
+c1.metric("Distance Traveled (km)",f"{distance_km:.2f}")
+c2.metric("Time (hr)",f"{time_hr:.2f}")
+c3.metric("HYCOM Step",st.session_state.ship_step_idx)
 st.caption(f"HYCOM observation time: {obs_time}")
 
 # ===============================
@@ -186,7 +168,7 @@ ax.add_feature(cfeature.LAND, facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
 # 當前流場
-time_idx = st.session_state.current_time_idx
+time_idx = st.session_state.ship_step_idx
 if time_idx >= len(ds['time']):
     time_idx = -1
 u_data = ds['ssu'].sel(lat=slice(21,26),lon=slice(118,124)).isel(time=time_idx).values
@@ -205,19 +187,24 @@ for zone in OFFSHORE_WIND:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="yellow",alpha=0.4)
 
-# 航跡
-if st.session_state.ship_path:
-    path_lons=[lons[p[1]] for p in st.session_state.ship_path]
-    path_lats=[lats[p[0]] for p in st.session_state.ship_path]
-    ax.plot(path_lons, path_lats,color="red",linewidth=2)
+# 完整路徑
+full_lons = [lons[p[1]] for p in st.session_state.full_path]
+full_lats = [lats[p[0]] for p in st.session_state.full_path]
+ax.plot(full_lons, full_lats, color="red", linewidth=2, label="Full Path")
 
-# 船當前位置
-current_pos = st.session_state.ship_path[-1]
-ax.scatter(lons[current_pos[1]], lats[current_pos[0]], color="green",s=120,edgecolors="black")
+# 已走過航跡
+done_lons = full_lons[:st.session_state.ship_step_idx+1]
+done_lats = full_lats[:st.session_state.ship_step_idx+1]
+ax.plot(done_lons, done_lats, color="pink", linewidth=2, label="Travelled Path")
+
+# 船圖標
+current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
+ax.scatter(lons[current_pos[1]], lats[current_pos[0]], color="green", s=120, edgecolors="black", marker="^", label="Ship")
 
 # 起點/終點
 ax.scatter(s_lon,s_lat,color="green",s=120,edgecolors="black")
 ax.scatter(e_lon,e_lat,color="yellow",marker="*",s=200,edgecolors="black")
 
-plt.title("HELIOS Dynamic Ocean Navigation Map")
+plt.title("HELIOS Dynamic Navigation Map")
+plt.legend(loc="upper left")
 st.pyplot(fig)
