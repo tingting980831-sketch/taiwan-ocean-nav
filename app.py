@@ -30,8 +30,7 @@ OFFSHORE_WIND = [
     [[23.88,120.05],[23.92,120.18],[23.75,120.25],[23.70,120.08]],
     [[23.68,120.02],[23.72,120.12],[23.58,120.15],[23.55,120.05]],
 ]
-
-OFFSHORE_COST = 10  # 每格軟懲罰成本
+OFFSHORE_COST = 10  # 軟懲罰成本
 
 # ===============================
 # HYCOM Ocean Current
@@ -89,9 +88,22 @@ def offshore_penalty(y,x):
     return 0
 
 # ===============================
-# A* with offshore wind penalty
+# 靠岸懲罰
 # ===============================
-def astar_with_wind(start, goal):
+sea_mask = ~land_mask
+dist_to_land = distance_transform_edt(sea_mask)
+MAX_DIST = 5
+COAST_PENALTY = 5.0
+def coast_penalty(y,x):
+    d = dist_to_land[y,x]
+    if d < MAX_DIST:
+        return COAST_PENALTY * (MAX_DIST - d)/MAX_DIST
+    return 0.0
+
+# ===============================
+# A* with offshore + coast
+# ===============================
+def astar_with_wind_and_coast(start, goal):
     rows, cols = land_mask.shape
     dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
     pq = [(0,start)]
@@ -106,7 +118,9 @@ def astar_with_wind(start, goal):
             ni, nj = cur[0]+d[0], cur[1]+d[1]
             if 0<=ni<rows and 0<=nj<cols and not land_mask[ni,nj]:
                 base_distance = np.hypot(d[0], d[1])
-                new = cost[cur] + base_distance + offshore_penalty(ni,nj)
+                new = cost[cur] + base_distance \
+                      + offshore_penalty(ni,nj) \
+                      + coast_penalty(ni,nj)
                 if (ni,nj) not in cost or new < cost[(ni,nj)]:
                     cost[(ni,nj)] = new
                     heapq.heappush(pq,(new,(ni,nj)))
@@ -117,7 +131,8 @@ def astar_with_wind(start, goal):
     while curr in came:
         path.append(curr)
         curr=came[curr]
-    if path: path.append(start)
+    if path:
+        path.append(start)
     return path[::-1]
 
 # ===============================
@@ -125,7 +140,7 @@ def astar_with_wind(start, goal):
 # ===============================
 start=nearest_ocean_cell(s_lon,s_lat)
 goal=nearest_ocean_cell(e_lon,e_lat)
-path=astar_with_wind(start,goal)
+path=astar_with_wind_and_coast(start,goal)
 
 # ===============================
 # Distance & Time
@@ -149,7 +164,7 @@ c1,c2,c3=st.columns(3)
 c1.metric("Total Distance (km)",f"{distance_km:.2f}")
 c2.metric("Travel Time (hr)",f"{time_hr:.2f}")
 c3.metric("Connected Satellites",np.random.randint(3,7))
-st.caption(f"HYCOM observation time: {obs_time} | Offshore wind zones: Considered")
+st.caption(f"HYCOM observation time: {obs_time}")  # 已刪掉 Offshore wind提示
 
 # ===============================
 # Map
