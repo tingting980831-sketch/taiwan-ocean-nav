@@ -8,17 +8,9 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
 from scipy.ndimage import distance_transform_edt
-import plotly.graph_objects as go
-import requests
 
-st.set_page_config(layout="wide", page_title="HELIOS V8")
-st.title("🛰️ HELIOS V8 智慧海象導航系統")
-
-# ===============================
-# 模擬可視衛星
-# ===============================
-def get_visible_sats():
-    return np.random.randint(8,12)
+st.set_page_config(layout="wide", page_title="HELIOS V9")
+st.title("🛰️ HELIOS V9 智慧海象導航系統 (2D)")
 
 # ===============================
 # 讀取 HYCOM 海流
@@ -46,39 +38,6 @@ def load_hycom_data():
 lons,lats,u,v,land_mask,obs_time = load_hycom_data()
 
 # ===============================
-# 波高 + 風速 API
-# ===============================
-@st.cache_data(ttl=1800)
-def get_realtime_marine_data(lat, lon):
-    marine_url = "https://marine-api.open-meteo.com/v1/marine"
-    marine_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "wave_height",
-        "timezone": "Asia/Taipei"
-    }
-    weather_url = "https://api.open-meteo.com/v1/forecast"
-    weather_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "wind_speed_10m,wind_direction_10m",
-        "timezone": "Asia/Taipei"
-    }
-    marine = requests.get(marine_url, params=marine_params).json()
-    weather = requests.get(weather_url, params=weather_params).json()
-    try:
-        wave = float(marine["hourly"]["wave_height"][0])
-    except:
-        wave = None
-    try:
-        wind_speed = float(weather["hourly"]["wind_speed_10m"][0])
-        wind_dir = float(weather["hourly"]["wind_direction_10m"][0])
-    except:
-        wind_speed = None
-        wind_dir = None
-    return wave, wind_speed, wind_dir
-
-# ===============================
 # 最近海洋格點
 # ===============================
 def nearest_ocean_cell(lon,lat,lons,lats,land_mask):
@@ -94,7 +53,7 @@ def nearest_ocean_cell(lon,lat,lons,lats,land_mask):
 # ===============================
 # A* 航線
 # ===============================
-def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
+def astar(start,goal,u,v,land_mask,safety,ship_spd):
     v_ship = ship_spd*0.277
     rows,cols = land_mask.shape
     dirs=[(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
@@ -114,7 +73,6 @@ def astar(start,goal,u,v,land_mask,safety,ship_spd,wave_factor=0,wind_factor=0):
                 flow = (u[cur]*(d[1]/norm) + v[cur]*(d[0]/norm))
                 v_ground = max(0.5,v_ship+flow)
                 step = (dist_m/v_ground)+(-flow*(dist_m/v_ship)*1.5)
-                step += (wave_factor**2)*60 + wind_factor*40
                 if safety[ni,nj]<4:
                     step += 12000/(safety[ni,nj]+0.2)**2
                 new = cost[cur]+step
@@ -144,13 +102,31 @@ with st.sidebar:
     ship_speed = st.number_input("船速 km/h",1.0,60.0,20.0)
 
 # ===============================
-# 禁航區座標範例 (請依你的資料自行替換)
+# 禁航區 (NO_GO_ZONES)
 # ===============================
-RESTRICTED_ZONES = [
-    # 範例：A1區域
-    [(22.36,120.26),(22.362,120.261),(22.361,120.263),(22.359,120.262)],
-    # 範例：B1區域
-    [(22.355,120.265),(22.357,120.266),(22.356,120.268),(22.354,120.267)],
+NO_GO_ZONES = [
+    # 台南安平/四草
+    [[22.953536, 120.171678], [22.934628, 120.175472], [22.933136, 120.170942], [22.957810, 120.160780]],
+    [[22.943956, 120.172358], [22.939717, 120.173944], [22.928353, 120.157372], [22.936636, 120.153547]],
+    [[22.88462, 120.17547], [22.91242, 120.17696], [22.91178, 120.17214], [22.933136, 120.170942]],
+    # 屏東東港
+    [[22.360902, 120.381109], [22.354722, 120.382139], [22.353191, 120.384728], [22.357684, 120.387818]],
+    [[22.452778, 120.458611], [22.4475, 120.451389], [22.446111, 120.452222], [22.449167, 120.460556]],
+    # 澎湖海域
+    [[23.7885, 119.598368], [23.784251, 119.598368], [23.784251, 119.602022], [23.7885, 119.602022]],
+    [[23.280833, 119.5], [23.280833, 119.509722], [23.274444, 119.509722], [23.274444, 119.5]],
+    # 野柳/基隆/瑞芳
+    [[25.231417, 121.648863], [25.226151, 121.651505], [25.233410, 121.642090], [25.242200, 121.634560]],
+    [[25.135583, 121.826500], [25.128472, 121.834222], [25.128722, 121.818389], [25.118861, 121.824250]],
+    # 東北角 B1-B4
+    [[25.103033, 121.920683], [25.101992, 121.922256], [25.098672, 121.919836], [25.099569, 121.918122]],
+    # 宜蘭外海
+    [[24.8797, 121.8463], [24.8791, 121.8452], [24.8780, 121.8452]],
+    # 旗津沿岸 A1-A8
+    [[22.611569, 120.264303], [22.61055, 120.26386], [22.60902, 120.26382], [22.60799, 120.26434]],
+    # 新竹/苗栗
+    [[24.849621, 120.928948], [24.848034, 120.929797], [24.847862, 120.930568], [24.850101, 120.930086]],
+    [[24.831074, 120.914995], [24.822774, 120.909618], [24.818237, 120.907696], [24.822791, 120.909332]],
 ]
 
 # ===============================
@@ -160,38 +136,7 @@ if lons is not None:
     safety = distance_transform_edt(~land_mask)
     start = nearest_ocean_cell(s_lon, s_lat, lons, lats, land_mask)
     goal  = nearest_ocean_cell(e_lon, e_lat, lons, lats, land_mask)
-    wave, wind_speed, wind_dir = get_realtime_marine_data(
-        (s_lat + e_lat)/2,
-        (s_lon + e_lon)/2
-    )
-    # 風向轉向量
-    if wind_speed is None or wind_dir is None:
-        wind_u, wind_v = 0,0
-    else:
-        theta = np.deg2rad(270 - wind_dir)
-        wind_u = wind_speed*np.cos(theta)
-        wind_v = wind_speed*np.sin(theta)
-    path = astar(
-        start, goal, u, v, land_mask, safety, ship_speed,
-        wave_factor=wave if wave else 0,
-        wind_factor=wind_speed if wind_speed else 0
-    )
-
-    # ===============================
-    # 儀表板
-    # ===============================
-    c1, c2, c3 = st.columns(3)
-    if path:
-        dist_km = sum(np.sqrt(
-            (lats[path[i][0]]-lats[path[i+1][0]])**2+
-            (lons[path[i][1]]-lons[path[i+1][1]])**2
-        ) for i in range(len(path)-1))*111
-        c1.metric("航行時間",f"{dist_km/ship_speed:.1f} hr")
-        c2.metric("航行距離",f"{dist_km:.1f} km")
-    c3.metric("衛星數",f"{get_visible_sats()} SATS")
-    wave_status = "OK" if wave is not None else "未接到"
-    wind_status = "OK" if wind_speed is not None else "未接到"
-    st.caption(f"HYCOM資料時間 {obs_time} | 波高資料: {wave_status} | 風速資料: {wind_status}")
+    path = astar(start, goal, u, v, land_mask, safety, ship_speed)
 
     # ===============================
     # 2D 地圖
@@ -207,67 +152,23 @@ if lons is not None:
     ax.set_extent([118,124,21,26])
     ax.add_feature(cfeature.LAND, facecolor='lightgray')
     ax.add_feature(cfeature.COASTLINE)
-    total_factor = np.sqrt(u**2 + v**2) + (wave if wave else 0) + (wind_speed if wind_speed else 0)
+    total_factor = np.sqrt(u**2 + v**2)
     im = ax.pcolormesh(lons, lats, total_factor, cmap=cmap, shading='auto', alpha=0.8)
-    plt.colorbar(im, ax=ax, label="海象強度")
+    plt.colorbar(im, ax=ax, label="海流強度")
 
     # ⭐ 畫禁航區
-    for zone in RESTRICTED_ZONES:
+    for zone in NO_GO_ZONES:
         xs = [p[1] for p in zone] + [zone[0][1]]
         ys = [p[0] for p in zone] + [zone[0][0]]
         ax.fill(xs, ys, color="red", alpha=0.6, transform=ccrs.PlateCarree(), zorder=5)
 
+    # 畫航線
     if path:
         path_lons = [lons[p[1]] for p in path]
         path_lats = [lats[p[0]] for p in path]
         ax.plot(path_lons, path_lats, color='red', linewidth=2)
 
-    ax.scatter(s_lon, s_lat, color='green', s=120, edgecolors='black')
-    ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=200, edgecolors='black')
-    plt.title("HELIOS V8 Navigation")
+    ax.scatter(s_lon, s_lat, color='green', s=120, edgecolors='black', label="起點")
+    ax.scatter(e_lon, e_lat, color='yellow', marker='*', s=200, edgecolors='black', label="終點")
+    plt.title("HELIOS V9 Navigation (2D)")
     st.pyplot(fig)
-
-    # ===============================
-    # 3D 海象
-    # ===============================
-    st.subheader("🌊 3D 海象模型")
-    lon_grid, lat_grid = np.meshgrid(lons, lats)
-    flow_speed = np.sqrt(u**2+v**2)
-    fig3d = go.Figure()
-    fig3d.add_trace(go.Surface(
-        x=lon_grid,
-        y=lat_grid,
-        z=flow_speed,
-        colorscale="Blues",
-        opacity=0.8
-    ))
-    skip = 3
-    fig3d.add_trace(go.Cone(
-        x=lon_grid[::skip,::skip].flatten(),
-        y=lat_grid[::skip,::skip].flatten(),
-        z=flow_speed[::skip,::skip].flatten(),
-        u=u[::skip,::skip].flatten(),
-        v=v[::skip,::skip].flatten(),
-        w=np.zeros_like(u[::skip,::skip].flatten()),
-        sizemode="scaled",
-        sizeref=0.5
-    ))
-    if path:
-        path_lons = [lons[p[1]] for p in path]
-        path_lats = [lats[p[0]] for p in path]
-        fig3d.add_trace(go.Scatter3d(
-            x=path_lons,
-            y=path_lats,
-            z=np.full(len(path_lons), flow_speed.max()+1),
-            mode="lines",
-            line=dict(color="red", width=6)
-        ))
-    fig3d.update_layout(
-        scene=dict(
-            xaxis_title="經度",
-            yaxis_title="緯度",
-            zaxis_title="流速"
-        ),
-        height=700
-    )
-    st.plotly_chart(fig3d, use_container_width=True)
