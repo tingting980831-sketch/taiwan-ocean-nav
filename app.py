@@ -9,8 +9,8 @@ import heapq
 from scipy.ndimage import distance_transform_edt
 from matplotlib.path import Path
 
-st.set_page_config(layout="wide", page_title="HELIOS Dynamic Navigation")
-st.title("🛰️ HELIOS Dynamic Ocean Navigation with Hourly Flow Update")
+st.set_page_config(layout="wide", page_title="HELIOS 系統")
+st.title("HELIOS 系統")  # 改成簡單標題
 
 # ===============================
 # No-Go Zones & Offshore Wind
@@ -134,7 +134,6 @@ if "elapsed_hours" not in st.session_state:
 # ===============================
 if st.session_state.get("next_step_button", False):
     if st.session_state.ship_step_idx < len(st.session_state.full_path)-1:
-        # 計算下一格距離時間
         y0,x0 = st.session_state.full_path[st.session_state.ship_step_idx]
         y1,x1 = st.session_state.full_path[st.session_state.ship_step_idx+1]
         step_dist = np.hypot(lats[y1]-lats[y0],lons[x1]-lons[x0])*111  # km
@@ -146,17 +145,12 @@ if st.session_state.get("next_step_button", False):
 # Distance & Remaining Time
 # ===============================
 def calc_stats(path, step_idx):
-    dist=0
-    for i in range(step_idx):
-        y0,x0=path[i]
-        y1,x1=path[i+1]
-        dist+=np.hypot(lats[y1]-lats[y0],lons[x1]-lons[x0])*111
     remaining_dist = 0
     for i in range(step_idx, len(path)-1):
         y0,x0=path[i]
         y1,x1=path[i+1]
-        remaining_dist+=np.hypot(lats[y1]-lats[y0],lons[x1]-lons[x0])*111
-    # 計算建議方向
+        remaining_dist += np.hypot(lats[y1]-lats[y0],lons[x1]-lons[x0])*111
+    # 建議方向
     if step_idx < len(path)-1:
         y0,x0=path[step_idx]
         y1,x1=path[step_idx+1]
@@ -184,7 +178,7 @@ sat_count = visible_sats(lats[current_pos[0]], lons[current_pos[1]])
 st.subheader("Navigation Dashboard")
 c1,c2,c3,c4=st.columns(4)
 c1.metric("Remaining Distance (km)", f"{remaining_dist:.2f}")
-c2.metric("Remaining Time (hr)", f"{int(st.session_state.elapsed_hours)}")
+c2.metric("Remaining Time (hr)", f"{int(max(0, st.session_state.elapsed_hours))}")  # 保證至少顯示0
 c3.metric("Heading (°)", f"{heading_deg:.1f}")
 c4.metric("Satellites in View", sat_count)
 st.caption(f"HYCOM observation time: {obs_time}")
