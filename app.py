@@ -7,6 +7,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
 from scipy.ndimage import distance_transform_edt
+from matplotlib.path import Path
 
 st.set_page_config(layout="wide", page_title="HELIOS Navigation System")
 st.title("🛰️ HELIOS Smart Ocean Navigation")
@@ -29,6 +30,8 @@ OFFSHORE_WIND = [
     [[23.88,120.05],[23.92,120.18],[23.75,120.25],[23.70,120.08]],
     [[23.68,120.02],[23.72,120.12],[23.58,120.15],[23.55,120.05]],
 ]
+
+OFFSHORE_COST = 10  # 每格軟懲罰成本
 
 # ===============================
 # HYCOM Ocean Current
@@ -77,28 +80,37 @@ def nearest_ocean_cell(lon,lat):
     lat_idx=np.abs(lats-lat).argmin()
     return lat_idx,lon_idx
 
+def offshore_penalty(y,x):
+    lat=lats[y]
+    lon=lons[x]
+    for zone in OFFSHORE_WIND:
+        if Path(zone).contains_point([lon,lat]):
+            return OFFSHORE_COST
+    return 0
+
 # ===============================
-# Simple A*
+# A* with offshore wind penalty
 # ===============================
-def astar(start,goal):
-    rows,cols=land_mask.shape
-    dirs=[(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
-    pq=[(0,start)]
-    came={}
-    cost={start:0}
+def astar_with_wind(start, goal):
+    rows, cols = land_mask.shape
+    dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+    pq = [(0,start)]
+    came = {}
+    cost = {start:0}
 
     while pq:
-        _,cur=heapq.heappop(pq)
-        if cur==goal: break
+        _, cur = heapq.heappop(pq)
+        if cur == goal: break
 
         for d in dirs:
-            ni,nj=cur[0]+d[0],cur[1]+d[1]
+            ni, nj = cur[0]+d[0], cur[1]+d[1]
             if 0<=ni<rows and 0<=nj<cols and not land_mask[ni,nj]:
-                new=cost[cur]+1
-                if (ni,nj) not in cost or new<cost[(ni,nj)]:
-                    cost[(ni,nj)]=new
+                base_distance = np.hypot(d[0], d[1])
+                new = cost[cur] + base_distance + offshore_penalty(ni,nj)
+                if (ni,nj) not in cost or new < cost[(ni,nj)]:
+                    cost[(ni,nj)] = new
                     heapq.heappush(pq,(new,(ni,nj)))
-                    came[(ni,nj)]=cur
+                    came[(ni,nj)] = cur
 
     path=[]
     curr=goal
@@ -108,9 +120,12 @@ def astar(start,goal):
     if path: path.append(start)
     return path[::-1]
 
+# ===============================
+# Compute path
+# ===============================
 start=nearest_ocean_cell(s_lon,s_lat)
 goal=nearest_ocean_cell(e_lon,e_lat)
-path=astar(start,goal)
+path=astar_with_wind(start,goal)
 
 # ===============================
 # Distance & Time
@@ -127,19 +142,14 @@ def calc_stats(path):
 distance_km,time_hr=calc_stats(path)
 
 # ===============================
-# Dashboard (Horizontal)
+# Dashboard
 # ===============================
 st.subheader("Navigation Dashboard")
-
 c1,c2,c3=st.columns(3)
 c1.metric("Total Distance (km)",f"{distance_km:.2f}")
 c2.metric("Travel Time (hr)",f"{time_hr:.2f}")
 c3.metric("Connected Satellites",np.random.randint(3,7))
-
-# small status line
-st.caption(
-f"HYCOM observation time: {obs_time} | Offshore wind data: Loaded"
-)
+st.caption(f"HYCOM observation time: {obs_time} | Offshore wind zones: Considered")
 
 # ===============================
 # Map
@@ -151,11 +161,7 @@ ax.add_feature(cfeature.LAND,facecolor="lightgray")
 ax.add_feature(cfeature.COASTLINE)
 
 speed=np.sqrt(u**2+v**2)
-
-mesh=ax.pcolormesh(lons,lats,speed,
-                   cmap="Blues",
-                   shading="auto")
-
+mesh=ax.pcolormesh(lons,lats,speed,cmap="Blues",shading="auto")
 fig.colorbar(mesh,ax=ax,label="Current Speed (m/s)")
 
 # No-go zones
@@ -163,7 +169,7 @@ for zone in NO_GO_ZONES:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="red",alpha=0.4)
 
-# Offshore wind (YELLOW)
+# Offshore wind (軟懲罰，黃色)
 for zone in OFFSHORE_WIND:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="yellow",alpha=0.4)
