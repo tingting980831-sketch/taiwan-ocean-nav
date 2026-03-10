@@ -106,7 +106,6 @@ def astar_with_wind_and_coast(start, goal):
                     cost[(ni,nj)] = new
                     heapq.heappush(pq,(new,(ni,nj)))
                     came[(ni,nj)] = cur
-    # reconstruct path
     path=[]
     curr=goal
     while curr in came:
@@ -187,24 +186,26 @@ for zone in OFFSHORE_WIND:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="yellow",alpha=0.4)
 
-# 完整路徑
+# 完整路徑 (粉色)
 full_lons = [lons[p[1]] for p in st.session_state.full_path]
 full_lats = [lats[p[0]] for p in st.session_state.full_path]
-ax.plot(full_lons, full_lats, color="red", linewidth=2, label="Full Path")
+ax.plot(full_lons, full_lats, color="pink", linewidth=2)
 
-# 已走過航跡
+# 已走過航跡 (紅色)
 done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
-ax.plot(done_lons, done_lats, color="pink", linewidth=2, label="Travelled Path")
+ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
-# 船圖標
+# 船圖標 (灰色，無圖例)
 current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
-ax.scatter(lons[current_pos[1]], lats[current_pos[0]], color="green", s=120, edgecolors="black", marker="^", label="Ship")
+ax.scatter(
+    lons[current_pos[1]], lats[current_pos[0]],
+    color="gray", s=120, edgecolors="black", marker="^"
+)
 
 # 起點/終點
-ax.scatter(s_lon,s_lat,color="green",s=120,edgecolors="black")
-ax.scatter(e_lon,e_lat,color="yellow",marker="*",s=200,edgecolors="black")
+ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")  # 起點小一點，顏色改
+ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")  # 終點保持
 
 plt.title("HELIOS Dynamic Navigation Map")
-plt.legend(loc="upper left")
 st.pyplot(fig)
