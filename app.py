@@ -9,8 +9,8 @@ import heapq
 from scipy.ndimage import distance_transform_edt
 from matplotlib.path import Path
 
-st.set_page_config(layout="wide", page_title="HELIOS 系統")
-st.title("🛰️ HELIOS 系統")
+st.set_page_config(layout="wide", page_title="HELIOS System")
+st.title("🛰️ HELIOS System")
 
 # ===============================
 # No-Go Zones & Offshore Wind
@@ -57,12 +57,12 @@ dist_to_land = distance_transform_edt(sea_mask)
 # ===============================
 with st.sidebar:
     st.header("Route Settings")
-    s_lon=st.number_input("Start Lon",118.0,124.0,120.3)
-    s_lat=st.number_input("Start Lat",21.0,26.0,22.6)
-    e_lon=st.number_input("End Lon",118.0,124.0,122.0)
-    e_lat=st.number_input("End Lat",21.0,26.0,24.5)
+    s_lon=st.number_input("Start Longitude",118.0,124.0,120.3)
+    s_lat=st.number_input("Start Latitude",21.0,26.0,22.6)
+    e_lon=st.number_input("End Longitude",118.0,124.0,122.0)
+    e_lat=st.number_input("End Latitude",21.0,26.0,24.5)
     ship_speed=st.number_input("Ship Speed (km/h)",1.0,60.0,20.0)
-    st.button("下一步", key="next_step_button")
+    st.button("Next Step", key="next_step_button")
 
 # ===============================
 # Helper Functions
@@ -127,7 +127,7 @@ if "full_path" not in st.session_state:
 if "ship_step_idx" not in st.session_state:
     st.session_state.ship_step_idx = 0
 
-# 預估總時間
+# Estimate total travel time
 def estimate_total_time(path):
     total_dist = 0
     for i in range(len(path)-1):
@@ -152,7 +152,7 @@ def calc_remaining(path, step_idx):
         y0,x0 = path[i]
         y1,x1 = path[i+1]
         dist_remaining += np.hypot(lats[y1]-lats[y0], lons[x1]-lons[x0])*111
-    # 建議航向
+    # Suggested heading
     if step_idx < len(path)-1:
         y0,x0 = path[step_idx]
         y1,x1 = path[step_idx+1]
@@ -162,7 +162,7 @@ def calc_remaining(path, step_idx):
     return dist_remaining, angle_deg
 
 remaining_dist, heading_deg = calc_remaining(st.session_state.full_path, st.session_state.ship_step_idx)
-remaining_time = st.session_state.total_time * (remaining_dist / (remaining_dist + np.hypot(lats[start[0]]-lats[goal[0]], lons[start[1]]-lons[goal[1]])*111)) if remaining_dist>0 else 0
+remaining_time = st.session_state.total_time * (remaining_dist / st.session_state.total_time) if remaining_dist>0 else 0
 
 # ===============================
 # Satellite Visibility
@@ -193,7 +193,7 @@ ax.set_extent([118,124,21,26])
 ax.add_feature(cfeature.LAND, facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
-# 流場 (固定色條 0~1.6)
+# Flow field (fixed color scale 0~1.6)
 time_idx = st.session_state.ship_step_idx
 if time_idx >= len(ds['time']):
     time_idx = -1
@@ -213,22 +213,22 @@ for zone in OFFSHORE_WIND:
     poly=np.array(zone)
     ax.fill(poly[:,1],poly[:,0],color="yellow",alpha=0.4)
 
-# 完整路徑 (粉色)
+# Full path (pink)
 full_lons = [lons[p[1]] for p in st.session_state.full_path]
 full_lats = [lats[p[0]] for p in st.session_state.full_path]
 ax.plot(full_lons, full_lats, color="pink", linewidth=2)
 
-# 已走過航跡 (紅色)
+# Traveled path (red)
 done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
 ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
-# 船圖標 (灰色，尖角朝向建議方向)
+# Ship icon (gray, heading)
 ax.scatter(lons[current_pos[1]], lats[current_pos[0]], color="gray", s=150, marker="^")
 
-# 起點/終點
-ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")  # 起點
-ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")  # 終點
+# Start/End
+ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")  # Start
+ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")  # End
 
-plt.title("HELIOS 系統")
+plt.title("HELIOS System")
 st.pyplot(fig)
