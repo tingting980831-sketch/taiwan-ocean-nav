@@ -31,7 +31,7 @@ NO_GO_ZONES = [
 ]
 
 OFFSHORE_WIND = [
-@@ -30,61 +32,61 @@
+-30,61 +32,61
 ]
 OFFSHORE_COST = 10
 
