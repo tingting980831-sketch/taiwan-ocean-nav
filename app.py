@@ -1,83 +1,84 @@
 import streamlit as st
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import heapq
 from scipy.ndimage import distance_transform_edt
-from matplotlib.path import Path
 import xarray as xr
 
 st.set_page_config(layout="wide")
-st.title("🛰️ HELIOS System")
+st.title("🛰️ HELIOS System (LIVE HYCOM)")
 
-# =============================
+# =========================
 # PARAMETERS
-# =============================
+# =========================
 CURRENT_WEIGHT = 0.3
 MAX_ASSIST = 0.5
-COAST_PENALTY = 2.0
-MAX_DIST = 2
 
 LAT_RANGE = slice(21,26)
 LON_RANGE = slice(118,124)
 
-# =============================
-# MEMORY SAFE HYCOM LOAD
-# =============================
-@st.cache_data(ttl=3600)
-def load_hycom_small():
+HYCOM_URL = (
+"https://tds.hycom.org/thredds/dodsC/"
+"FMRC_ESPC-D-V02_uv3z/"
+"FMRC_ESPC-D-V02_uv3z_best.ncd"
+)
 
-    url="https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+# =========================
+# LOAD LATEST HYCOM
+# =========================
+@st.cache_data(ttl=1800)
+def load_latest_hycom():
 
-    ds = xr.open_dataset(url, decode_times=False)
+    ds = xr.open_dataset(
+        HYCOM_URL,
+        engine="netcdf4"
+    )
 
-    # ⭐ 直接遠端裁切（關鍵）
-    sub = ds.isel(time=-1).sel(lat=LAT_RANGE, lon=LON_RANGE)
+    # ⭐ 最新時間
+    sub = ds.isel(time=-1).sel(
+        lat=LAT_RANGE,
+        lon=LON_RANGE
+    )
 
-    u = sub["ssu"].to_numpy()
-    v = sub["ssv"].to_numpy()
+    u = sub["water_u"].values
+    v = sub["water_v"].values
 
-    lats = sub.lat.to_numpy()
-    lons = sub.lon.to_numpy()
+    lats = sub.lat.values
+    lons = sub.lon.values
 
     land_mask = np.isnan(u)
 
     return u,v,lats,lons,land_mask
 
-u_field,v_field,lats,lons,land_mask = load_hycom_small()
+with st.spinner("Connecting to latest HYCOM ocean currents..."):
+    u_field,v_field,lats,lons,land_mask = load_latest_hycom()
 
 sea_mask = ~land_mask
 dist_to_land = distance_transform_edt(sea_mask)
 
-# =============================
+# =========================
 # SIDEBAR
-# =============================
+# =========================
 with st.sidebar:
 
-    s_lon = st.number_input("Start Lon",118.0,124.0,120.3)
-    s_lat = st.number_input("Start Lat",21.0,26.0,22.6)
+    s_lon=st.number_input("Start Lon",118.0,124.0,120.3)
+    s_lat=st.number_input("Start Lat",21.0,26.0,22.6)
 
-    e_lon = st.number_input("End Lon",118.0,124.0,122.0)
-    e_lat = st.number_input("End Lat",21.0,26.0,24.5)
+    e_lon=st.number_input("End Lon",118.0,124.0,122.0)
+    e_lat=st.number_input("End Lat",21.0,26.0,24.5)
 
-    ship_speed = st.number_input("Ship Speed km/h",1.0,60.0,20.0)
+    ship_speed=st.number_input("Ship Speed (km/h)",1.0,60.0,20.0)
 
-    recompute = st.button("Recalculate")
-    next_step = st.button("Next Step")
+    recompute=st.button("Recalculate Route")
+    next_step=st.button("Next Step")
 
-# =============================
+# =========================
 # HELPERS
-# =============================
+# =========================
 def nearest(lon,lat):
     return np.abs(lats-lat).argmin(), np.abs(lons-lon).argmin()
-
-def coast_penalty(y,x):
-    d=dist_to_land[y,x]
-    if d<MAX_DIST:
-        return COAST_PENALTY*(MAX_DIST-d)/MAX_DIST
-    return 0
 
 def travel_time(y0,x0,y1,x1):
 
@@ -99,9 +100,9 @@ def travel_time(y0,x0,y1,x1):
 
     return dist/(eff_speed*3.6)
 
-# =============================
+# =========================
 # ASTAR
-# =============================
+# =========================
 dirs=[(1,0),(-1,0),(0,1),(0,-1),
       (1,1),(1,-1),(-1,1),(-1,-1)]
 
@@ -125,7 +126,7 @@ def astar(start,goal):
 
             if 0<=ni<rows and 0<=nj<cols and not land_mask[ni,nj]:
 
-                new=cost[cur]+travel_time(*cur,ni,nj)+coast_penalty(ni,nj)
+                new=cost[cur]+travel_time(*cur,ni,nj)
 
                 if (ni,nj) not in cost or new<cost[(ni,nj)]:
                     cost[(ni,nj)]=new
@@ -141,9 +142,9 @@ def astar(start,goal):
     path.append(start)
     return path[::-1]
 
-# =============================
+# =========================
 # ROUTE
-# =============================
+# =========================
 start=nearest(s_lon,s_lat)
 goal=nearest(e_lon,e_lat)
 
@@ -154,9 +155,9 @@ if recompute or "path" not in st.session_state:
 if next_step and st.session_state.idx<len(st.session_state.path)-1:
     st.session_state.idx+=1
 
-# =============================
+# =========================
 # MAP
-# =============================
+# =========================
 fig=plt.figure(figsize=(10,8))
 ax=plt.axes(projection=ccrs.PlateCarree())
 
@@ -167,9 +168,10 @@ ax.add_feature(cfeature.COASTLINE)
 speed=np.sqrt(u_field**2+v_field**2)
 
 mesh=ax.pcolormesh(lons,lats,speed,cmap="Blues",shading="auto")
-fig.colorbar(mesh,ax=ax,label="Current m/s")
+fig.colorbar(mesh,ax=ax,label="Current speed (m/s)")
 
 path=st.session_state.path
+
 plon=[lons[p[1]] for p in path]
 plat=[lats[p[0]] for p in path]
 
