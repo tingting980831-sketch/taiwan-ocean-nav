@@ -270,7 +270,7 @@ for zone in OFFSHORE_WIND:
 
 # Full path (pink)
 full_lons = [lons[p[1]] for p in st.session_state.full_path]
-@@ -224,7 +232,7 @@
+@@ -224,12 +232,12 @@
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
 ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
@@ -279,3 +279,8 @@ ax.plot(done_lons, done_lats, color="red", linewidth=2)
 ax.scatter(lons[current_pos[1]], lats[current_pos[0]], color="gray", s=150, marker="^")
 
 # Start/End
+ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")  # Start
+ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")  # End
+
+plt.title("HELIOS System")
+st.pyplot(fig)
