@@ -51,9 +51,9 @@ def load_hycom_data():
 
     return ds, lons, lats, land_mask, latest_time
 
-ds, lons_full, lats_full, land_mask_full, obs_time = load_hycom_data()
-sea_mask_full = ~land_mask_full
-dist_to_land_full = distance_transform_edt(sea_mask_full)
+ds, lons, lats, land_mask, obs_time = load_hycom_data()
+sea_mask = ~land_mask
+dist_to_land = distance_transform_edt(sea_mask)
 
 # ------------------------------
 # Sidebar Settings
@@ -65,16 +65,7 @@ with st.sidebar:
     e_lon = st.number_input("End Longitude", 118.0, 124.0, 122.0)
     e_lat = st.number_input("End Latitude", 21.0, 26.0, 24.5)
     ship_speed = st.number_input("Ship Speed (km/h)", 1.0, 60.0, 20.0)
-    grid_step = st.slider("Path Calculation Grid Step (larger=faster)", 1, 3, 1)
-    st.button("Next Step", key="next_step_button")
-
-# ------------------------------
-# Downsample for faster pathfinding
-# ------------------------------
-lons = lons_full[::grid_step]
-lats = lats_full[::grid_step]
-land_mask = land_mask_full[::grid_step, ::grid_step]
-dist_to_land = distance_transform_edt(~land_mask)
+    recalc = st.button("🚀 計算最佳航軌")
 
 # ------------------------------
 # Helper Functions
@@ -128,20 +119,14 @@ def astar_with_wind_and_coast(start, goal):
         path.append(start)
     return path[::-1]
 
-# ------------------------------
-# Initialize Session State
-# ------------------------------
-start = nearest_ocean_cell(s_lon, s_lat)
-goal = nearest_ocean_cell(e_lon, e_lat)
+def estimate_total_time(path, speed):
+    total_dist = 0
+    for i in range(len(path)-1):
+        y0,x0 = path[i]
+        y1,x1 = path[i+1]
+        total_dist += np.hypot(lats[y1]-lats[y0], lons[x1]-lons[x0])*111
+    return total_dist / speed
 
-if "full_path" not in st.session_state:
-    st.session_state.full_path = astar_with_wind_and_coast(start, goal)
-if "ship_step_idx" not in st.session_state:
-    st.session_state.ship_step_idx = 0
-
-# ------------------------------
-# Estimate remaining distance & time
-# ------------------------------
 def calc_remaining(path, step_idx, speed):
     dist_remaining = 0
     for i in range(step_idx, len(path)-1):
@@ -157,17 +142,37 @@ def calc_remaining(path, step_idx, speed):
     remaining_time = dist_remaining / speed
     return dist_remaining, remaining_time, angle_deg
 
-remaining_dist, remaining_time, heading_deg = calc_remaining(
-    st.session_state.full_path, st.session_state.ship_step_idx, ship_speed
-)
-
-# ------------------------------
-# Dashboard & Map (保留原設定)
-# ------------------------------
 def visible_sats(ship_lat, ship_lon):
     return np.random.randint(3,13)
 
+# ------------------------------
+# Initialize / Recalculate Path
+# ------------------------------
+start = nearest_ocean_cell(s_lon, s_lat)
+goal = nearest_ocean_cell(e_lon, e_lat)
+
+if "full_path" not in st.session_state or recalc:
+    with st.spinner("正在計算最佳航軌..."):
+        st.session_state.full_path = astar_with_wind_and_coast(start, goal)
+        st.session_state.ship_step_idx = 0
+        st.session_state.total_time = estimate_total_time(st.session_state.full_path, ship_speed)
+if "ship_step_idx" not in st.session_state:
+    st.session_state.ship_step_idx = 0
+
+# ------------------------------
+# Move Ship One Step
+# ------------------------------
+if st.session_state.get("next_step_button", False):
+    if st.session_state.ship_step_idx < len(st.session_state.full_path)-1:
+        st.session_state.ship_step_idx += 1
+
+# ------------------------------
+# Dashboard
+# ------------------------------
 current_pos = st.session_state.full_path[st.session_state.ship_step_idx]
+remaining_dist, remaining_time, heading_deg = calc_remaining(
+    st.session_state.full_path, st.session_state.ship_step_idx, ship_speed
+)
 sat_count = visible_sats(lats[current_pos[0]], lons[current_pos[1]])
 
 st.subheader("Navigation Dashboard")
@@ -187,41 +192,46 @@ ax.set_extent([118,124,21,26])
 ax.add_feature(cfeature.LAND, facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
+# Flow field
 time_idx = st.session_state.ship_step_idx
 if time_idx >= len(ds['time']):
     time_idx = -1
 u_data = ds['ssu'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=time_idx).values
 v_data = ds['ssv'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=time_idx).values
 speed = np.sqrt(u_data**2 + v_data**2)
-mesh = ax.pcolormesh(lons_full, lats_full, speed, cmap="Blues", shading="auto", vmin=0, vmax=1.6)
+mesh = ax.pcolormesh(lons, lats, speed, cmap="Blues", shading="auto", vmin=0, vmax=1.6)
 fig.colorbar(mesh, ax=ax, label="Current Speed (m/s)")
 
-# 禁航區
+# No-go zones
 for zone in NO_GO_ZONES:
     poly = np.array(zone)
     ax.fill(poly[:,1], poly[:,0], color="red", alpha=0.4)
 
-# 離岸風區
+# Offshore wind zones
 for zone in OFFSHORE_WIND:
     poly = np.array(zone)
     ax.fill(poly[:,1], poly[:,0], color="yellow", alpha=0.4)
 
-# Full path (pink)
+# Full path
 full_lons = [lons[p[1]] for p in st.session_state.full_path]
 full_lats = [lats[p[0]] for p in st.session_state.full_path]
-ax.plot(full_lons, full_lats, color="pink", linewidth=2)
 
-# Traveled path (red)
 done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
-ax.plot(done_lons, done_lats, color="red", linewidth=2)
+remain_lons = full_lons[st.session_state.ship_step_idx:]
+remain_lats = full_lats[st.session_state.ship_step_idx:]
+
+if remain_lons and remain_lats:
+    ax.plot(remain_lons, remain_lats, color="pink", linewidth=2)
+if done_lons and done_lats:
+    ax.plot(done_lons, done_lats, color="red", linewidth=2)
 
 # Ship icon
 ax.scatter(lons[current_pos[1]], lats[current_pos[0]], color="gray", s=150, marker="^")
 
 # Start/End
-ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")
-ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")
+ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black")  # Start
+ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black")  # End
 
 plt.title("HELIOS System")
 st.pyplot(fig)
