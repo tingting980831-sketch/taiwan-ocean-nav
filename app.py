@@ -1,204 +1,95 @@
-import streamlit as st
-import xarray as xr
-import numpy as np
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-from scipy.ndimage import distance_transform_edt
-import heapq
+# ===============================
+# Map (完全替換此區塊)
+# ===============================
+st.subheader("Interactive Navigation Map")
 
-st.set_page_config(layout="wide")
-st.title("🛰️ HELIOS Dynamic Ocean Navigation (Stable)")
+# 1. 準備地圖畫布
+fig = plt.figure(figsize=(12, 10)) # 稍微放大一點，看得更清楚
+ax = plt.axes(projection=ccrs.PlateCarree())
 
-# =====================================================
-# HYCOM LOADER  (RESOURCE CACHE — 不可 hash)
-# =====================================================
+# 設定顯示範圍 (與 sidebar 的數值範圍一致)
+ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
 
-@st.cache_resource(show_spinner="Loading HYCOM...")
-def load_hycom():
+# 2. 加入地理特徵
+# 使用 Cartopy 自帶的高解析度特徵
+ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor="#d0d0d0", edgecolor='black', linewidth=0.5, zorder=2)
+ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=1, zorder=3)
+ax.add_feature(cfeature.OCEAN, facecolor="#f0f8ff", zorder=0) # 加入海洋底色
 
-    url = (
-        "https://tds.hycom.org/thredds/dodsC/"
-        "GLBy0.08/latest"
-    )
+# 加入經緯度網格線
+gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+gl.top_labels = False
+gl.right_labels = False
 
-    ds = xr.open_dataset(
-        url,
-        engine="pydap",
-        decode_times=False
-    )
+# 3. 處理海流數據 (⭐核心修正)
+time_idx = -1 # 取最新的時間點
 
-    lons = ds["lon"].values
-    lats = ds["lat"].values
+# 取得 U/V 分量
+u_da = ds['ssu'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
+v_da = ds['ssv'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
 
-    # land mask (NaN = land)
-    sample = ds["water_u"][0,0,:,:].values
-    land_mask = np.isnan(sample)
+# 計算流速
+speed_da = np.sqrt(u_da**2 + v_da**2)
 
-    obs_time = float(ds["time"].values[-1])
+# ⭐ 關鍵修正 1：明確將維度轉置為 (lat, lon)，以匹配 pcolormesh 的預期
+speed_for_plot = speed_da.transpose('lat', 'lon')
 
-    return ds, lons, lats, land_mask, obs_time
+# ⭐ 關鍵修正 2：確保繪圖使用 PlateCarree 轉換
+# 使用其 values 繪製，shading="nearest" 或 "auto" 均可，nearest 通常更穩定
+mesh = ax.pcolormesh(speed_for_plot.lon, speed_for_plot.lat, speed_for_plot.values,
+                    cmap="Blues", shading="nearest", vmin=0, vmax=1.6,
+                    transform=ccrs.PlateCarree(), zorder=1, alpha=0.9)
 
+# 4. 加入 Colorbar (⭐修正調用方式)
+# 使用 plt.colorbar 並明確指定 ax
+cbar = plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.03, shrink=0.7)
+cbar.set_label("Current Speed (m/s)", fontsize=12)
 
-ds, lons, lats, land_mask, obs_time = load_hycom()
+# 5. 加入 No-Go Zones 與 風場 (加入 zorder 確保在海流之上)
+for zone in NO_GO_ZONES:
+    poly = np.array(zone)
+    # Cartopy 的 fill 需要確保 transform 正確
+    ax.fill(poly[:, 1], poly[:, 0], color="red", alpha=0.5, transform=ccrs.PlateCarree(), zorder=4, label='No-Go Zone')
 
-# =====================================================
-# CURRENT EXTRACTION (DATA CACHE — 可 hash)
-# =====================================================
+for zone in OFFSHORE_WIND:
+    poly = np.array(zone)
+    ax.fill(poly[:, 1], poly[:, 0], color="yellow", alpha=0.5, transform=ccrs.PlateCarree(), zorder=4, label='Offshore Wind')
 
-@st.cache_data(show_spinner="Extracting currents...")
-def get_valid_currents():
+# 6. 繪製航段與船隻 (⭐加入 transform)
+if len(path) > 0:
+    full_lons = [lons[p[1]] for p in path]
+    full_lats = [lats[p[0]] for p in path]
+    
+    # 完整規劃路徑 (粉色)
+    ax.plot(full_lons, full_lats, color="#FF69B4", linewidth=3, 
+            transform=ccrs.PlateCarree(), zorder=5, label='Planned Route')
 
-    u = ds["water_u"][-1,0,:,:].values
-    v = ds["water_v"][-1,0,:,:].values
+    # 已走路徑 (紅色)
+    done_lons = full_lons[:st.session_state.ship_step_idx + 1]
+    done_lats = full_lats[:st.session_state.ship_step_idx + 1]
+    ax.plot(done_lons, done_lats, color="red", linewidth=3, 
+            transform=ccrs.PlateCarree(), zorder=6, label='Traveled Route')
 
-    u = np.nan_to_num(u)
-    v = np.nan_to_num(v)
+    # 當前船隻位置 (灰色三角形)
+    ax.scatter(lons[current_pos[1]], lats[current_pos[0]],
+               color="#505050", marker="^", s=250, edgecolor='white',
+               transform=ccrs.PlateCarree(), zorder=10)
 
-    speed = np.sqrt(u**2 + v**2)
+# 7. 繪製起點與終點 (⭐加入 transform)
+# 起點 (紫色圓點)
+ax.scatter(s_lon, s_lat, color="#B15BFF", s=150, edgecolor="black", linewidth=1.5,
+           transform=ccrs.PlateCarree(), zorder=12, label='Start')
 
-    return u, v, speed
+# 終點 (黃色星星)
+ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=350, edgecolor="black", linewidth=1.5,
+           transform=ccrs.PlateCarree(), zorder=12, label='End')
 
+# 8. 介面優化
+# 移除非必要的 plt.title，Streamlit 已經有大標題
+# plt.title("HELIOS Dynamic Navigation", fontsize=16)
 
-u, v, speed = get_valid_currents()
+# 防止 labels 重疊
+plt.tight_layout()
 
-# =====================================================
-# A* PATHFINDING
-# =====================================================
-
-def heuristic(a, b):
-    return np.hypot(a[0]-b[0], a[1]-b[1])
-
-
-def astar(cost, start, goal):
-
-    neighbors = [
-        (1,0),(-1,0),(0,1),(0,-1),
-        (1,1),(1,-1),(-1,1),(-1,-1)
-    ]
-
-    close_set=set()
-    came_from={}
-    gscore={start:0}
-    fscore={start:heuristic(start,goal)}
-
-    oheap=[]
-    heapq.heappush(oheap,(fscore[start],start))
-
-    while oheap:
-
-        current=heapq.heappop(oheap)[1]
-
-        if current==goal:
-            data=[]
-            while current in came_from:
-                data.append(current)
-                current=came_from[current]
-            return data[::-1]
-
-        close_set.add(current)
-
-        for i,j in neighbors:
-            neighbor=(current[0]+i,current[1]+j)
-
-            if not (
-                0<=neighbor[0]<cost.shape[0]
-                and 0<=neighbor[1]<cost.shape[1]
-            ):
-                continue
-
-            if land_mask[neighbor]:
-                continue
-
-            tentative=gscore[current]+cost[neighbor]
-
-            if neighbor in close_set and tentative>=gscore.get(neighbor,0):
-                continue
-
-            if tentative<gscore.get(neighbor,np.inf):
-                came_from[neighbor]=current
-                gscore[neighbor]=tentative
-                fscore[neighbor]=tentative+heuristic(neighbor,goal)
-                heapq.heappush(oheap,(fscore[neighbor],neighbor))
-
-    return []
-
-
-# =====================================================
-# UI INPUT
-# =====================================================
-
-col1,col2=st.columns(2)
-
-with col1:
-    start_lat=st.number_input("Start Lat",value=22.0)
-    start_lon=st.number_input("Start Lon",value=120.0)
-
-with col2:
-    end_lat=st.number_input("End Lat",value=25.0)
-    end_lon=st.number_input("End Lon",value=122.0)
-
-# =====================================================
-# GRID INDEX
-# =====================================================
-
-def nearest_idx(lat,lon):
-    iy=np.abs(lats-lat).argmin()
-    ix=np.abs(lons-lon).argmin()
-    return iy,ix
-
-start=nearest_idx(start_lat,start_lon)
-goal=nearest_idx(end_lat,end_lon)
-
-# =====================================================
-# COST FIELD
-# =====================================================
-
-dist_land=distance_transform_edt(~land_mask)
-
-cost=1/(speed+0.05)+1/(dist_land+1)
-
-# =====================================================
-# PATH COMPUTE
-# =====================================================
-
-with st.spinner("Computing optimal path..."):
-    path=astar(cost,start,goal)
-
-# =====================================================
-# PLOT
-# =====================================================
-
-fig=plt.figure(figsize=(10,8))
-ax=plt.axes(projection=ccrs.PlateCarree())
-
-ax.set_extent([
-    start_lon-5,end_lon+5,
-    start_lat-5,end_lat+5
-])
-
-ax.coastlines()
-ax.add_feature(cfeature.LAND)
-
-skip=15
-
-ax.quiver(
-    lons[::skip],
-    lats[::skip],
-    u[::skip,::skip],
-    v[::skip,::skip],
-    transform=ccrs.PlateCarree()
-)
-
-if path:
-    py=[lats[p[0]] for p in path]
-    px=[lons[p[1]] for p in path]
-
-    ax.plot(px,py,"r-",linewidth=3)
-
-ax.plot(start_lon,start_lat,"go",markersize=10)
-ax.plot(end_lon,end_lat,"ro",markersize=10)
-
+# 9. 將 Figure 傳給 Streamlit
 st.pyplot(fig)
-
-st.success("Route computed successfully.")
