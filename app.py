@@ -146,13 +146,22 @@ def astar(start, goal):
 # ===============================
 # ROUTE LOGIC
 # ===============================
+# 檢查 Session State
+if "full_path" not in st.session_state:
+    st.session_state.full_path = []
+if "ship_step_idx" not in st.session_state:
+    st.session_state.ship_step_idx = 0
+if "route_key" not in st.session_state:
+    st.session_state.route_key = None
+
 start = nearest_cell(s_lon, s_lat)
 goal = nearest_cell(e_lon, e_lat)
 
 route_key = (round(s_lon, 4), round(s_lat, 4),
              round(e_lon, 4), round(e_lat, 4))
 
-if "route_key" not in st.session_state or st.session_state.route_key != route_key:
+# 重新計算路徑如果設定改變
+if st.session_state.route_key != route_key:
     with st.spinner("Computing optimal route..."):
         new_path = astar(start, goal)
 
@@ -170,14 +179,19 @@ if "route_key" not in st.session_state or st.session_state.route_key != route_ke
 path = st.session_state.full_path
 
 # 防止索引越界
-st.session_state.ship_step_idx = min(
-    st.session_state.ship_step_idx,
-    len(path) - 1
-)
+if path:
+    st.session_state.ship_step_idx = min(
+        st.session_state.ship_step_idx,
+        len(path) - 1
+    )
 
 if st.session_state.get("next_step"):
-    if st.session_state.ship_step_idx < len(path) - 1:
+    if path and st.session_state.ship_step_idx < len(path) - 1:
         st.session_state.ship_step_idx += 1
+
+# 如果沒有路徑則停止
+if not path:
+    st.stop()
 
 current_pos = path[st.session_state.ship_step_idx]
 
@@ -229,11 +243,13 @@ ax.add_feature(cfeature.COASTLINE)
 
 # 獲取海流數據
 try:
+    # 確保座標軸對應正確
     time_idx = -1
     u = ds['ssu'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
     v = ds['ssv'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
     speed = np.sqrt(u**2 + v**2)
-    mesh = ax.pcolormesh(lons, lats, speed, cmap="Blues", shading="auto", vmin=0, vmax=1.6)
+    # 使用正確的轉置或指定座標軸，解決直條紋問題
+    mesh = ax.pcolormesh(speed.lon, speed.lat, speed, cmap="Blues", shading="auto", vmin=0, vmax=1.6, transform=ccrs.PlateCarree())
     fig.colorbar(mesh, ax=ax, label="Current Speed (m/s)")
 except:
     st.warning("Could not overlay current data.")
@@ -241,26 +257,33 @@ except:
 # 繪製禁航區與風場
 for zone in NO_GO_ZONES:
     poly = np.array(zone)
-    ax.fill(poly[:, 1], poly[:, 0], color="red", alpha=0.4)
+    ax.fill(poly[:, 1], poly[:, 0], color="red", alpha=0.4, transform=ccrs.PlateCarree())
 
 for zone in OFFSHORE_WIND:
     poly = np.array(zone)
-    ax.fill(poly[:, 1], poly[:, 0], color="yellow", alpha=0.4)
+    ax.fill(poly[:, 1], poly[:, 0], color="yellow", alpha=0.4, transform=ccrs.PlateCarree())
 
 # 繪製路徑
 full_lons = [lons[p[1]] for p in path]
 full_lats = [lats[p[0]] for p in path]
-ax.plot(full_lons, full_lats, color="pink", linewidth=2, label="Planned Route")
+ax.plot(full_lons, full_lats, color="pink", linewidth=2, label="Planned Route", transform=ccrs.PlateCarree())
 
 # 繪製已行駛路徑
 done_lons = full_lons[:st.session_state.ship_step_idx + 1]
 done_lats = full_lats[:st.session_state.ship_step_idx + 1]
-ax.plot(done_lons, done_lats, color="red", linewidth=2)
+ax.plot(done_lons, done_lats, color="red", linewidth=2, transform=ccrs.PlateCarree())
 
-# 標記船隻當前位置、起點與終點
-ax.scatter(lons[current_pos[1]], lats[current_pos[0]], color="black", marker="^", s=150, zorder=5)
-ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black", label="Start")
-ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black", label="Goal")
+# ==============================================================================
+# ⭐ 核心修正：標記船隻當前位置、起點與終點
+# 將船隻顏色從 'black' 改為 'gray'，並加入 transform 確保座標正確
+# ==============================================================================
+ax.scatter(lons[current_pos[1]], lats[current_pos[0]], 
+           color="gray", marker="^", s=150, zorder=5, transform=ccrs.PlateCarree())
+
+ax.scatter(s_lon, s_lat, color="#B15BFF", s=80, edgecolors="black", label="Start", transform=ccrs.PlateCarree())
+ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=200, edgecolors="black", label="Goal", transform=ccrs.PlateCarree())
 
 plt.title("HELIOS Navigation Map")
+# 由於 Cartopy 的特性，legend 有時需要特殊處理，這裡暫時註解掉以防報錯
+# ax.legend() 
 st.pyplot(fig)
