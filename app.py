@@ -1,95 +1,170 @@
+import streamlit as st
+import xarray as xr
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import heapq
+from scipy.ndimage import distance_transform_edt
+from matplotlib.path import Path
+
 # ===============================
-# Map (完全替換此區塊)
+# 1. 頁面配置與基本參數
 # ===============================
-st.subheader("Interactive Navigation Map")
+st.set_page_config(layout="wide", page_title="HELIOS Intelligent Navigation")
+st.title("🛰️ HELIOS Intelligent Navigation System")
 
-# 1. 準備地圖畫布
-fig = plt.figure(figsize=(12, 10)) # 稍微放大一點，看得更清楚
-ax = plt.axes(projection=ccrs.PlateCarree())
+# 禁止航行區 (No-Go Zones)
+NO_GO_ZONES = [
+    [[22.95, 120.17], [22.93, 120.17], [22.93, 120.15], [22.95, 120.15]],
+]
 
-# 設定顯示範圍 (與 sidebar 的數值範圍一致)
-ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
+# 離岸風場 (Offshore Wind Farms) - 設有額外權重
+OFFSHORE_WIND = [
+    [[24.18, 120.12], [24.22, 120.28], [24.05, 120.35], [24.00, 120.15]],
+    [[24.00, 120.10], [24.05, 120.32], [23.90, 120.38], [23.85, 120.15]],
+]
 
-# 2. 加入地理特徵
-# 使用 Cartopy 自帶的高解析度特徵
-ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor="#d0d0d0", edgecolor='black', linewidth=0.5, zorder=2)
-ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=1, zorder=3)
-ax.add_feature(cfeature.OCEAN, facecolor="#f0f8ff", zorder=0) # 加入海洋底色
-
-# 加入經緯度網格線
-gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
-gl.top_labels = False
-gl.right_labels = False
-
-# 3. 處理海流數據 (⭐核心修正)
-time_idx = -1 # 取最新的時間點
-
-# 取得 U/V 分量
-u_da = ds['ssu'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
-v_da = ds['ssv'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
-
-# 計算流速
-speed_da = np.sqrt(u_da**2 + v_da**2)
-
-# ⭐ 關鍵修正 1：明確將維度轉置為 (lat, lon)，以匹配 pcolormesh 的預期
-speed_for_plot = speed_da.transpose('lat', 'lon')
-
-# ⭐ 關鍵修正 2：確保繪圖使用 PlateCarree 轉換
-# 使用其 values 繪製，shading="nearest" 或 "auto" 均可，nearest 通常更穩定
-mesh = ax.pcolormesh(speed_for_plot.lon, speed_for_plot.lat, speed_for_plot.values,
-                    cmap="Blues", shading="nearest", vmin=0, vmax=1.6,
-                    transform=ccrs.PlateCarree(), zorder=1, alpha=0.9)
-
-# 4. 加入 Colorbar (⭐修正調用方式)
-# 使用 plt.colorbar 並明確指定 ax
-cbar = plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.03, shrink=0.7)
-cbar.set_label("Current Speed (m/s)", fontsize=12)
-
-# 5. 加入 No-Go Zones 與 風場 (加入 zorder 確保在海流之上)
-for zone in NO_GO_ZONES:
-    poly = np.array(zone)
-    # Cartopy 的 fill 需要確保 transform 正確
-    ax.fill(poly[:, 1], poly[:, 0], color="red", alpha=0.5, transform=ccrs.PlateCarree(), zorder=4, label='No-Go Zone')
-
-for zone in OFFSHORE_WIND:
-    poly = np.array(zone)
-    ax.fill(poly[:, 1], poly[:, 0], color="yellow", alpha=0.5, transform=ccrs.PlateCarree(), zorder=4, label='Offshore Wind')
-
-# 6. 繪製航段與船隻 (⭐加入 transform)
-if len(path) > 0:
-    full_lons = [lons[p[1]] for p in path]
-    full_lats = [lats[p[0]] for p in path]
+# ===============================
+# 2. 數據讀取 (HYCOM)
+# ===============================
+@st.cache_data(ttl=3600)
+def load_hycom_data():
+    # 使用 2026 年最新數據源
+    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+    ds = xr.open_dataset(url, decode_times=False)
     
-    # 完整規劃路徑 (粉色)
-    ax.plot(full_lons, full_lats, color="#FF69B4", linewidth=3, 
-            transform=ccrs.PlateCarree(), zorder=5, label='Planned Route')
+    # 擷取台灣周邊範圍
+    sub = ds.sel(lat=slice(21, 26), lon=slice(118, 124))
+    lons = sub.lon.values
+    lats = sub.lat.values
+    
+    # 建立陸地遮罩 (NaN 代表陸地)
+    u_vals = sub['ssu'].isel(time=-1).values
+    land_mask = np.isnan(u_vals)
+    
+    # 計算離岸距離 (避開海岸線用)
+    sea_mask = ~land_mask
+    dist_to_land = distance_transform_edt(sea_mask)
+    
+    return sub, lons, lats, land_mask, dist_to_land
 
-    # 已走路徑 (紅色)
-    done_lons = full_lons[:st.session_state.ship_step_idx + 1]
-    done_lats = full_lats[:st.session_state.ship_step_idx + 1]
-    ax.plot(done_lons, done_lats, color="red", linewidth=3, 
-            transform=ccrs.PlateCarree(), zorder=6, label='Traveled Route')
+ds_sub, lons, lats, land_mask, dist_to_land = load_hycom_data()
 
-    # 當前船隻位置 (灰色三角形)
-    ax.scatter(lons[current_pos[1]], lats[current_pos[0]],
-               color="#505050", marker="^", s=250, edgecolor='white',
-               transform=ccrs.PlateCarree(), zorder=10)
+# ===============================
+# 3. 側邊欄輸入與路徑計算邏輯
+# ===============================
+with st.sidebar:
+    st.header("📍 Route Settings")
+    s_lon = st.number_input("Start Longitude", 118.0, 124.0, 120.3)
+    s_lat = st.number_input("Start Latitude", 21.0, 26.0, 22.6)
+    e_lon = st.number_input("End Longitude", 118.0, 124.0, 122.0)
+    e_lat = st.number_input("End Latitude", 21.0, 26.0, 24.5)
+    ship_speed = st.number_input("Ship Speed (km/h)", 1.0, 60.0, 20.0)
+    
+    if st.button("Next Step"):
+        if "ship_step_idx" in st.session_state:
+            st.session_state.ship_step_idx += 1
 
-# 7. 繪製起點與終點 (⭐加入 transform)
-# 起點 (紫色圓點)
-ax.scatter(s_lon, s_lat, color="#B15BFF", s=150, edgecolor="black", linewidth=1.5,
-           transform=ccrs.PlateCarree(), zorder=12, label='Start')
+# A* 輔助函數
+def get_nearest_idx(lon, lat):
+    return (np.abs(lats - lat).argmin(), np.abs(lons - lon).argmin())
 
-# 終點 (黃色星星)
-ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=350, edgecolor="black", linewidth=1.5,
-           transform=ccrs.PlateCarree(), zorder=12, label='End')
+def astar_algorithm(start_node, goal_node):
+    rows, cols = land_mask.shape
+    pq = [(0, start_node)]
+    came_from = {}
+    cost_so_far = {start_node: 0}
+    
+    dirs = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
+    
+    while pq:
+        _, current = heapq.heappop(pq)
+        if current == goal_node: break
+        
+        for d in dirs:
+            neighbor = (current[0] + d[0], current[1] + d[1])
+            if 0 <= neighbor[0] < rows and 0 <= neighbor[1] < cols:
+                if land_mask[neighbor[0], neighbor[1]]: continue # 撞到陸地
+                
+                # 基本距離 + 岸邊懲罰 (避免靠岸太近)
+                step_cost = np.hypot(d[0], d[1])
+                if dist_to_land[neighbor[0], neighbor[1]] < 3:
+                    step_cost += 10 
+                
+                new_cost = cost_so_far[current] + step_cost
+                if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                    cost_so_far[neighbor] = new_cost
+                    priority = new_cost + np.hypot(neighbor[0]-goal_node[0], neighbor[1]-goal_node[1])
+                    heapq.heappush(pq, (priority, neighbor))
+                    came_from[neighbor] = current
+    
+    path = []
+    curr = goal_node
+    while curr in came_from:
+        path.append(curr)
+        curr = came_from[curr]
+    return path[::-1]
 
-# 8. 介面優化
-# 移除非必要的 plt.title，Streamlit 已經有大標題
-# plt.title("HELIOS Dynamic Navigation", fontsize=16)
+# 初始化路徑
+start_idx = get_nearest_idx(s_lon, s_lat)
+goal_idx = get_nearest_idx(e_lon, e_lat)
+route_id = (s_lon, s_lat, e_lon, e_lat)
 
-# 防止 labels 重疊
-plt.tight_layout()
+if "route_id" not in st.session_state or st.session_state.route_id != route_id:
+    st.session_state.full_path = astar_algorithm(start_idx, goal_idx)
+    st.session_state.ship_step_idx = 0
+    st.session_state.route_id = route_id
 
-# 9. 將 Figure 傳給 Streamlit
-st.pyplot(fig)
+# ===============================
+# 4. 儀表板資訊
+# ===============================
+path = st.session_state.full_path
+step = min(st.session_state.ship_step_idx, len(path)-1)
+curr_node = path[step]
+
+col1, col2 = st.columns([2, 1])
+with col2:
+    st.subheader("📊 Navigation Status")
+    st.metric("Current Latitude", f"{lats[curr_node[0]]:.3f}°N")
+    st.metric("Current Longitude", f"{lons[curr_node[1]]:.3f}°E")
+    st.info(f"Total Waypoints: {len(path)}")
+
+# ===============================
+# 5. 地圖繪製 (核心穩定版)
+# ===============================
+with col1:
+    fig = plt.figure(figsize=(10, 8))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent([118.5, 123.5, 21.5, 25.5], crs=ccrs.PlateCarree())
+
+    # A. 繪製海流 (使用 xarray 內建 plot 最穩定)
+    u = ds_sub['ssu'].isel(time=-1)
+    v = ds_sub['ssv'].isel(time=-1)
+    speed = np.sqrt(u**2 + v**2)
+    
+    # 確保座標轉置正確並繪製
+    speed.plot.pcolormesh(
+        ax=ax, x='lon', y='lat', transform=ccrs.PlateCarree(),
+        cmap="YlGnBu_r", vmin=0, vmax=1.5, zorder=1,
+        cbar_kwargs={'label': 'Current Speed (m/s)', 'shrink': 0.8}
+    )
+
+    # B. 加入地理特徵
+    ax.add_feature(cfeature.LAND, facecolor="#e0e0e0", zorder=2)
+    ax.add_feature(cfeature.COASTLINE, linewidth=1, zorder=3)
+    ax.gridlines(draw_labels=True, dms=True, x_inline=False, y_inline=False, alpha=0.3)
+
+    # C. 繪製航線
+    p_lons = [lons[p[1]] for p in path]
+    p_lats = [lats[p[0]] for p in path]
+    ax.plot(p_lons, p_lats, color="#FF69B4", linewidth=2, alpha=0.7, transform=ccrs.PlateCarree(), zorder=4, label="Planned")
+    ax.plot(p_lons[:step+1], p_lats[:step+1], color="red", linewidth=3, transform=ccrs.PlateCarree(), zorder=5, label="Traveled")
+
+    # D. 繪製位置點
+    ax.scatter(lons[curr_node[1]], lats[curr_node[0]], color="black", marker="^", s=200, transform=ccrs.PlateCarree(), zorder=10)
+    ax.scatter(s_lon, s_lat, color="purple", s=100, transform=ccrs.PlateCarree(), zorder=6)
+    ax.scatter(e_lon, e_lat, color="gold", marker="*", s=300, transform=ccrs.PlateCarree(), zorder=6)
+
+    st.pyplot(fig)
