@@ -16,7 +16,7 @@ st.set_page_config(layout="wide", page_title="HELIOS System")
 st.title("🛰️ HELIOS System")
 
 # ===============================
-# No-Go Zones & Offshore Wind
+# Zones
 # ===============================
 NO_GO_ZONES = [
     [[22.953536,120.171678],[22.934628,120.175472],[22.933136,120.170942],[22.95781,120.16078]],
@@ -34,46 +34,80 @@ OFFSHORE_WIND = [
 OFFSHORE_COST = 10
 
 # ===============================
-# Load HYCOM
+# HYCOM Loader (Stable)
 # ===============================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800)
 def load_hycom():
-    url="https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
-    ds=xr.open_dataset(url,decode_times=False)
+
+    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+
+    ds = xr.open_dataset(
+        url,
+        engine="pydap",
+        decode_times=False
+    )
 
     if 'time_origin' in ds['time'].attrs:
-        origin=pd.to_datetime(ds['time'].attrs['time_origin'])
-        obs_time=origin+pd.to_timedelta(ds['time'].values[-1],unit='h')
+        origin = pd.to_datetime(ds['time'].attrs['time_origin'])
+        obs_time = origin + pd.to_timedelta(
+            ds['time'].values[-1], unit='h'
+        )
     else:
-        obs_time=pd.Timestamp.now()
+        obs_time = pd.Timestamp.now()
 
-    sub=ds.sel(lat=slice(21,26),lon=slice(118,124))
-    lons=sub.lon.values
-    lats=sub.lat.values
-    land_mask=np.isnan(sub['ssu'].isel(time=0).values)
+    sub = ds.sel(lat=slice(21,26), lon=slice(118,124))
 
-    return ds,lons,lats,land_mask,obs_time
+    lons = sub.lon.values
+    lats = sub.lat.values
 
-ds,lons,lats,land_mask,obs_time=load_hycom()
+    sample = sub['ssu'].isel(time=0).load()
+    land_mask = np.isnan(sample.values)
 
-sea_mask=~land_mask
-dist_to_land=distance_transform_edt(sea_mask)
+    return ds, lons, lats, land_mask, obs_time
+
+
+ds, lons, lats, land_mask, obs_time = load_hycom()
+
+sea_mask = ~land_mask
+dist_to_land = distance_transform_edt(sea_mask)
+
+# ===============================
+# Find valid HYCOM timestep
+# ===============================
+@st.cache_data(ttl=600)
+def get_valid_currents(ds):
+
+    sub_u = ds['ssu'].sel(lat=slice(21,26),lon=slice(118,124))
+    sub_v = ds['ssv'].sel(lat=slice(21,26),lon=slice(118,124))
+
+    for i in range(-1, -15, -1):
+
+        u = sub_u.isel(time=i).load()
+        v = sub_v.isel(time=i).load()
+
+        speed = np.sqrt(u.values**2 + v.values**2)
+
+        if not np.isnan(speed).all():
+            return u.values, v.values, speed, i
+
+    raise RuntimeError("No valid HYCOM timestep found")
 
 # ===============================
 # Sidebar
 # ===============================
 with st.sidebar:
+
     st.header("Route Settings")
 
-    s_lon=st.number_input("Start Lon",118.0,124.0,120.3)
-    s_lat=st.number_input("Start Lat",21.0,26.0,22.6)
+    s_lon = st.number_input("Start Lon",118.0,124.0,120.3)
+    s_lat = st.number_input("Start Lat",21.0,26.0,22.6)
 
-    e_lon=st.number_input("End Lon",118.0,124.0,122.0)
-    e_lat=st.number_input("End Lat",21.0,26.0,24.5)
+    e_lon = st.number_input("End Lon",118.0,124.0,122.0)
+    e_lat = st.number_input("End Lat",21.0,26.0,24.5)
 
-    ship_speed=st.number_input("Ship Speed (km/h)",1.0,60.0,20.0)
+    ship_speed = st.number_input("Ship Speed (km/h)",1.0,60.0,20.0)
 
-    st.button("Next Step",key="next_step")
+    next_step = st.button("Next Step")
 
 # ===============================
 # Helpers
@@ -91,8 +125,8 @@ def offshore_penalty(y,x):
     return 0
 
 def coast_penalty(y,x):
-    d=dist_to_land[y,x]
-    if d<2:
+    d = dist_to_land[y,x]
+    if d < 2:
         return (2-d)*2
     return 0
 
@@ -104,7 +138,7 @@ dirs=[(1,0),(-1,0),(0,1),(0,-1),
 
 def astar(start,goal):
 
-    rows,cols=land_mask.shape
+    rows,cols = land_mask.shape
     pq=[(0,start)]
     came={}
     cost={start:0}
@@ -116,7 +150,8 @@ def astar(start,goal):
             break
 
         for d in dirs:
-            ni,nj=cur[0]+d[0],cur[1]+d[1]
+
+            ni,nj = cur[0]+d[0],cur[1]+d[1]
 
             if 0<=ni<rows and 0<=nj<cols and not land_mask[ni,nj]:
 
@@ -140,10 +175,10 @@ def astar(start,goal):
     return path[::-1]
 
 # ===============================
-# ROUTE KEY (⭐核心修正)
+# Route compute
 # ===============================
-start=nearest_cell(s_lon,s_lat)
-goal=nearest_cell(e_lon,e_lat)
+start = nearest_cell(s_lon,s_lat)
+goal = nearest_cell(e_lon,e_lat)
 
 route_key=(round(s_lon,4),round(s_lat,4),
            round(e_lon,4),round(e_lat,4))
@@ -154,33 +189,26 @@ if "route_key" not in st.session_state or st.session_state.route_key!=route_key:
         new_path=astar(start,goal)
 
     if len(new_path)==0:
-        st.error("❌ No valid route found")
+        st.error("❌ No valid route")
         st.stop()
 
     st.session_state.full_path=new_path
     st.session_state.ship_step_idx=0
     st.session_state.route_key=route_key
 
-# ===============================
-# Safe index
-# ===============================
 path=st.session_state.full_path
 
-st.session_state.ship_step_idx=min(
-    st.session_state.ship_step_idx,
-    len(path)-1
-)
+if next_step and st.session_state.ship_step_idx<len(path)-1:
+    st.session_state.ship_step_idx+=1
 
-if st.session_state.get("next_step"):
-    if st.session_state.ship_step_idx<len(path)-1:
-        st.session_state.ship_step_idx+=1
-
-current_pos=path[st.session_state.ship_step_idx]
+idx=st.session_state.ship_step_idx
+current_pos=path[idx]
 
 # ===============================
 # Remaining distance
 # ===============================
 def calc_remaining(path,idx):
+
     dist=0
     for i in range(idx,len(path)-1):
         y0,x0=path[i]
@@ -190,15 +218,16 @@ def calc_remaining(path,idx):
     if idx<len(path)-1:
         y0,x0=path[idx]
         y1,x1=path[idx+1]
-        heading=np.degrees(np.arctan2(lats[y1]-lats[y0],lons[x1]-lons[x0]))
+        heading=np.degrees(np.arctan2(
+            lats[y1]-lats[y0],
+            lons[x1]-lons[x0]
+        ))
     else:
         heading=0
 
     return dist,dist/ship_speed,heading
 
-remaining_dist,remaining_time,heading=calc_remaining(
-    path,st.session_state.ship_step_idx
-)
+remaining_dist,remaining_time,heading = calc_remaining(path,idx)
 
 # ===============================
 # Dashboard
@@ -213,97 +242,59 @@ c3.metric("Heading",f"{heading:.1f}°")
 st.caption(f"HYCOM observation time: {obs_time}")
 
 # ===============================
-# Map (完全替換此區塊)
+# Map
 # ===============================
-st.subheader("Interactive Navigation Map")
+fig=plt.figure(figsize=(10,8))
+ax=plt.axes(projection=ccrs.PlateCarree())
 
-# 1. 準備地圖畫布
-fig = plt.figure(figsize=(12, 10)) # 稍微放大一點，看得更清楚
-ax = plt.axes(projection=ccrs.PlateCarree())
+ax.set_extent([118,124,21,26])
+ax.add_feature(cfeature.LAND,facecolor="#b0b0b0")
+ax.add_feature(cfeature.COASTLINE)
 
-# 設定顯示範圍 (與 sidebar 的數值範圍一致)
-ax.set_extent([118, 124, 21, 26], crs=ccrs.PlateCarree())
+u,v,speed,time_idx=get_valid_currents(ds)
 
-# 2. 加入地理特徵
-# 使用 Cartopy 自帶的高解析度特徵
-ax.add_feature(cfeature.LAND.with_scale('10m'), facecolor="#d0d0d0", edgecolor='black', linewidth=0.5, zorder=2)
-ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=1, zorder=3)
-ax.add_feature(cfeature.OCEAN, facecolor="#f0f8ff", zorder=0) # 加入海洋底色
+mesh=ax.pcolormesh(
+    lons,lats,speed,
+    cmap="Blues",
+    shading="auto",
+    vmin=0,vmax=1.6,
+    transform=ccrs.PlateCarree()
+)
 
-# 加入經緯度網格線
-gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
-gl.top_labels = False
-gl.right_labels = False
+fig.colorbar(mesh,ax=ax,label="Current Speed (m/s)")
 
-# 3. 處理海流數據 (⭐核心修正)
-time_idx = -1 # 取最新的時間點
-
-# 取得 U/V 分量
-u_da = ds['ssu'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
-v_da = ds['ssv'].sel(lat=slice(21, 26), lon=slice(118, 124)).isel(time=time_idx)
-
-# 計算流速
-speed_da = np.sqrt(u_da**2 + v_da**2)
-
-# ⭐ 關鍵修正 1：明確將維度轉置為 (lat, lon)，以匹配 pcolormesh 的預期
-speed_for_plot = speed_da.transpose('lat', 'lon')
-
-# ⭐ 關鍵修正 2：確保繪圖使用 PlateCarree 轉換
-# 使用其 values 繪製，shading="nearest" 或 "auto" 均可，nearest 通常更穩定
-mesh = ax.pcolormesh(speed_for_plot.lon, speed_for_plot.lat, speed_for_plot.values,
-                    cmap="Blues", shading="nearest", vmin=0, vmax=1.6,
-                    transform=ccrs.PlateCarree(), zorder=1, alpha=0.9)
-
-# 4. 加入 Colorbar (⭐修正調用方式)
-# 使用 plt.colorbar 並明確指定 ax
-cbar = plt.colorbar(mesh, ax=ax, orientation='vertical', pad=0.03, shrink=0.7)
-cbar.set_label("Current Speed (m/s)", fontsize=12)
-
-# 5. 加入 No-Go Zones 與 風場 (加入 zorder 確保在海流之上)
+# zones
 for zone in NO_GO_ZONES:
-    poly = np.array(zone)
-    # Cartopy 的 fill 需要確保 transform 正確
-    ax.fill(poly[:, 1], poly[:, 0], color="red", alpha=0.5, transform=ccrs.PlateCarree(), zorder=4, label='No-Go Zone')
+    poly=np.array(zone)
+    ax.fill(poly[:,1],poly[:,0],color="red",alpha=0.4)
 
 for zone in OFFSHORE_WIND:
-    poly = np.array(zone)
-    ax.fill(poly[:, 1], poly[:, 0], color="yellow", alpha=0.5, transform=ccrs.PlateCarree(), zorder=4, label='Offshore Wind')
+    poly=np.array(zone)
+    ax.fill(poly[:,1],poly[:,0],color="yellow",alpha=0.4)
 
-# 6. 繪製航段與船隻 (⭐加入 transform)
-if len(path) > 0:
-    full_lons = [lons[p[1]] for p in path]
-    full_lats = [lats[p[0]] for p in path]
-    
-    # 完整規劃路徑 (粉色)
-    ax.plot(full_lons, full_lats, color="#FF69B4", linewidth=3, 
-            transform=ccrs.PlateCarree(), zorder=5, label='Planned Route')
+# path
+full_lons=[lons[p[1]] for p in path]
+full_lats=[lats[p[0]] for p in path]
 
-    # 已走路徑 (紅色)
-    done_lons = full_lons[:st.session_state.ship_step_idx + 1]
-    done_lats = full_lats[:st.session_state.ship_step_idx + 1]
-    ax.plot(done_lons, done_lats, color="red", linewidth=3, 
-            transform=ccrs.PlateCarree(), zorder=6, label='Traveled Route')
+ax.plot(full_lons,full_lats,color="pink",linewidth=2)
 
-    # 當前船隻位置 (灰色三角形)
-    ax.scatter(lons[current_pos[1]], lats[current_pos[0]],
-               color="#505050", marker="^", s=250, edgecolor='white',
-               transform=ccrs.PlateCarree(), zorder=10)
+done_lons=full_lons[:idx+1]
+done_lats=full_lats[:idx+1]
 
-# 7. 繪製起點與終點 (⭐加入 transform)
-# 起點 (紫色圓點)
-ax.scatter(s_lon, s_lat, color="#B15BFF", s=150, edgecolor="black", linewidth=1.5,
-           transform=ccrs.PlateCarree(), zorder=12, label='Start')
+ax.plot(done_lons,done_lats,color="red",linewidth=2)
 
-# 終點 (黃色星星)
-ax.scatter(e_lon, e_lat, color="yellow", marker="*", s=350, edgecolor="black", linewidth=1.5,
-           transform=ccrs.PlateCarree(), zorder=12, label='End')
+ax.scatter(
+    lons[current_pos[1]],
+    lats[current_pos[0]],
+    color="gray",
+    marker="^",
+    s=150
+)
 
-# 8. 介面優化
-# 移除非必要的 plt.title，Streamlit 已經有大標題
-# plt.title("HELIOS Dynamic Navigation", fontsize=16)
+ax.scatter(s_lon,s_lat,color="#B15BFF",s=80,edgecolors="black")
+ax.scatter(e_lon,e_lat,color="yellow",marker="*",s=200,edgecolors="black")
 
-# 防止 labels 重疊
-plt.tight_layout()
-
-# 9. 將 Figure 傳給 Streamlit
+plt.title("HELIOS System")
 st.pyplot(fig)
+
+st.caption(f"HYCOM timestep used: {time_idx}")
