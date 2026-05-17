@@ -5,9 +5,7 @@ pandas
 matplotlib
 cartopy
 scipy
-plotly
 requests
-netCDF4
-pyproj
-geojson
-pydap
+cfgrib
+eccodes
+netcdf4
