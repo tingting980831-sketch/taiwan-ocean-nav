@@ -71,7 +71,6 @@ dist_to_land = distance_transform_edt(sea_mask)
 # ===============================
 @st.cache_data(ttl=3600)
 def fetch_weather():
-    # 找最新有效 cycle
     date_str, cycle = None, None
     for days_back in range(0, 4):
         check_date = datetime.now(timezone.utc) - timedelta(days=days_back)
@@ -122,7 +121,6 @@ def fetch_weather():
         wlats = ds_w["latitude"].values
         wlons = ds_w["longitude"].values
 
-        # 找最近非 nan 格點（台灣東部海域）
         lat_idx = np.abs(wlats - 24.0).argmin()
         lon_idx = np.abs(wlons - 122.0).argmin()
         found = False
@@ -141,12 +139,11 @@ def fetch_weather():
                 break
 
         result["wave"] = {
-            "swh":   float(ds_w["swh"].isel(latitude=lat_idx, longitude=lon_idx).values),
-            "perpw": float(ds_w["perpw"].isel(latitude=lat_idx, longitude=lon_idx).values),
-            "dirpw": float(ds_w["dirpw"].isel(latitude=lat_idx, longitude=lon_idx).values),
+            "swh":      float(ds_w["swh"].isel(latitude=lat_idx, longitude=lon_idx).values),
+            "dirpw":    float(ds_w["dirpw"].isel(latitude=lat_idx, longitude=lon_idx).values),
             "swh_grid": swh_grid,
-            "lats": wlats,
-            "lons": wlons,
+            "lats":     wlats,
+            "lons":     wlons,
         }
         ds_w.close()
         os.unlink(tmp_path)
@@ -175,11 +172,11 @@ def fetch_weather():
         u = ds_f["u10"].values
         v = ds_f["v10"].values
         result["wind"] = {
-            "u":    u,
-            "v":    v,
+            "u":     u,
+            "v":     v,
             "speed": np.sqrt(u**2 + v**2),
-            "lats": ds_f["latitude"].values,
-            "lons": ds_f["longitude"].values,
+            "lats":  ds_f["latitude"].values,
+            "lons":  ds_f["longitude"].values,
         }
         ds_f.close()
         os.unlink(tmp_path)
@@ -197,7 +194,6 @@ with st.spinner("載入氣象資料中..."):
 # ===============================
 with st.sidebar:
     st.header("Route Settings")
-
     s_lon = st.number_input("Start Lon", 118.0, 124.0, 120.3)
     s_lat = st.number_input("Start Lat", 21.0, 26.0, 22.6)
     e_lon = st.number_input("End Lon", 118.0, 124.0, 122.0)
@@ -205,21 +201,28 @@ with st.sidebar:
     ship_speed = st.number_input("Ship Speed (km/h)", 1.0, 60.0, 20.0)
     st.button("Next Step", key="next_step")
 
-    # 氣象資料摘要
-    if weather:
-        st.divider()
-        st.markdown(f"**氣象資料** `{weather['date']} {weather['cycle']}z`")
-        if weather.get("wave"):
-            w = weather["wave"]
-            st.metric("顯著波高", f"{w['swh']:.2f} m")
-            st.metric("尖峰週期", f"{w['perpw']:.2f} s")
-            st.metric("波浪方向", f"{w['dirpw']:.1f}°")
-        if weather.get("wind"):
-            wnd = weather["wind"]
-            center_lat_idx = len(wnd["lats"]) // 2
-            center_lon_idx = len(wnd["lons"]) // 2
-            spd = float(wnd["speed"][center_lat_idx, center_lon_idx])
-            st.metric("風速（中心）", f"{spd:.2f} m/s")
+    st.divider()
+    st.subheader("⚙️ 環境影響係數")
+    current_factor = st.slider(
+        "海流影響係數",
+        min_value=0.0, max_value=2.0, value=1.0, step=0.1,
+        help="1.0 = 完整物理影響，0 = 忽略海流"
+    )
+    wind_factor = st.slider(
+        "風場影響係數",
+        min_value=0.0, max_value=1.0, value=0.3, step=0.05,
+        help="風對船速的影響通常比海流小，建議 0.2~0.5"
+    )
+    wave_threshold = st.slider(
+        "波高門檻 (m)",
+        min_value=0.5, max_value=5.0, value=2.5, step=0.25,
+        help="超過此波高才會增加路徑成本"
+    )
+    wave_weight = st.slider(
+        "波浪懲罰係數",
+        min_value=0.0, max_value=10.0, value=3.0, step=0.5,
+        help="每超過門檻 1m，增加多少 cost"
+    )
 
 # ===============================
 # Helpers
@@ -238,14 +241,13 @@ def coast_penalty(y, x):
     return (2 - d) * 2 if d < 2 else 0
 
 def wave_penalty(y, x):
-    """波高超過 2.5m 增加路徑成本"""
     if weather and weather.get("wave"):
         w = weather["wave"]
         lat_idx = np.abs(w["lats"] - lats[y]).argmin()
         lon_idx = np.abs(w["lons"] - lons[x]).argmin()
         swh = w["swh_grid"][lat_idx, lon_idx]
-        if not np.isnan(swh) and swh > 2.5:
-            return (swh - 2.5) * 3
+        if not np.isnan(swh) and swh > wave_threshold:
+            return (swh - wave_threshold) * wave_weight
     return 0
 
 # ===============================
@@ -297,7 +299,8 @@ if "route_key" not in st.session_state:
 
 start = nearest_cell(s_lon, s_lat)
 goal  = nearest_cell(e_lon, e_lat)
-route_key = (round(s_lon,4), round(s_lat,4), round(e_lon,4), round(e_lat,4))
+route_key = (round(s_lon,4), round(s_lat,4), round(e_lon,4), round(e_lat,4),
+             wave_threshold, wave_weight)
 
 if st.session_state.route_key != route_key:
     with st.spinner("Computing optimal route..."):
@@ -329,28 +332,95 @@ current_pos = path[st.session_state.ship_step_idx]
 # ===============================
 def calc_remaining(path, idx):
     dist = 0
-    for i in range(idx, len(path)-1):
+    total_time = 0
+
+    for i in range(idx, len(path) - 1):
         y0, x0 = path[i]
-        y1, x1 = path[i+1]
-        dist += np.hypot(lats[y1]-lats[y0], lons[x1]-lons[x0]) * 111
-    if idx < len(path)-1:
+        y1, x1 = path[i + 1]
+
+        seg_dist = np.hypot(lats[y1]-lats[y0], lons[x1]-lons[x0]) * 111
+
+        dlat = lats[y1] - lats[y0]
+        dlon = lons[x1] - lons[x0]
+        norm = np.hypot(dlat, dlon)
+        if norm == 0:
+            continue
+        dir_lat = dlat / norm
+        dir_lon = dlon / norm
+
+        effective_speed = ship_speed
+
+        # 海流修正
+        try:
+            ci = np.abs(lats - lats[y0]).argmin()
+            cj = np.abs(lons - lons[x0]).argmin()
+            sub = ds['ssu'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
+            subv = ds['ssv'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
+            u_cur = float(sub[ci, cj])
+            v_cur = float(subv[ci, cj])
+            if not np.isnan(u_cur) and not np.isnan(v_cur):
+                current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  # m/s → km/h
+                effective_speed += current_proj * current_factor
+        except:
+            pass
+
+        # 風修正
+        if weather and weather.get("wind"):
+            wnd = weather["wind"]
+            wi = np.abs(wnd["lats"] - lats[y0]).argmin()
+            wj = np.abs(wnd["lons"] - lons[x0]).argmin()
+            u_wnd = float(wnd["u"][wi, wj])
+            v_wnd = float(wnd["v"][wi, wj])
+            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6  # m/s → km/h
+            effective_speed += wind_proj * wind_factor
+
+        effective_speed = max(effective_speed, 1.0)
+        dist += seg_dist
+        total_time += seg_dist / effective_speed
+
+    if idx < len(path) - 1:
         y0, x0 = path[idx]
-        y1, x1 = path[idx+1]
+        y1, x1 = path[idx + 1]
         heading = np.degrees(np.arctan2(lats[y1]-lats[y0], lons[x1]-lons[x0]))
     else:
         heading = 0
-    return dist, dist/ship_speed, heading
 
-remaining_dist, remaining_time, heading = calc_remaining(path, st.session_state.ship_step_idx)
+    return dist, total_time, heading
+
+remaining_dist, remaining_time, heading = calc_remaining(
+    path, st.session_state.ship_step_idx
+)
 
 # ===============================
-# Dashboard
+# Dashboard — 第一排
 # ===============================
 st.subheader("Navigation Dashboard")
 c1, c2, c3 = st.columns(3)
 c1.metric("Remaining Distance (km)", f"{remaining_dist:.2f}")
 c2.metric("Remaining Time (hr)",     f"{remaining_time:.2f}")
 c3.metric("Heading",                 f"{heading:.1f}°")
+
+# 第二排 — 氣象資料
+w1, w2, w3, w4 = st.columns(4)
+if weather and weather.get("wave"):
+    w = weather["wave"]
+    w1.metric("顯著波高", f"{w['swh']:.2f} m")
+    w2.metric("波浪方向", f"{w['dirpw']:.1f}°")
+else:
+    w1.metric("顯著波高", "N/A")
+    w2.metric("波浪方向", "N/A")
+
+if weather and weather.get("wind"):
+    wnd = weather["wind"]
+    ci = len(wnd["lats"]) // 2
+    cj = len(wnd["lons"]) // 2
+    spd = float(wnd["speed"][ci, cj])
+    w3.metric("風速（中心）", f"{spd:.2f} m/s")
+else:
+    w3.metric("風速（中心）", "N/A")
+
+w4.metric("氣象時間", f"{weather['date']} {weather['cycle']}z" if weather else "N/A")
+
 st.caption(f"HYCOM observation time: {obs_time}")
 
 # ===============================
@@ -374,15 +444,16 @@ try:
 except:
     st.warning("Could not overlay current data.")
 
-# 波浪疊圖
+# 波浪等高線
 if weather and weather.get("wave"):
     w = weather["wave"]
     wlon_grid, wlat_grid = np.meshgrid(w["lons"], w["lats"])
     ax.contourf(wlon_grid, wlat_grid, w["swh_grid"],
-                levels=[2.5, 3.5, 5.0], colors=["#00BFFF"], alpha=0.3,
+                levels=[wave_threshold, wave_threshold+1, wave_threshold+2.5],
+                colors=["#00BFFF"], alpha=0.3,
                 transform=ccrs.PlateCarree())
     ax.contour(wlon_grid, wlat_grid, w["swh_grid"],
-               levels=[2.5], colors=["blue"], linewidths=1,
+               levels=[wave_threshold], colors=["blue"], linewidths=1,
                transform=ccrs.PlateCarree())
 
 # 風場箭頭
@@ -398,7 +469,6 @@ if weather and weather.get("wind"):
 for zone in NO_GO_ZONES:
     poly = np.array(zone)
     ax.fill(poly[:,1], poly[:,0], color="red",    alpha=0.4, transform=ccrs.PlateCarree())
-
 for zone in OFFSHORE_WIND:
     poly = np.array(zone)
     ax.fill(poly[:,1], poly[:,0], color="yellow", alpha=0.4, transform=ccrs.PlateCarree())
