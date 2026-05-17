@@ -354,12 +354,12 @@ def calc_remaining(path, idx):
         try:
             ci = np.abs(lats - lats[y0]).argmin()
             cj = np.abs(lons - lons[x0]).argmin()
-            sub = ds['ssu'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
-            subv = ds['ssv'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
-            u_cur = float(sub[ci, cj])
-            v_cur = float(subv[ci, cj])
+            sub_u = ds['ssu'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
+            sub_v = ds['ssv'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
+            u_cur = float(sub_u[ci, cj])
+            v_cur = float(sub_v[ci, cj])
             if not np.isnan(u_cur) and not np.isnan(v_cur):
-                current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  # m/s → km/h
+                current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
                 effective_speed += current_proj * current_factor
         except:
             pass
@@ -371,7 +371,7 @@ def calc_remaining(path, idx):
             wj = np.abs(wnd["lons"] - lons[x0]).argmin()
             u_wnd = float(wnd["u"][wi, wj])
             v_wnd = float(wnd["v"][wi, wj])
-            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6  # m/s → km/h
+            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6
             effective_speed += wind_proj * wind_factor
 
         effective_speed = max(effective_speed, 1.0)
@@ -401,7 +401,7 @@ c2.metric("Remaining Time (hr)",     f"{remaining_time:.2f}")
 c3.metric("Heading",                 f"{heading:.1f}°")
 
 # 第二排 — 氣象資料
-w1, w2, w3, w4 = st.columns(4)
+w1, w2, w3 = st.columns(3)
 if weather and weather.get("wave"):
     w = weather["wave"]
     w1.metric("顯著波高", f"{w['swh']:.2f} m")
@@ -418,8 +418,6 @@ if weather and weather.get("wind"):
     w3.metric("風速（中心）", f"{spd:.2f} m/s")
 else:
     w3.metric("風速（中心）", "N/A")
-
-w4.metric("氣象時間", f"{weather['date']} {weather['cycle']}z" if weather else "N/A")
 
 st.caption(f"HYCOM observation time: {obs_time}")
 
@@ -448,21 +446,21 @@ except:
 if weather and weather.get("wave"):
     w = weather["wave"]
     wlon_grid, wlat_grid = np.meshgrid(w["lons"], w["lats"])
-    ax.contourf(wlon_grid, wlat_grid, w["swh_grid"],
-                levels=[wave_threshold, wave_threshold+1, wave_threshold+2.5],
-                colors=["#00BFFF"], alpha=0.3,
-                transform=ccrs.PlateCarree())
-    ax.contour(wlon_grid, wlat_grid, w["swh_grid"],
-               levels=[wave_threshold], colors=["blue"], linewidths=1,
-               transform=ccrs.PlateCarree())
+    contour = ax.contour(
+        wlon_grid, wlat_grid, w["swh_grid"],
+        levels=[1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+        cmap="cool", linewidths=1.2,
+        transform=ccrs.PlateCarree()
+    )
+    ax.clabel(contour, fmt="%.1fm", fontsize=7, inline=True)
 
-# 風場箭頭
+# 風場箭頭（半透明白色）
 if weather and weather.get("wind"):
     wnd = weather["wind"]
     wlon_g, wlat_g = np.meshgrid(wnd["lons"], wnd["lats"])
     ax.quiver(wlon_g[::2, ::2], wlat_g[::2, ::2],
               wnd["u"][::2, ::2], wnd["v"][::2, ::2],
-              scale=200, color="darkgreen", alpha=0.7,
+              scale=200, color="white", alpha=0.5,
               transform=ccrs.PlateCarree())
 
 # 禁航區
@@ -480,7 +478,7 @@ ax.plot(full_lons, full_lats, color="pink",  linewidth=2, transform=ccrs.PlateCa
 
 done_lons = full_lons[:st.session_state.ship_step_idx+1]
 done_lats = full_lats[:st.session_state.ship_step_idx+1]
-ax.plot(done_lons, done_lats, color="red",   linewidth=2, transform=ccrs.PlateCarree())
+ax.plot(done_lons, done_lats, color="red", linewidth=2, transform=ccrs.PlateCarree())
 
 ax.scatter(lons[current_pos[1]], lats[current_pos[0]],
            color="gray", marker="^", s=150, zorder=5, transform=ccrs.PlateCarree())
