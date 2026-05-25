@@ -58,11 +58,15 @@ def load_hycom():
     sub = ds.sel(lat=slice(21, 26), lon=slice(118, 124))
     lons = sub.lon.values
     lats = sub.lat.values
-    land_mask = np.isnan(sub['ssu'].isel(time=0).values)
+    
+    # 預先加載最後一個時間步的海流數據，避免尋路時重複讀取網絡
+    u_data = sub['ssu'].isel(time=-1).values
+    v_data = sub['ssv'].isel(time=-1).values
+    land_mask = np.isnan(u_data)
 
-    return ds, lons, lats, land_mask, obs_time
+    return lons, lats, land_mask, obs_time, u_data, v_data
 
-ds, lons, lats, land_mask, obs_time = load_hycom()
+lons, lats, land_mask, obs_time, hycom_u, hycom_v = load_hycom()
 sea_mask = ~land_mask
 dist_to_land = distance_transform_edt(sea_mask)
 
@@ -190,7 +194,7 @@ with st.spinner("載入氣象資料中..."):
     weather = fetch_weather()
 
 # ===============================
-# Sidebar (🔧 核心修改：三選一物理智慧模式)
+# Sidebar
 # ===============================
 with st.sidebar:
     st.header("Route Settings")
@@ -204,7 +208,6 @@ with st.sidebar:
     st.divider()
     st.subheader("🧬 船型自適應環境優化模式")
     
-    # 原本手動拉的 Slider 整合為三大專業選項
     ship_mode = st.radio(
         "選擇航行船舶類型 (Ship Profile):",
         options=["大型貨輪/油輪 (CargoTanker)", "小型漁船 (Fishing)", "其他公務/客輪 (Other)"],
@@ -212,7 +215,6 @@ with st.sidebar:
         help="系統將根據不同船型的流體動力學與環境特徵，自動載入最優化權重矩陣。"
     )
 
-    # 依據你的實測黃金數據自動注入權重
     if "CargoTanker" in ship_mode:
         w_curr = 0.452
         w_wave = 0.431
@@ -223,15 +225,14 @@ with st.sidebar:
         w_wave = 0.513
         w_wind = 0.222
         desc_text = "💡 **小型船隻特徵**：船身輕、耐浪性低。尋路大腦將極力避開高波浪失速區（51.3%），以確保安全與防增阻。"
-    else: # Other
+    else: 
         w_curr = 0.380
         w_wave = 0.410
         w_wind = 0.210
         desc_text = "💡 **中型特殊船舶特徵**：採取均衡優化矩陣，在流阻、浪阻與空氣阻力間取得最佳系統抗噪強健性。"
 
-    # 設定恆定的基礎物理比對參數
-    wave_threshold = 2.0  # 基礎浪高門檻
-    wave_weight = 5.0     # 基礎波浪懲罰基準
+    wave_threshold = 2.0  
+    wave_weight = 2.0     
 
     with st.expander("📊 自動載入之流體力學加權矩陣", expanded=True):
         st.markdown(desc_text)
@@ -266,19 +267,13 @@ def get_environmental_cost(y0, x0, y1, x1):
     dir_lat = dlat / norm
     dir_lon = dlon / norm
 
-    # 1. 海流代價（逆流增阻、順流紅利）
+    # 1. 海流代價（使用已記憶體對齊的 hycom_u / hycom_v）
     current_cost = 0
-    try:
-        sub_u = ds['ssu'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
-        sub_v = ds['ssv'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
-        u_cur = float(sub_u[y0, x0])
-        v_cur = float(sub_v[y0, x0])
-        if not np.isnan(u_cur) and not np.isnan(v_cur):
-            # 點積投影：逆流為正代價，順流為負代價
-            current_proj = -(u_cur * dir_lon + v_cur * dir_lat)
-            current_cost = max(current_proj * 5.0, -1.0) # 給予合理的代價映射上限
-    except:
-        pass
+    u_cur = float(hycom_u[y0, x0])
+    v_cur = float(hycom_v[y0, x0])
+    if not np.isnan(u_cur) and not np.isnan(v_cur):
+        current_proj = (u_cur * dir_lon + v_cur * dir_lat)
+        current_cost = -current_proj * 5.0
 
     # 2. 波浪代價
     wave_cost = 0
@@ -288,7 +283,7 @@ def get_environmental_cost(y0, x0, y1, x1):
         wj = np.abs(w["lons"] - lons[x0]).argmin()
         swh = w["swh_grid"][wi, wj]
         if not np.isnan(swh) and swh > wave_threshold:
-            wave_cost = (swh - wave_threshold) * wave_weight
+            wave_cost = ((swh - wave_threshold) ** 2) * wave_weight
 
     # 3. 風場代價
     wind_cost = 0
@@ -298,17 +293,17 @@ def get_environmental_cost(y0, x0, y1, x1):
         wj = np.abs(wnd["lons"] - lons[x0]).argmin()
         u_wnd = float(wnd["u"][wi, wj])
         v_wnd = float(wnd["v"][wi, wj])
-        wind_proj = -(u_wnd * dir_lon + v_wnd * dir_lat)
-        wind_cost = max(wind_proj * 0.5, 0) # 逆風產生之空氣阻力代價
+        wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat)
+        wind_cost = max(-wind_proj * 0.5, 0)
 
-    # 🚀 核心多目標融合：套用你的船型自適應加權
     fused_env_cost = (current_cost * w_curr) + (wave_cost * w_wave) + (wind_cost * w_wind)
-    return max(fused_env_cost, 0)
+    return fused_env_cost
 
 # ===============================
-# A* Pathfinding (🧠 尋路大腦升級)
+# A* Pathfinding (🧠 方向修正與負權防禦)
 # ===============================
-dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+# 🔧 修正：補上左下角 (-1, -1)，移除重複的 (-1, 1)
+dirs = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
 
 def astar(start, goal):
     rows, cols = land_mask.shape
@@ -324,14 +319,14 @@ def astar(start, goal):
             ni, nj = cur[0]+d[0], cur[1]+d[1]
             if 0 <= ni < rows and 0 <= nj < cols and not land_mask[ni, nj]:
                 base = np.hypot(d[0], d[1])
-                
-                # 計算該步的自適應動態環境阻力代價
                 env_penalty = get_environmental_cost(cur[0], cur[1], ni, nj)
                 
-                new = (cost[cur] + base
-                       + offshore_penalty(ni, nj)
-                       + coast_penalty(ni, nj)
-                       + env_penalty) # 🚀 成功注入物理多目標融合代價！
+                # 🔧 修正：限制單步總代價最低不可小於 0.05，防止負權重擊穿 A* 機制
+                step_cost = base + offshore_penalty(ni, nj) + coast_penalty(ni, nj) + env_penalty
+                if step_cost < 0.05:
+                    step_cost = 0.05
+                    
+                new = cost[cur] + step_cost
                        
                 if (ni, nj) not in cost or new < cost[(ni, nj)]:
                     cost[(ni, nj)] = new
@@ -360,8 +355,7 @@ if "route_key" not in st.session_state:
 start = nearest_cell(s_lon, s_lat)
 goal  = nearest_cell(e_lon, e_lat)
 
-# 變更觸發重新尋路的 key，綁定目前的船型模式
-route_key = (round(s_lon,4), round(s_lat,4), round(e_lon,4), round(e_lat,4), ship_mode)
+route_key = (s_lon, s_lat, e_lon, e_lat, ship_mode)
 
 if st.session_state.route_key != route_key:
     with st.spinner("HELIOS 尋路引擎正依據船型特徵進行最優解算..."):
@@ -376,8 +370,7 @@ if st.session_state.route_key != route_key:
 path = st.session_state.full_path
 
 if path:
-    st.session_state.ship_step_idx = min(
-        st.session_state.ship_step_idx, len(path)-1)
+    st.session_state.ship_step_idx = min(st.session_state.ship_step_idx, len(path)-1)
 
 if st.session_state.get("next_step"):
     if path and st.session_state.ship_step_idx < len(path)-1:
@@ -411,19 +404,12 @@ def calc_remaining(path, idx):
 
         effective_speed = ship_speed
 
-        # 海流航速修正（與尋路引擎權重同步平衡）
-        try:
-            ci = np.abs(lats - lats[y0]).argmin()
-            cj = np.abs(lons - lons[x0]).argmin()
-            sub_u = ds['ssu'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
-            sub_v = ds['ssv'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1).values
-            u_cur = float(sub_u[ci, cj])
-            v_cur = float(sub_v[ci, cj])
-            if not np.isnan(u_cur) and not np.isnan(v_cur):
-                current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
-                effective_speed += current_proj * (w_curr * 2.0) # 受船型海流敏感度權重縮放
-        except:
-            pass
+        # 海流航速修正
+        u_cur = float(hycom_u[y0, x0])
+        v_cur = float(hycom_v[y0, x0])
+        if not np.isnan(u_cur) and not np.isnan(v_cur):
+            current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  
+            effective_speed += current_proj * w_curr
 
         # 風場航速修正
         if weather and weather.get("wind"):
@@ -432,10 +418,20 @@ def calc_remaining(path, idx):
             wj = np.abs(wnd["lons"] - lons[x0]).argmin()
             u_wnd = float(wnd["u"][wi, wj])
             v_wnd = float(wnd["v"][wi, wj])
-            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6
-            effective_speed += wind_proj * (w_wind * 1.0) # 受船型風場敏感度權重縮放
+            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6  
+            effective_speed += wind_proj * w_wind
 
-        effective_speed = max(effective_speed, 1.0)
+        # 波浪失速減速（讓時間估算與尋路邏輯同步）
+        if weather and weather.get("wave"):
+            w = weather["wave"]
+            wi = np.abs(w["lats"] - lats[y0]).argmin()
+            wj = np.abs(w["lons"] - lons[x0]).argmin()
+            swh = w["swh_grid"][wi, wj]
+            if not np.isnan(swh) and swh > wave_threshold:
+                # 浪越高，失速越多
+                effective_speed -= ((swh - wave_threshold) ** 1.5) * wave_weight * w_wave
+
+        effective_speed = max(effective_speed, 2.0) # 修正下限為最低航速 2 km/h，防止除以零
         dist += seg_dist
         total_time += seg_dist / effective_speed
 
@@ -448,9 +444,7 @@ def calc_remaining(path, idx):
 
     return dist, total_time, heading
 
-remaining_dist, remaining_time, heading = calc_remaining(
-    path, st.session_state.ship_step_idx
-)
+remaining_dist, remaining_time, heading = calc_remaining(path, st.session_state.ship_step_idx)
 
 # ===============================
 # Dashboard — 第一排
@@ -488,15 +482,13 @@ st.caption(f"HYCOM observation time: {obs_time}")
 fig = plt.figure(figsize=(10, 8))
 ax  = plt.axes(projection=ccrs.PlateCarree())
 ax.set_extent([118, 124, 21, 26])
-ax.add_feature(cfeature.LAND,      facecolor="#b0b0b0")
+ax.add_feature(cfeature.LAND,       facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
 # 海流
 try:
-    u = ds['ssu'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1)
-    v = ds['ssv'].sel(lat=slice(21,26), lon=slice(118,124)).isel(time=-1)
-    speed_cur = np.sqrt(u**2 + v**2)
-    mesh = ax.pcolormesh(speed_cur.lon, speed_cur.lat, speed_cur,
+    speed_cur = np.sqrt(hycom_u**2 + hycom_v**2)
+    mesh = ax.pcolormesh(lons, lats, speed_cur,
                          cmap="Blues", shading="auto", vmin=0, vmax=1.6,
                          transform=ccrs.PlateCarree())
     fig.colorbar(mesh, ax=ax, label="Current Speed (m/s)")
@@ -515,7 +507,7 @@ if weather and weather.get("wave"):
     )
     ax.clabel(contour, fmt="%.1fm", fontsize=7, inline=True)
 
-# 風場箭頭（半透明白色）
+# 風場箭頭
 if weather and weather.get("wind"):
     wnd = weather["wind"]
     wlon_g, wlat_g = np.meshgrid(wnd["lons"], wnd["lats"])
