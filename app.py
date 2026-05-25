@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 # Page Config
 # ===============================
 st.set_page_config(layout="wide", page_title="HELIOS Smart Navigation System")
-st.title("🛰️ HELIOS Smart Navigation System")
+st.title("🛰️ HELIOS System")
 
 # ===============================
 # No-Go Zones & Offshore Wind
