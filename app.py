@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 # ===============================
 # Page Config
 # ===============================
-st.set_page_config(layout="wide", page_title="HELIOS Smart Navigation System")
+st.set_page_config(layout="wide", page_title="HELIOS System")
 st.title("🛰️ HELIOS System")
 
 # ===============================
