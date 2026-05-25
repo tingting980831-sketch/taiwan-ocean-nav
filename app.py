@@ -194,7 +194,7 @@ with st.spinner("載入氣象資料中..."):
     weather = fetch_weather()
 
 # ===============================
-# Sidebar
+# Sidebar (已移除權重與特徵面板)
 # ===============================
 with st.sidebar:
     st.header("Route Settings")
@@ -208,6 +208,7 @@ with st.sidebar:
     st.divider()
     st.subheader("🧬 船型自適應環境優化模式")
     
+    # 僅保留專業選項切換，後台自動注入黃金權重
     ship_mode = st.radio(
         "選擇航行船舶類型 (Ship Profile):",
         options=["大型貨輪/油輪 (CargoTanker)", "小型漁船 (Fishing)", "其他公務/客輪 (Other)"],
@@ -215,31 +216,23 @@ with st.sidebar:
         help="系統將根據不同船型的流體動力學與環境特徵，自動載入最優化權重矩陣。"
     )
 
+    # 後台靜態注入權重參數（不顯示於前端）
     if "CargoTanker" in ship_mode:
         w_curr = 0.452
         w_wave = 0.431
         w_wind = 0.117
-        desc_text = "💡 **大型船隻特徵**：吃水深、噸位大。尋路大腦將高度依賴水下海流向量推進（45.2%），並大幅降低天空風阻干擾。"
     elif "Fishing" in ship_mode:
         w_curr = 0.265
         w_wave = 0.513
         w_wind = 0.222
-        desc_text = "💡 **小型船隻特徵**：船身輕、耐浪性低。尋路大腦將極力避開高波浪失速區（51.3%），以確保安全與防增阻。"
-    else: 
+    else: # Other
         w_curr = 0.380
         w_wave = 0.410
         w_wind = 0.210
-        desc_text = "💡 **中型特殊船舶特徵**：採取均衡優化矩陣，在流阻、浪阻與空氣阻力間取得最佳系統抗噪強健性。"
 
-    wave_threshold = 2.0  
-    wave_weight = 2.0     
-
-    with st.expander("📊 自動載入之流體力學加權矩陣", expanded=True):
-        st.markdown(desc_text)
-        st.divider()
-        st.caption(f"🟢 **海流最優權重 ($w_{{Current}}$)** : {w_curr*100:.1f}%")
-        st.caption(f"🟠 **波浪失速權重 ($w_{{Wave}}$)** : {w_wave*100:.1f}%")
-        st.caption(f"🔵 **空氣風阻權重 ($w_{{Wind}}$)** : {w_wind*100:.1f}%")
+    # 設定恆定的基礎物理比對參數
+    wave_threshold = 2.0  # 基礎浪高門檻
+    wave_weight = 2.0     # 基礎波浪懲罰權重
 
 # ===============================
 # Helpers
