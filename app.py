@@ -42,20 +42,29 @@ OFFSHORE_COST = 10
 # ===============================
 @st.cache_data(ttl=3600)
 def load_hycom():
-    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
-    try:
-        ds = xr.open_dataset(url, decode_times=False)
-    except Exception as e:
-        st.error(f"無法連接到 HYCOM 數據庫: {e}")
+    # ssu/ssv 在 v3z 資料集（非 ice）；年份從新到舊 fallback
+    ds = None
+    used_url = None
+    current_year = datetime.now(timezone.utc).year
+    for year in range(current_year, current_year - 3, -1):
+        url = f"https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/v3z/{year}"
+        try:
+            ds = xr.open_dataset(url, decode_times=False)
+            used_url = url
+            break
+        except Exception:
+            continue
+
+    if ds is None:
+        st.error("無法連接到 HYCOM v3z 資料集（已嘗試最近三年）")
         st.stop()
 
     if 'time_origin' in ds['time'].attrs:
-        origin = pd.to_datetime(ds['time'].attrs['time_origin'])
+        origin   = pd.to_datetime(ds['time'].attrs['time_origin'])
         obs_time = origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
     else:
         obs_time = pd.Timestamp.now()
 
-    # FIX 1: 全部縮排在函數內
     sub = (
         ds[["ssu", "ssv"]]
         .sel(
@@ -66,11 +75,20 @@ def load_hycom():
         .load()
     )
 
+    # v3z 含深度維度，取表層 (depth index 0)
+    if "depth" in sub["ssu"].dims:
+        sub = sub.isel(depth=0)
+
     lons = sub.lon.values
     lats = sub.lat.values
 
     u_data = sub["ssu"].values
     v_data = sub["ssv"].values
+
+    # 確保是 2D
+    if u_data.ndim > 2:
+        u_data = u_data[0]
+        v_data = v_data[0]
 
     land_mask = np.isnan(u_data)
 
