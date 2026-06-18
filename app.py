@@ -42,54 +42,26 @@ OFFSHORE_COST = 10
 # ===============================
 @st.cache_data(ttl=3600)
 def load_hycom():
-    import socket
-
-    # 診斷：確認 Streamlit Cloud 能不能解析並連到 tds.hycom.org
-    diag_lines = []
+    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
     try:
-        ip = socket.gethostbyname("tds.hycom.org")
-        diag_lines.append(f"DNS OK: tds.hycom.org → {ip}")
+        ds = xr.open_dataset(url, decode_times=False)
     except Exception as e:
-        diag_lines.append(f"DNS FAIL: {e}")
-
-    try:
-        s = socket.create_connection(("tds.hycom.org", 443), timeout=10)
-        s.close()
-        diag_lines.append("TCP 443 OK")
-    except Exception as e:
-        diag_lines.append(f"TCP 443 FAIL: {e}")
-
-    try:
-        s = socket.create_connection(("tds.hycom.org", 80), timeout=10)
-        s.close()
-        diag_lines.append("TCP 80 OK")
-    except Exception as e:
-        diag_lines.append(f"TCP 80 FAIL: {e}")
-
-    st.info("HYCOM 連線診斷\n" + "\n".join(diag_lines))
-
-    URL = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
-    try:
-        ds = xr.open_dataset(URL, decode_times=False, engine="netcdf4")
-    except Exception as e:
-        st.exception(e)
+        st.error(f"無法連接到 HYCOM 數據庫: {e}")
         st.stop()
 
-    origin     = pd.to_datetime(ds.attrs["time_origin"])
-    latest_tau = float(ds["tau"].values[-1])
-    obs_time   = origin + pd.to_timedelta(latest_tau, unit="h")
+    if 'time_origin' in ds['time'].attrs:
+        origin = pd.to_datetime(ds['time'].attrs['time_origin'])
+        obs_time = origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
+    else:
+        obs_time = pd.Timestamp.now()
 
-    sub = (
-        ds[["ssu", "ssv"]]
-        .sel(lat=slice(21, 26), lon=slice(118, 124))
-        .isel(time=-1)
-        .load()
-    )
-
-    lons      = sub.lon.values
-    lats      = sub.lat.values
-    u_data    = sub["ssu"].values.astype(float)
-    v_data    = sub["ssv"].values.astype(float)
+    sub = ds.sel(lat=slice(21, 26), lon=slice(118, 124))
+    lons = sub.lon.values
+    lats = sub.lat.values
+    
+    # 預先加載最後一個時間步的海流數據，避免尋路時重複讀取網絡
+    u_data = sub['ssu'].isel(time=-1).values
+    v_data = sub['ssv'].isel(time=-1).values
     land_mask = np.isnan(u_data)
 
     return lons, lats, land_mask, obs_time, u_data, v_data
@@ -222,23 +194,7 @@ with st.spinner("載入氣象資料中..."):
     weather = fetch_weather()
 
 # ===============================
-# FIX 3: 預先計算索引陣列（只算一次）
-# ===============================
-wave_lat_idx = None
-wave_lon_idx = None
-wind_lat_idx = None
-wind_lon_idx = None
-
-if weather and weather.get("wave"):
-    wave_lat_idx = np.searchsorted(weather["wave"]["lats"], lats)
-    wave_lon_idx = np.searchsorted(weather["wave"]["lons"], lons)
-
-if weather and weather.get("wind"):
-    wind_lat_idx = np.searchsorted(weather["wind"]["lats"], lats)
-    wind_lon_idx = np.searchsorted(weather["wind"]["lons"], lons)
-
-# ===============================
-# Sidebar
+# Sidebar (已移除權重與特徵面板)
 # ===============================
 with st.sidebar:
     st.header("Route Settings")
@@ -251,7 +207,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🧬 船型自適應環境優化模式")
-
+    
+    # 僅保留專業選項切換，後台自動注入黃金權重
     ship_mode = st.radio(
         "選擇航行船舶類型 (Ship Profile):",
         options=["大型貨輪/油輪 (CargoTanker)", "小型漁船 (Fishing)", "其他公務/客輪 (Other)"],
@@ -259,6 +216,7 @@ with st.sidebar:
         help="系統將根據不同船型的流體動力學與環境特徵，自動載入最優化權重矩陣。"
     )
 
+    # 後台靜態注入權重參數（不顯示於前端）
     if "CargoTanker" in ship_mode:
         w_curr = 0.452
         w_wave = 0.431
@@ -267,13 +225,14 @@ with st.sidebar:
         w_curr = 0.265
         w_wave = 0.513
         w_wind = 0.222
-    else:
+    else: # Other
         w_curr = 0.380
         w_wave = 0.410
         w_wind = 0.210
 
-    wave_threshold = 2.0
-    wave_weight    = 2.0
+    # 設定恆定的基礎物理比對參數
+    wave_threshold = 2.0  # 基礎浪高門檻
+    wave_weight = 2.0     # 基礎波浪懲罰權重
 
 # ===============================
 # Helpers
@@ -291,7 +250,7 @@ def coast_penalty(y, x):
     d = dist_to_land[y, x]
     return (2 - d) * 2 if d < 2 else 0
 
-# FIX 3: get_environmental_cost 使用快取索引
+# 🌟 A* 尋路專用的三介面動態代價計算
 def get_environmental_cost(y0, x0, y1, x1):
     dlat = lats[y1] - lats[y0]
     dlon = lons[x1] - lons[x0]
@@ -301,7 +260,7 @@ def get_environmental_cost(y0, x0, y1, x1):
     dir_lat = dlat / norm
     dir_lon = dlon / norm
 
-    # 1. 海流代價
+    # 1. 海流代價（使用已記憶體對齊的 hycom_u / hycom_v）
     current_cost = 0
     u_cur = float(hycom_u[y0, x0])
     v_cur = float(hycom_v[y0, x0])
@@ -309,22 +268,24 @@ def get_environmental_cost(y0, x0, y1, x1):
         current_proj = (u_cur * dir_lon + v_cur * dir_lat)
         current_cost = -current_proj * 5.0
 
-    # 2. 波浪代價（使用快取索引）
+    # 2. 波浪代價
     wave_cost = 0
-    if wave_lat_idx is not None:
-        wi = wave_lat_idx[y0]
-        wj = wave_lon_idx[x0]
-        swh = weather["wave"]["swh_grid"][wi, wj]
+    if weather and weather.get("wave"):
+        w = weather["wave"]
+        wi = np.abs(w["lats"] - lats[y0]).argmin()
+        wj = np.abs(w["lons"] - lons[x0]).argmin()
+        swh = w["swh_grid"][wi, wj]
         if not np.isnan(swh) and swh > wave_threshold:
             wave_cost = ((swh - wave_threshold) ** 2) * wave_weight
 
-    # 3. 風場代價（使用快取索引）
+    # 3. 風場代價
     wind_cost = 0
-    if wind_lat_idx is not None:
-        wi = wind_lat_idx[y0]
-        wj = wind_lon_idx[x0]
-        u_wnd = float(weather["wind"]["u"][wi, wj])
-        v_wnd = float(weather["wind"]["v"][wi, wj])
+    if weather and weather.get("wind"):
+        wnd = weather["wind"]
+        wi = np.abs(wnd["lats"] - lats[y0]).argmin()
+        wj = np.abs(wnd["lons"] - lons[x0]).argmin()
+        u_wnd = float(wnd["u"][wi, wj])
+        v_wnd = float(wnd["v"][wi, wj])
         wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat)
         wind_cost = max(-wind_proj * 0.5, 0)
 
@@ -332,12 +293,10 @@ def get_environmental_cost(y0, x0, y1, x1):
     return fused_env_cost
 
 # ===============================
-# A* Pathfinding
+# A* Pathfinding (🧠 方向修正與負權防禦)
 # ===============================
+# 🔧 修正：補上左下角 (-1, -1)，移除重複的 (-1, 1)
 dirs = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
-
-def heuristic(a, b):
-    return np.hypot(a[0] - b[0], a[1] - b[1])
 
 def astar(start, goal):
     rows, cols = land_mask.shape
@@ -352,21 +311,20 @@ def astar(start, goal):
         for d in dirs:
             ni, nj = cur[0]+d[0], cur[1]+d[1]
             if 0 <= ni < rows and 0 <= nj < cols and not land_mask[ni, nj]:
-                base        = np.hypot(d[0], d[1])
+                base = np.hypot(d[0], d[1])
                 env_penalty = get_environmental_cost(cur[0], cur[1], ni, nj)
-
+                
+                # 🔧 修正：限制單步總代價最低不可小於 0.05，防止負權重擊穿 A* 機制
                 step_cost = base + offshore_penalty(ni, nj) + coast_penalty(ni, nj) + env_penalty
                 if step_cost < 0.05:
                     step_cost = 0.05
-
+                    
                 new = cost[cur] + step_cost
-
-                # FIX 2: heapq.heappush 在 if 區塊內
+                       
                 if (ni, nj) not in cost or new < cost[(ni, nj)]:
                     cost[(ni, nj)] = new
                     came[(ni, nj)] = cur
-                    priority = new + heuristic((ni, nj), goal)
-                    heapq.heappush(pq, (priority, (ni, nj)))
+                    heapq.heappush(pq, (new, (ni, nj)))
 
     path = []
     cur = goal
@@ -398,9 +356,9 @@ if st.session_state.route_key != route_key:
     if len(new_path) == 0:
         st.error("❌ 無法在當前海況與船型設定下找到安全航線")
         st.stop()
-    st.session_state.full_path    = new_path
+    st.session_state.full_path = new_path
     st.session_state.ship_step_idx = 0
-    st.session_state.route_key    = route_key
+    st.session_state.route_key = route_key
 
 path = st.session_state.full_path
 
@@ -420,7 +378,7 @@ current_pos = path[st.session_state.ship_step_idx]
 # Calculations
 # ===============================
 def calc_remaining(path, idx):
-    dist       = 0
+    dist = 0
     total_time = 0
 
     for i in range(idx, len(path) - 1):
@@ -443,28 +401,31 @@ def calc_remaining(path, idx):
         u_cur = float(hycom_u[y0, x0])
         v_cur = float(hycom_v[y0, x0])
         if not np.isnan(u_cur) and not np.isnan(v_cur):
-            current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
+            current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  
             effective_speed += current_proj * w_curr
 
-        # 風場航速修正（使用快取索引）
-        if wind_lat_idx is not None:
-            wi = wind_lat_idx[y0]
-            wj = wind_lon_idx[x0]
-            u_wnd = float(weather["wind"]["u"][wi, wj])
-            v_wnd = float(weather["wind"]["v"][wi, wj])
-            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6
+        # 風場航速修正
+        if weather and weather.get("wind"):
+            wnd = weather["wind"]
+            wi = np.abs(wnd["lats"] - lats[y0]).argmin()
+            wj = np.abs(wnd["lons"] - lons[x0]).argmin()
+            u_wnd = float(wnd["u"][wi, wj])
+            v_wnd = float(wnd["v"][wi, wj])
+            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6  
             effective_speed += wind_proj * w_wind
 
-        # 波浪失速減速（使用快取索引）
-        if wave_lat_idx is not None:
-            wi  = wave_lat_idx[y0]
-            wj  = wave_lon_idx[x0]
-            swh = weather["wave"]["swh_grid"][wi, wj]
+        # 波浪失速減速（讓時間估算與尋路邏輯同步）
+        if weather and weather.get("wave"):
+            w = weather["wave"]
+            wi = np.abs(w["lats"] - lats[y0]).argmin()
+            wj = np.abs(w["lons"] - lons[x0]).argmin()
+            swh = w["swh_grid"][wi, wj]
             if not np.isnan(swh) and swh > wave_threshold:
+                # 浪越高，失速越多
                 effective_speed -= ((swh - wave_threshold) ** 1.5) * wave_weight * w_wave
 
-        effective_speed = max(effective_speed, 2.0)
-        dist       += seg_dist
+        effective_speed = max(effective_speed, 2.0) # 修正下限為最低航速 2 km/h，防止除以零
+        dist += seg_dist
         total_time += seg_dist / effective_speed
 
     if idx < len(path) - 1:
@@ -499,8 +460,8 @@ else:
 
 if weather and weather.get("wind"):
     wnd = weather["wind"]
-    ci  = len(wnd["lats"]) // 2
-    cj  = len(wnd["lons"]) // 2
+    ci = len(wnd["lats"]) // 2
+    cj = len(wnd["lons"]) // 2
     spd = float(wnd["speed"][ci, cj])
     w3.metric("風速（中心）", f"{spd:.2f} m/s")
 else:
@@ -514,7 +475,7 @@ st.caption(f"HYCOM observation time: {obs_time}")
 fig = plt.figure(figsize=(10, 8))
 ax  = plt.axes(projection=ccrs.PlateCarree())
 ax.set_extent([118, 124, 21, 26])
-ax.add_feature(cfeature.LAND,      facecolor="#b0b0b0")
+ax.add_feature(cfeature.LAND,       facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
 # 海流
