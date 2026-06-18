@@ -40,7 +40,6 @@ OFFSHORE_COST = 10
 # ===============================
 # Load HYCOM
 # ===============================
-@st.cache_data(ttl=3600)
 def load_hycom():
     # ssu/ssv 在 v3z 資料集（非 ice）；年份從新到舊 fallback
     ds = None
