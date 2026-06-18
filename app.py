@@ -9,7 +9,7 @@ import heapq
 import requests
 import tempfile
 import os
-import time  # 引入時間模組以支援重試機制
+import time  
 from scipy.ndimage import distance_transform_edt
 from matplotlib.path import Path
 from datetime import datetime, timezone, timedelta
@@ -38,58 +38,61 @@ OFFSHORE_WIND = [
 
 OFFSHORE_COST = 10
 
-# 🌟 修正點：在此處預先宣告全域變數，防止 load_hycom 啟動時發生 NameError
+# 預先宣告全域變數，防止啟動時發生 NameError
 w_curr = 0.452
 w_wave = 0.431
 w_wind = 0.117
 
 # ===============================
-# Load HYCOM (已最佳化：加入防崩潰自動重試與釋放機制)
+# Load HYCOM (純線上強制串接版：修正官方動態即時資料路徑)
 # ===============================
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800) # 縮短快取時間，確保抓到最新即時海流
 def load_hycom():
-    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+    # 🌟 修正點：更換為 HYCOM 最穩定、目前全天候更新的 ESPC 實際即時預報串流網址
+    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/expt_93.0/data/forecasts"
     
-    max_retries = 4       # 最大重試次數
-    retry_delay = 15      # 每次失敗後等待 15 秒再試
+    max_retries = 5       # 增加重試次數
+    retry_delay = 10      # 每次失敗等待 10 秒
     ds = None
 
     for attempt in range(max_retries):
         try:
-            # 建立 OpenDAP 遠端數據集串流
+            # 嘗試使用 OpenDAP 協議開啟數據流
             ds = xr.open_dataset(url, decode_times=False)
-            break  # 連線成功，跳出重試迴圈
+            break  # 成功連線則跳出重試
         except Exception as e:
             if attempt < max_retries - 1:
-                # 在畫面上提示目前重試進度，避免使用者誤以為當機
-                st.warning(f"⚠️ HYCOM 伺服器連線失敗 (嘗試 {attempt + 1}/{max_retries}): {e}。將於 {retry_delay} 秒後自動重試...")
+                st.warning(f"⏳ 正在嘗試強制串接 HYCOM 數據庫 (第 {attempt + 1}/{max_retries} 次)... 錯誤原因: {e}")
                 time.sleep(retry_delay)
             else:
-                st.error(f"❌ 嚴重錯誤：已達到最大重試次數，無法連接到 HYCOM 數據庫。\n錯誤細節: {e}")
-                st.info("💡 提示：這通常是因為 HYCOM 伺服器正在進行每日例行維護（美東時間 02:00-03:00 / 12:00-13:00），請稍候再試。")
+                st.error(f"❌ 無法連接到 HYCOM 伺服器。請檢查伺服器狀態或您的網路連線環境。\n網址: {url}\n細節: {e}")
                 st.stop()
 
+    # 讀取觀測與預報時間戳記
     if 'time_origin' in ds['time'].attrs:
         origin = pd.to_datetime(ds['time'].attrs['time_origin'])
         obs_time = origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
     else:
         obs_time = pd.Timestamp.now()
 
-    # 進行台灣周邊海域切片
+    # 切片台灣海域 (緯度 21~26, 經度 118~124)
     sub = ds.sel(lat=slice(21, 26), lon=slice(118, 124))
     lons = sub.lon.values
     lats = sub.lat.values
     
-    # 預先加載最後一個時間步的海流數據至內部記憶體，防止尋路時重複引發網路 I/O
+    # 抓取最新時間點的表面東向海流(ssu)與北向海流(ssv)
     u_data = sub['ssu'].isel(time=-1).values
     v_data = sub['ssv'].isel(time=-1).values
+    
+    # 利用海流資料中的 NaN 值來做陸地遮罩 (Land Mask)
     land_mask = np.isnan(u_data)
 
-    # 關閉遠端資料集串流，釋放 curl 執行緒資源
+    # 關閉串流，釋放 socket 連線，避免 memory leak
     ds.close()
 
     return lons, lats, land_mask, obs_time, u_data, v_data
 
+# 強制執行加載
 lons, lats, land_mask, obs_time, hycom_u, hycom_v = load_hycom()
 sea_mask = ~land_mask
 dist_to_land = distance_transform_edt(sea_mask)
@@ -112,7 +115,7 @@ def fetch_weather():
                 f"&dir=%2Fgfs.{d}%2F{c}%2Fwave%2Fgridded"
             )
             try:
-                r = requests.head(url, timeout=10)
+                r = requests.head(url, timeout=5)
                 if r.status_code == 200:
                     date_str, cycle = d, c
                     break
@@ -136,7 +139,7 @@ def fetch_weather():
             "&leftlon=118&rightlon=124&toplat=26&bottomlat=21"
             f"&dir=%2Fgfs.{date_str}%2F{cycle}%2Fwave%2Fgridded"
         )
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, timeout=15)
         with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
             tmp.write(r.content)
             tmp_path = tmp.name
@@ -177,7 +180,6 @@ def fetch_weather():
         os.unlink(tmp_path)
     except Exception as e:
         result["wave"] = None
-        st.warning(f"波浪資料載入失敗: {e}")
 
     # 風場
     try:
@@ -188,7 +190,7 @@ def fetch_weather():
             "&subregion=&leftlon=118&rightlon=124&toplat=26&bottomlat=21"
             f"&dir=%2Fgfs.{date_str}%2F{cycle}%2Fatmos"
         )
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, timeout=15)
         with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
             tmp.write(r.content)
             tmp_path = tmp.name
@@ -210,7 +212,6 @@ def fetch_weather():
         os.unlink(tmp_path)
     except Exception as e:
         result["wind"] = None
-        st.warning(f"風場資料載入失敗: {e}")
 
     return result
 
@@ -236,10 +237,8 @@ with st.sidebar:
         "選擇航行船舶類型 (Ship Profile):",
         options=["大型貨輪/油輪 (CargoTanker)", "小型漁船 (Fishing)", "其他公務/客輪 (Other)"],
         index=0,
-        help="系統將根據不同船型的流體動力學與環境特徵，自動載入最優化權重矩陣。"
     )
 
-    # 後台動態覆蓋優化權重
     if "CargoTanker" in ship_mode:
         w_curr = 0.452
         w_wave = 0.431
@@ -248,13 +247,13 @@ with st.sidebar:
         w_curr = 0.265
         w_wave = 0.513
         w_wind = 0.222
-    else: # Other
+    else: 
         w_curr = 0.380
         w_wave = 0.410
         w_wind = 0.210
 
-    wave_threshold = 2.0  # 基礎浪高門檻
-    wave_weight = 2.0     # 基礎波浪懲罰權重
+    wave_threshold = 2.0  
+    wave_weight = 2.0     
 
 # ===============================
 # Helpers
@@ -281,7 +280,6 @@ def get_environmental_cost(y0, x0, y1, x1):
     dir_lat = dlat / norm
     dir_lon = dlon / norm
 
-    # 1. 海流代價
     current_cost = 0
     u_cur = float(hycom_u[y0, x0])
     v_cur = float(hycom_v[y0, x0])
@@ -289,7 +287,6 @@ def get_environmental_cost(y0, x0, y1, x1):
         current_proj = (u_cur * dir_lon + v_cur * dir_lat)
         current_cost = -current_proj * 5.0
 
-    # 2. 波浪代價
     wave_cost = 0
     if weather and weather.get("wave"):
         w = weather["wave"]
@@ -299,7 +296,6 @@ def get_environmental_cost(y0, x0, y1, x1):
         if not np.isnan(swh) and swh > wave_threshold:
             wave_cost = ((swh - wave_threshold) ** 2) * wave_weight
 
-    # 3. 風場代價
     wind_cost = 0
     if weather and weather.get("wind"):
         wnd = weather["wind"]
@@ -416,14 +412,12 @@ def calc_remaining(path, idx):
 
         effective_speed = ship_speed
 
-        # 海流航速修正
         u_cur = float(hycom_u[y0, x0])
         v_cur = float(hycom_v[y0, x0])
         if not np.isnan(u_cur) and not np.isnan(v_cur):
             current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  
             effective_speed += current_proj * w_curr
 
-        # 風場航速修正
         if weather and weather.get("wind"):
             wnd = weather["wind"]
             wi = np.abs(wnd["lats"] - lats[y0]).argmin()
@@ -433,7 +427,6 @@ def calc_remaining(path, idx):
             wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6  
             effective_speed += wind_proj * w_wind
 
-        # 波浪失速減速
         if weather and weather.get("wave"):
             w = weather["wave"]
             wi = np.abs(w["lats"] - lats[y0]).argmin()
@@ -495,7 +488,6 @@ ax.set_extent([118, 124, 21, 26])
 ax.add_feature(cfeature.LAND,       facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
-# 海流
 try:
     speed_cur = np.sqrt(hycom_u**2 + hycom_v**2)
     mesh = ax.pcolormesh(lons, lats, speed_cur,
@@ -505,7 +497,6 @@ try:
 except:
     st.warning("Could not overlay current data.")
 
-# 波浪等高線
 if weather and weather.get("wave"):
     w = weather["wave"]
     wlon_grid, wlat_grid = np.meshgrid(w["lons"], w["lats"])
@@ -517,7 +508,6 @@ if weather and weather.get("wave"):
     )
     ax.clabel(contour, fmt="%.1fm", fontsize=7, inline=True)
 
-# 風場箭頭
 if weather and weather.get("wind"):
     wnd = weather["wind"]
     wlon_g, wlat_g = np.meshgrid(wnd["lons"], wnd["lats"])
@@ -526,7 +516,6 @@ if weather and weather.get("wind"):
               scale=200, color="white", alpha=0.5,
               transform=ccrs.PlateCarree())
 
-# 禁航區
 for zone in NO_GO_ZONES:
     poly = np.array(zone)
     ax.fill(poly[:,1], poly[:,0], color="red",    alpha=0.4, transform=ccrs.PlateCarree())
@@ -534,7 +523,6 @@ for zone in OFFSHORE_WIND:
     poly = np.array(zone)
     ax.fill(poly[:,1], poly[:,0], color="yellow", alpha=0.4, transform=ccrs.PlateCarree())
 
-# 路徑
 full_lons = [lons[p[1]] for p in path]
 full_lats = [lats[p[0]] for p in path]
 ax.plot(full_lons, full_lats, color="pink",  linewidth=2, transform=ccrs.PlateCarree())
