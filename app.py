@@ -42,62 +42,55 @@ OFFSHORE_COST = 10
 # ===============================
 @st.cache_data(ttl=3600)
 def load_hycom():
-    # Streamlit Cloud 封鎖直接 OPeNDAP，改用 NCSS HTTP subset 下載暫存檔
-    base = "https://ncss.hycom.org/thredds/ncss/grid/ESPC-D-V02/ice/2026"
-    params = (
-        "?var=ssu&var=ssv"
-        "&north=26&south=21&west=118&east=124"
-        "&horizStride=1"
-        "&time_start=present&time_end=present"
-        "&addLatLon=true"
-        "&accept=netcdf4"
+    import socket
+
+    # 診斷：確認 Streamlit Cloud 能不能解析並連到 tds.hycom.org
+    diag_lines = []
+    try:
+        ip = socket.gethostbyname("tds.hycom.org")
+        diag_lines.append(f"DNS OK: tds.hycom.org → {ip}")
+    except Exception as e:
+        diag_lines.append(f"DNS FAIL: {e}")
+
+    try:
+        s = socket.create_connection(("tds.hycom.org", 443), timeout=10)
+        s.close()
+        diag_lines.append("TCP 443 OK")
+    except Exception as e:
+        diag_lines.append(f"TCP 443 FAIL: {e}")
+
+    try:
+        s = socket.create_connection(("tds.hycom.org", 80), timeout=10)
+        s.close()
+        diag_lines.append("TCP 80 OK")
+    except Exception as e:
+        diag_lines.append(f"TCP 80 FAIL: {e}")
+
+    st.info("HYCOM 連線診斷\n" + "\n".join(diag_lines))
+
+    URL = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
+    try:
+        ds = xr.open_dataset(URL, decode_times=False, engine="netcdf4")
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+
+    origin     = pd.to_datetime(ds.attrs["time_origin"])
+    latest_tau = float(ds["tau"].values[-1])
+    obs_time   = origin + pd.to_timedelta(latest_tau, unit="h")
+
+    sub = (
+        ds[["ssu", "ssv"]]
+        .sel(lat=slice(21, 26), lon=slice(118, 124))
+        .isel(time=-1)
+        .load()
     )
-    url = base + params
 
-    try:
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-    except Exception as e:
-        st.error(f"HYCOM NCSS 下載失敗: {e}")
-        st.stop()
-
-    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-        tmp.write(r.content)
-        tmp_path = tmp.name
-
-    try:
-        ds = xr.open_dataset(tmp_path, decode_times=True)
-    except Exception as e:
-        os.unlink(tmp_path)
-        st.error(f"HYCOM NetCDF 解析失敗: {e}")
-        st.stop()
-
-    try:
-        obs_time = pd.Timestamp(ds["time"].values[-1])
-    except Exception:
-        obs_time = pd.Timestamp.now()
-
-    # NCSS 回傳座標可能是 lat/lon 或 latitude/longitude
-    lat_name = "lat" if "lat" in ds.coords else "latitude"
-    lon_name = "lon" if "lon" in ds.coords else "longitude"
-
-    sub = ds[["ssu", "ssv"]].isel(time=-1).load()
-
-    lons = sub[lon_name].values
-    lats = sub[lat_name].values
-
-    u_data = sub["ssu"].values.astype(float)
-    v_data = sub["ssv"].values.astype(float)
-
-    # 確保 2D（剝掉多餘的 depth 或其他維度）
-    while u_data.ndim > 2:
-        u_data = u_data[0]
-        v_data = v_data[0]
-
+    lons      = sub.lon.values
+    lats      = sub.lat.values
+    u_data    = sub["ssu"].values.astype(float)
+    v_data    = sub["ssv"].values.astype(float)
     land_mask = np.isnan(u_data)
-
-    ds.close()
-    os.unlink(tmp_path)
 
     return lons, lats, land_mask, obs_time, u_data, v_data
 
