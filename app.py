@@ -39,9 +39,20 @@ OFFSHORE_COST = 10
 
 # ===============================
 # Load HYCOM
+# 🆕 修正：原本直接抓資料集「最後一筆」時間（isel(time=-1)），
+#    這往往是資料集裡最新上傳/最遠的預報時間點，不一定對應「現在」，
+#    導致海流資料與實際當下時間錯開。
+#    改為：解析完整時間座標，找出「最接近目標時間(現在, UTC)」的索引，
+#    真正做到「當下」海流資料。
 # ===============================
 @st.cache_data(ttl=3600)
-def load_hycom():
+def load_hycom(target_dt_str, bbox=(21, 26, 118, 124)):
+    """
+    target_dt_str: ISO 字串（UTC），代表希望取得海流資料的目標時間。
+    bbox: (lat_min, lat_max, lon_min, lon_max)
+    """
+    target_dt = pd.Timestamp(target_dt_str, tz='UTC')
+    lat_min, lat_max, lon_min, lon_max = bbox
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
     try:
         ds = xr.open_dataset(url, decode_times=False)
@@ -49,24 +60,37 @@ def load_hycom():
         st.error(f"無法連接到 HYCOM 數據庫: {e}")
         st.stop()
 
+    # 解析時間座標，找出與 target_dt 最接近的時間索引，
+    # 而不是直接假設最後一筆就是「現在」
     if 'time_origin' in ds['time'].attrs:
         origin = pd.to_datetime(ds['time'].attrs['time_origin'])
-        obs_time = origin + pd.to_timedelta(ds['time'].values[-1], unit='h')
+        if origin.tzinfo is None:
+            origin = origin.tz_localize('UTC')
+        time_vals = origin + pd.to_timedelta(ds['time'].values, unit='h')
     else:
-        obs_time = pd.Timestamp.now()
+        ds_decoded = xr.decode_cf(ds)
+        time_vals = pd.DatetimeIndex(pd.to_datetime(ds_decoded['time'].values, utc=True))
 
-    sub = ds.sel(lat=slice(21, 26), lon=slice(118, 124))
+    time_vals = pd.DatetimeIndex(time_vals)
+    deltas = np.abs((time_vals - target_dt).total_seconds())
+    time_idx = int(np.argmin(deltas))
+    obs_time = time_vals[time_idx]
+
+    sub = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
     lons = sub.lon.values
     lats = sub.lat.values
 
-    # 預先加載最後一個時間步的海流數據，避免尋路時重複讀取網絡
-    u_data = sub['ssu'].isel(time=-1).values
-    v_data = sub['ssv'].isel(time=-1).values
+    # 加載「最接近目標時間」那個時間步的海流數據
+    u_data = sub['ssu'].isel(time=time_idx).values
+    v_data = sub['ssv'].isel(time=time_idx).values
     land_mask = np.isnan(u_data)
 
     return lons, lats, land_mask, obs_time, u_data, v_data
 
-lons, lats, land_mask, obs_time, hycom_u, hycom_v = load_hycom()
+# 以現在時間(UTC)為目標，向 HYCOM 要「最接近現在」的資料。
+# 對 cache key 取整到小時，避免每次重跑都因為秒數不同而重新連線。
+_target_dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00:00")
+lons, lats, land_mask, obs_time, hycom_u, hycom_v = load_hycom(_target_dt_str)
 sea_mask = ~land_mask
 dist_to_land = distance_transform_edt(sea_mask)
 
@@ -297,9 +321,19 @@ def offshore_penalty(y, x):
             return OFFSHORE_COST
     return 0
 
+# 🆕 修正：原本的懲罰只在距岸 2 個網格內生效，且最大只罰 4 分，
+#    相對於單步移動的基礎成本（約 10~15 分）幾乎可忽略，
+#    導致路徑經常貼著海岸線走。現在把安全距離拉大到 5 個網格
+#    （約 0.4 度 ≈ 40+ 公里），並改成平方成長的懲罰，
+#    使貼岸繞路的代價遠高於其可能換來的海流/風力好處。
+COAST_SAFE_CELLS = 5
+COAST_PENALTY_WEIGHT = 12
+
 def coast_penalty(y, x):
     d = dist_to_land[y, x]
-    return (2 - d) * 2 if d < 2 else 0
+    if d >= COAST_SAFE_CELLS:
+        return 0
+    return ((COAST_SAFE_CELLS - d) ** 2) * COAST_PENALTY_WEIGHT / COAST_SAFE_CELLS
 
 # 🆕 A* 啟發函數：以直線距離(km)估計剩餘成本下界，
 #    讓搜尋優先朝目標方向擴展，而非像原本的 Dijkstra 一樣全向均勻擴散
