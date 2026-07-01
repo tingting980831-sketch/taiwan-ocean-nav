@@ -38,20 +38,27 @@ OFFSHORE_WIND = [
 OFFSHORE_COST = 10
 
 # ===============================
-# Load HYCOM
-# 🆕 修正：原本直接抓資料集「最後一筆」時間（isel(time=-1)），
-#    這往往是資料集裡最新上傳/最遠的預報時間點，不一定對應「現在」，
-#    導致海流資料與實際當下時間錯開。
-#    改為：解析完整時間座標，找出「最接近目標時間(現在, UTC)」的索引，
-#    真正做到「當下」海流資料。
+# 🆕 Load HYCOM as a TIME SERIES (not a single snapshot)
+#
+# 問題背景：原本只抓「最接近現在」的單一時間切片，整個航程（可能好幾小時）
+# 全部套用同一組海流資料。但船開 2 小時，第 2 小時經過的海域海流早就不是
+# 「現在」的樣子了 —— 尤其台灣海峽潮流變化很快。
+#
+# 修正方式：一次抓未來 HYCOM_FORECAST_HOURS 小時內的所有時間切片，
+# 回傳完整的 3D 陣列 (time, lat, lon)，之後在計算成本/剩餘時間時，
+# 用「船預計幾點到達該點」去查對應時間的海流，而不是永遠查「現在」。
 # ===============================
+HYCOM_FORECAST_HOURS = 72  # 抓未來72小時的預報，涵蓋大多數航程長度
+
 @st.cache_data(ttl=3600)
-def load_hycom(target_dt_str, bbox=(21, 26, 118, 124)):
+def load_hycom_series(bbox=(21, 26, 118, 124), hours_ahead=HYCOM_FORECAST_HOURS):
     """
-    target_dt_str: ISO 字串（UTC），代表希望取得海流資料的目標時間。
-    bbox: (lat_min, lat_max, lon_min, lon_max)
+    回傳從「現在」開始，未來 hours_ahead 小時內的海流時間序列。
+    times_rel: 各時間切片相對於「現在」的小時數（可能含些微負值，
+               因為會保留最接近現在的那一筆做為 t=0 起點）
+    u_ts, v_ts: shape = (T, lat, lon)
     """
-    target_dt = pd.Timestamp(target_dt_str, tz='UTC')
+    now_utc = pd.Timestamp(datetime.now(timezone.utc))
     lat_min, lat_max, lon_min, lon_max = bbox
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
     try:
@@ -60,8 +67,6 @@ def load_hycom(target_dt_str, bbox=(21, 26, 118, 124)):
         st.error(f"無法連接到 HYCOM 數據庫: {e}")
         st.stop()
 
-    # 解析時間座標，找出與 target_dt 最接近的時間索引，
-    # 而不是直接假設最後一筆就是「現在」
     if 'time_origin' in ds['time'].attrs:
         origin = pd.to_datetime(ds['time'].attrs['time_origin'])
         if origin.tzinfo is None:
@@ -72,30 +77,61 @@ def load_hycom(target_dt_str, bbox=(21, 26, 118, 124)):
         time_vals = pd.DatetimeIndex(pd.to_datetime(ds_decoded['time'].values, utc=True))
 
     time_vals = pd.DatetimeIndex(time_vals)
-    deltas = np.abs((time_vals - target_dt).total_seconds())
-    time_idx = int(np.argmin(deltas))
-    obs_time = time_vals[time_idx]
+
+    # 找到「最接近現在」的索引當作序列起點 t=0，
+    # 然後往未來抓到 now + hours_ahead 為止
+    deltas = (time_vals - now_utc).total_seconds() / 3600.0
+    start_idx = int(np.argmin(np.abs(deltas)))
+    end_mask = deltas <= hours_ahead
+    # 確保至少從 start_idx 開始，且不超過資料集尾端
+    valid_idx = np.where(end_mask)[0]
+    valid_idx = valid_idx[valid_idx >= start_idx]
+    if len(valid_idx) == 0:
+        valid_idx = np.array([start_idx])
+    idx_slice = valid_idx  # 已經是遞增排序的索引陣列
 
     sub = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
     lons = sub.lon.values
     lats = sub.lat.values
 
-    # 加載「最接近目標時間」那個時間步的海流數據
-    u_data = sub['ssu'].isel(time=time_idx).values
-    v_data = sub['ssv'].isel(time=time_idx).values
-    land_mask = np.isnan(u_data)
+    u_ts = sub['ssu'].isel(time=idx_slice).values  # (T, lat, lon)
+    v_ts = sub['ssv'].isel(time=idx_slice).values
+    times_used = time_vals[idx_slice]
+    times_rel = np.array([(t - now_utc).total_seconds() / 3600.0 for t in times_used])
 
-    return lons, lats, land_mask, obs_time, u_data, v_data
+    # land_mask：用序列中「所有時間點皆為 NaN」的位置才視為陸地，
+    # 避免單一時間切片偶發缺值就被誤判為陸地
+    land_mask = np.all(np.isnan(u_ts), axis=0)
 
-# 以現在時間(UTC)為目標，向 HYCOM 要「最接近現在」的資料。
-# 對 cache key 取整到小時，避免每次重跑都因為秒數不同而重新連線。
-_target_dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00:00")
-lons, lats, land_mask, obs_time, hycom_u, hycom_v = load_hycom(_target_dt_str)
+    return lons, lats, land_mask, times_rel, times_used, u_ts, v_ts
+
+
+with st.spinner("載入 HYCOM 海流時間序列中..."):
+    lons, lats, land_mask, hycom_times_rel, hycom_times_abs, hycom_u_ts, hycom_v_ts = load_hycom_series()
+
 sea_mask = ~land_mask
 dist_to_land = distance_transform_edt(sea_mask)
 
+# 🆕 給地圖顯示與各種「現在這一刻」用途使用的索引（最接近 t=0 的切片）
+_now_idx = int(np.argmin(np.abs(hycom_times_rel)))
+obs_time = hycom_times_abs[_now_idx]
+hycom_u = hycom_u_ts[_now_idx]  # 保留給地圖繪製用的「現在」快照
+hycom_v = hycom_v_ts[_now_idx]
+
+
+def get_current_at(y, x, elapsed_hours):
+    """
+    依「從現在起算的航行時數」取得對應時間切片的海流值。
+    這是解決「開2小時、海流資料卻沒變」問題的核心函式。
+    """
+    idx = int(np.argmin(np.abs(hycom_times_rel - elapsed_hours)))
+    return float(hycom_u_ts[idx, y, x]), float(hycom_v_ts[idx, y, x])
+
+
 # ===============================
 # 風場 + 波浪資料
+# （目前仍為單一時間切片 f000，若航程很長，未來可比照海流做法
+#   改抓多個預報時效 f000/f003/f006... 一併時間內插，先不在此次修正範圍）
 # ===============================
 @st.cache_data(ttl=3600)
 def fetch_weather():
@@ -149,7 +185,6 @@ def fetch_weather():
         wlats = ds_w["latitude"].values
         wlons = ds_w["longitude"].values
 
-        # 🆕 完整波浪方向 grid（用於方向投影，取代單點 dirpw）
         try:
             dirpw_grid = ds_w["dirpw"].values
         except Exception:
@@ -176,7 +211,7 @@ def fetch_weather():
             "swh":        float(ds_w["swh"].isel(latitude=lat_idx, longitude=lon_idx).values),
             "dirpw":      float(ds_w["dirpw"].isel(latitude=lat_idx, longitude=lon_idx).values),
             "swh_grid":   swh_grid,
-            "dirpw_grid": dirpw_grid,   # 🆕
+            "dirpw_grid": dirpw_grid,
             "lats":       wlats,
             "lons":       wlons,
         }
@@ -235,9 +270,6 @@ with st.sidebar:
     e_lat = st.number_input("End Lat", 21.0, 26.0, 24.5)
     ship_speed = st.number_input("Ship Speed (km/h)", 1.0, 60.0, 20.0)
 
-    # 🆕 修正：改用滑桿直接控制目前航行進度，比逐格點擊直覺，
-    #    也讓儀表板數字的變化明顯可見（原本每次只走1格，
-    #    在幾百格的長路徑上幾乎感覺不到變化）
     st.divider()
     progress_pct = st.slider("航行進度 (%)", 0, 100, 0, key="progress_slider")
     st.button("Next Step (+1小時航程)", key="next_step")
@@ -245,7 +277,6 @@ with st.sidebar:
     st.divider()
     st.subheader("🧬 船型自適應環境優化模式")
 
-    # 僅保留專業選項切換，後台自動注入黃金權重
     ship_mode = st.radio(
         "選擇航行船舶類型 (Ship Profile):",
         options=["大型貨輪/油輪 (CargoTanker)", "小型漁船 (Fishing)", "其他公務/客輪 (Other)"],
@@ -253,9 +284,6 @@ with st.sidebar:
         help="系統將根據不同船型的流體動力學與環境特徵，自動載入最優化權重矩陣。"
     )
 
-    # 後台靜態注入權重參數（不顯示於前端）
-    # 🆕 修正：降低海流/風力獎勵的相對權重，避免演算法為了
-    #    「套利」海流而犧牲路徑直線度，導致貼岸繞路
     if "CargoTanker" in ship_mode:
         w_curr = 0.25
         w_wave = 0.35
@@ -273,14 +301,7 @@ with st.sidebar:
         ship_type_key = "Other"
 
 # ===============================
-# 🆕 船型物理參數（移植自文件1 SHIP_PARAMS，並調整 distance_factor / time_weight）
-# 註：船速本系統由使用者手動輸入(ship_speed)，故不覆寫 speed
-#
-# 🆕 修正重點：
-#   1. distance_factor 大幅提高 —— 原本 0.3 太低，代表「多繞路」幾乎不用付代價，
-#      演算法會為了搭到海流順風而繞遠路貼著海岸走。拉高後路徑會更接近直線。
-#   2. time_weight 略降 —— 原本 5.0 過度放大「搭順流省下的時間」帶來的成本降低，
-#      進一步助長繞路套利行為。
+# 船型物理參數
 # ===============================
 SHIP_PARAMS = {
     'CargoTanker': {
@@ -302,10 +323,8 @@ SHIP_PARAMS = {
         'progress_weight': 2.0, 'wave_coef': 0.06,
     },
 }
-# 波浪嚴重度：貨輪對大浪更敏感（比照文件1 wave_severity 邏輯）
 wave_severity = 3.0 if ship_type_key == 'CargoTanker' else 1.0
 
-# 🆕 海流/風力投影的獎勵上限（km/h），避免演算法無限套利遠繞路徑
 MAX_CURRENT_BONUS = 2.0
 MAX_WIND_BONUS = 3.0
 
@@ -321,40 +340,50 @@ def offshore_penalty(y, x):
             return OFFSHORE_COST
     return 0
 
-# 🆕 修正：原本的懲罰只在距岸 2 個網格內生效，且最大只罰 4 分，
-#    相對於單步移動的基礎成本（約 10~15 分）幾乎可忽略，
-#    導致路徑經常貼著海岸線走。現在把安全距離拉大到 5 個網格
-#    （約 0.4 度 ≈ 40+ 公里），並改成平方成長的懲罰，
-#    使貼岸繞路的代價遠高於其可能換來的海流/風力好處。
-COAST_SAFE_CELLS = 5
-COAST_PENALTY_WEIGHT = 12
+# ===============================
+# 🆕 離岸安全距離：改用「實際公里數」校正，不再假設固定網格解析度
+#
+# 問題背景：舊版本直接寫死「5個網格」當安全距離，並註解假設 1 格 ≈ 8-9km。
+# 但如果 HYCOM 實際網格解析度不同（不同資料源/不同版本可能不一樣），
+# 這個假設就會失準，安全距離可能遠小於 40 公里，導致路徑還是貼著海岸走。
+#
+# 修正：直接用經緯度陣列算出「每格實際大約多少公里」，再反推要多少格
+# 才等於我們要的安全公里數。同時把懲罰權重拉高、指數拉高（平方->立方），
+# 讓貼岸的代價曲線在接近岸邊時急遽升高。
+# ===============================
+COAST_SAFE_KM = 18  # 想要的離岸安全距離（公里），可依實際需求調整
+_lat_res = float(np.abs(np.diff(lats)).mean()) if len(lats) > 1 else 0.05
+_lon_res = float(np.abs(np.diff(lons)).mean()) if len(lons) > 1 else 0.05
+CELL_KM = ((_lat_res + _lon_res) / 2) * 111.0
+COAST_SAFE_CELLS = max(3.0, COAST_SAFE_KM / max(CELL_KM, 1e-6))
+COAST_PENALTY_WEIGHT = 30
 
 def coast_penalty(y, x):
     d = dist_to_land[y, x]
     if d >= COAST_SAFE_CELLS:
         return 0
-    return ((COAST_SAFE_CELLS - d) ** 2) * COAST_PENALTY_WEIGHT / COAST_SAFE_CELLS
+    # 立方成長：越接近岸邊，代價升高得越陡，比平方更能壓制貼岸繞路
+    return ((COAST_SAFE_CELLS - d) ** 3) * COAST_PENALTY_WEIGHT / (COAST_SAFE_CELLS ** 2)
 
-# 🆕 A* 啟發函數：以直線距離(km)估計剩餘成本下界，
-#    讓搜尋優先朝目標方向擴展，而非像原本的 Dijkstra 一樣全向均勻擴散
-#    （這正是原本路徑容易被局部海流獎勵帶偏、繞去貼岸的關鍵原因之一）
 def heuristic(y, x, goal):
     d = np.hypot(lats[y] - lats[goal[0]], lons[x] - lons[goal[1]]) * 111
-    # 乘上目前船型的 distance_factor，維持與實際 g(n) 同一量綱，
-    # 且略微保守（乘 0.9）以確保 admissible，不會漏掉更優路徑
     return d * SHIP_PARAMS[ship_type_key]['distance_factor'] * 0.9
 
-# 🆕 綜合成本函數（移植自文件1 get_comprehensive_cost）
-# 涵蓋：實際距離(km)、進度懲罰、海流/風/波浪投影、effective_speed、時間成本、燃油成本
-def get_comprehensive_cost(y0, x0, y1, x1, goal):
+# ===============================
+# 🆕 綜合成本函數 — 加入 elapsed_hours 參數
+# 現在會依「船預計幾點會走到這一步」去查對應時間的海流資料，
+# 而不是永遠查「現在」這一份快照。
+# 回傳 (cost, segment_time_hours)，segment_time_hours 用來累加下一步的 elapsed_hours。
+# ===============================
+def get_comprehensive_cost(y0, x0, y1, x1, goal, elapsed_hours):
     dlat = lats[y1] - lats[y0]
     dlon = lons[x1] - lons[x0]
     norm = np.hypot(dlat, dlon)
     if norm == 0:
-        return 0
+        return 0, 0.0
     dir_lat = dlat / norm
     dir_lon = dlon / norm
-    base_dist = norm * 111  # 度 -> km（近似）
+    base_dist = norm * 111
 
     p = SHIP_PARAMS[ship_type_key]
     distance_factor = p['distance_factor']
@@ -366,27 +395,21 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
     progress_weight = p['progress_weight']
     wave_coef       = p['wave_coef']
 
-    # 進度懲罰：避免路徑繞遠離目標點
-    # 🆕 修正：原本只罰「離目標變遠」，對「橫向繞行、直線距離幾乎不變」的
-    #    貼岸移動完全沒有懲罰效果。現在改用「這一步實際走的距離」與
-    #    「真正朝目標前進的距離」之差來罰，橫向繞路也會被扣分。
     progress_penalty = 0
     if goal is not None:
         d_before = np.hypot(lats[y0]-lats[goal[0]], lons[x0]-lons[goal[1]]) * 111
         d_after  = np.hypot(lats[y1]-lats[goal[0]], lons[x1]-lons[goal[1]]) * 111
-        forward_progress = d_before - d_after  # 正值代表真的往目標前進了
+        forward_progress = d_before - d_after
         progress_penalty = max(base_dist - forward_progress, 0) * progress_weight * 0.3
 
-    # 海流投影（🆕 加上獎勵上限，避免無限套利遠路）
+    # 🆕 海流投影：改用 elapsed_hours 對應的時間切片，而非固定的「現在」
     current_proj = 0.0
-    u_cur = float(hycom_u[y0, x0])
-    v_cur = float(hycom_v[y0, x0])
+    u_cur, v_cur = get_current_at(y0, x0, elapsed_hours)
     if not np.isnan(u_cur) and not np.isnan(v_cur):
-        current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  # m/s -> km/h
+        current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
     current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
     current_cost = -current_bonus * current_gain
 
-    # 風場投影（🆕 加上獎勵上限）
     wind_proj = 0.0
     wind_cost = 0.0
     if weather and weather.get("wind"):
@@ -398,7 +421,6 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
         wind_bonus = min(max(wind_proj, -MAX_WIND_BONUS), MAX_WIND_BONUS)
         wind_cost = -wind_bonus * wind_gain
 
-    # 波浪（含方向投影）
     wave_cost = 0.0
     wave_slowdown = 1.0
     wave_proj = 0.0
@@ -422,13 +444,13 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
             wave_cost = swh ** 2 * wave_severity * max(
                 1.0 - wave_proj if has_dir else 1.0, 0)
 
-    # effective_speed：綜合海流推力／風力／波浪減速（使用已限幅後的 bonus）
     effective_speed = (ship_speed + current_bonus * current_gain +
                         wind_proj * wind_speed_gain * 0.5) / wave_slowdown
     effective_speed = max(effective_speed, 2.0)
 
-    time_cost = (base_dist / effective_speed) * time_weight
-    fuel_cost = (40 + 0.5 * effective_speed) * (base_dist / effective_speed) * fuel_weight
+    segment_time_hours = base_dist / effective_speed
+    time_cost = segment_time_hours * time_weight
+    fuel_cost = (40 + 0.5 * effective_speed) * segment_time_hours * fuel_weight
 
     total_cost = (
         base_dist * distance_factor +
@@ -439,14 +461,14 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
         progress_penalty +
         coast_penalty(y1, x1)
     )
-    return max(total_cost, 0.05)
+    return max(total_cost, 0.05), segment_time_hours
 
 # ===============================
-# A* Pathfinding
-# 🆕 修正：原本的 heapq 只推入 g(n)（純累積成本），沒有加上 heuristic，
-#    本質上是 Dijkstra 全向均勻擴散，容易被局部的海流/風力獎勵帶偏，
-#    導致繞去貼岸走。現在改成真正的 A*：f(n) = g(n) + h(n)，
-#    cost 字典仍儲存純 g(n) 以確保正確性，priority queue 用 f(n) 排序。
+# 🆕 A* Pathfinding — 同步追蹤「累積航行時間」
+# 這是時間相依最短路徑（time-dependent shortest path）的核心：
+# 每次鬆弛（relax）節點時，不只更新累積成本 cost[node]，
+# 也同步更新「船預計到達這個節點時，從現在起算過了幾小時」elapsed_time[node]，
+# 下一步查海流資料時就用這個值去對應正確的時間切片。
 # ===============================
 dirs = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
 
@@ -455,6 +477,7 @@ def astar(start, goal):
     pq = [(heuristic(start[0], start[1], goal), start)]
     came = {}
     cost = {start: 0}
+    elapsed_time = {start: 0.0}  # 🆕 從現在起算的累積航行小時數
 
     while pq:
         _, cur = heapq.heappop(pq)
@@ -463,13 +486,16 @@ def astar(start, goal):
         for d in dirs:
             ni, nj = cur[0]+d[0], cur[1]+d[1]
             if 0 <= ni < rows and 0 <= nj < cols and not land_mask[ni, nj]:
-                # 🆕 綜合成本(距離+進度懲罰+海流/風/波浪+時間/燃油) + 離岸風場懲罰
-                step_cost = get_comprehensive_cost(cur[0], cur[1], ni, nj, goal) + offshore_penalty(ni, nj)
+                step_cost, seg_time = get_comprehensive_cost(
+                    cur[0], cur[1], ni, nj, goal, elapsed_time[cur]
+                )
+                step_cost += offshore_penalty(ni, nj)
 
                 new_g = cost[cur] + step_cost
 
                 if (ni, nj) not in cost or new_g < cost[(ni, nj)]:
                     cost[(ni, nj)] = new_g
+                    elapsed_time[(ni, nj)] = elapsed_time[cur] + seg_time  # 🆕
                     came[(ni, nj)] = cur
                     f = new_g + heuristic(ni, nj, goal)
                     heapq.heappush(pq, (f, (ni, nj)))
@@ -499,7 +525,7 @@ goal  = nearest_cell(e_lon, e_lat)
 route_key = (s_lon, s_lat, e_lon, e_lat, ship_mode)
 
 if st.session_state.route_key != route_key:
-    with st.spinner("HELIOS 尋路引擎正依據船型特徵進行最優解算..."):
+    with st.spinner("HELIOS 尋路引擎正依據船型特徵與逐時海流變化進行最優解算..."):
         new_path = astar(start, goal)
     if len(new_path) == 0:
         st.error("❌ 無法在當前海況與船型設定下找到安全航線")
@@ -513,18 +539,12 @@ path = st.session_state.full_path
 if path:
     st.session_state.ship_step_idx = min(st.session_state.ship_step_idx, len(path)-1)
 
-# 🆕 修正：滑桿直接對應路徑進度（百分比 -> index），
-#    數字會隨拖曳即時大幅變化，不再有「動不動」的問題
 if path:
     slider_idx = int((progress_pct / 100) * (len(path) - 1))
     st.session_state.ship_step_idx = slider_idx
 
-# 🆕 修正：Next Step 原本每次只推進 1 個網格（在幾百格的長路徑上
-#    幾乎感覺不到儀表板數字變化）。現在依「目前剩餘時間 / 剩餘格數」
-#    估算出「大約 1 小時航程」對應的格數，一次前進這麼多格。
 if st.session_state.get("next_step") and path and st.session_state.ship_step_idx < len(path) - 1:
     remaining_steps = len(path) - 1 - st.session_state.ship_step_idx
-    # 用剩餘距離/剩餘格數估計平均每格距離，再抓大約1小時的份量
     approx_speed = max(ship_speed, 2.0)
     steps_per_hour = max(1, int(remaining_steps / max(1, int(approx_speed / 20))))
     st.session_state.ship_step_idx = min(
@@ -537,76 +557,88 @@ if not path:
 current_pos = path[st.session_state.ship_step_idx]
 
 # ===============================
-# Calculations
-# 🆕 改用與 get_comprehensive_cost 一致的 effective_speed / wave_slowdown 邏輯
-#    （波浪方向投影 + current_gain/wind_speed_gain，取代舊的門檻式減速），
-#    並同樣對海流/風力 bonus 加上限幅，避免時間估算被局部套利誇大。
+# 🆕 Calculations — 剩餘距離/時間計算也改用逐時海流
+#
+# 邏輯：先從路徑起點開始，依序累加每一段的航行時間，算出船抵達
+# 目前位置（ship_step_idx）時，從現在算起已經過了幾小時；接著從
+# 目前位置繼續往後累加剩餘路段，每一段都用「船屆時預計的時刻」
+# 去查對應的海流資料，而不是整段航程都套用「現在」這一份。
 # ===============================
-def calc_remaining(path, idx):
+def calc_segment(y0, x0, y1, x1, elapsed_hours):
     p = SHIP_PARAMS[ship_type_key]
     current_gain    = p['current_gain']
     wind_speed_gain = p['wind_speed_gain']
     wave_coef       = p['wave_coef']
 
-    dist = 0
-    total_time = 0
+    seg_dist = np.hypot(lats[y1]-lats[y0], lons[x1]-lons[x0]) * 111
+    dlat = lats[y1] - lats[y0]
+    dlon = lons[x1] - lons[x0]
+    norm = np.hypot(dlat, dlon)
+    if norm == 0:
+        return 0.0, 0.0
 
+    dir_lat = dlat / norm
+    dir_lon = dlon / norm
+
+    current_proj = 0.0
+    u_cur, v_cur = get_current_at(y0, x0, elapsed_hours)  # 🆕 依時間查海流
+    if not np.isnan(u_cur) and not np.isnan(v_cur):
+        current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
+    current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
+
+    wind_proj = 0.0
+    if weather and weather.get("wind"):
+        wnd = weather["wind"]
+        wi = np.abs(wnd["lats"] - lats[y0]).argmin()
+        wj = np.abs(wnd["lons"] - lons[x0]).argmin()
+        wind_proj = (float(wnd["u"][wi, wj]) * dir_lon +
+                     float(wnd["v"][wi, wj]) * dir_lat) * 3.6
+
+    wave_slowdown = 1.0
+    if weather and weather.get("wave"):
+        w = weather["wave"]
+        wi = np.abs(w["lats"] - lats[y0]).argmin()
+        wj = np.abs(w["lons"] - lons[x0]).argmin()
+        swh = w["swh_grid"][wi, wj]
+        if not np.isnan(swh) and swh > 0:
+            dirpw_grid = w.get("dirpw_grid")
+            has_dir = dirpw_grid is not None and not np.isnan(dirpw_grid[wi, wj])
+            if has_dir:
+                wave_dir_rad = np.radians(dirpw_grid[wi, wj] + 180.0)
+                wave_proj = (np.sin(wave_dir_rad) * dir_lon +
+                             np.cos(wave_dir_rad) * dir_lat)
+                wave_slowdown = 1.0 - wave_proj * swh * wave_coef
+                wave_slowdown = max(0.5, min(wave_slowdown, 1.5))
+            else:
+                wave_slowdown = 1.0 + swh * wave_coef
+
+    effective_speed = (ship_speed + current_bonus * current_gain +
+                        wind_proj * wind_speed_gain * 0.5) / wave_slowdown
+    effective_speed = max(effective_speed, 2.0)
+
+    seg_time = seg_dist / effective_speed
+    return seg_dist, seg_time
+
+
+def calc_remaining(path, idx):
+    # 先把起點到目前位置的累積航行時間算出來，
+    # 這樣才知道「現在」船已經航行了幾小時，剩餘段落要從這個時間點繼續查海流
+    elapsed = 0.0
+    for i in range(0, idx):
+        y0, x0 = path[i]
+        y1, x1 = path[i + 1]
+        _, seg_time = calc_segment(y0, x0, y1, x1, elapsed)
+        elapsed += seg_time
+
+    dist = 0.0
+    total_time = 0.0
     for i in range(idx, len(path) - 1):
         y0, x0 = path[i]
         y1, x1 = path[i + 1]
-
-        seg_dist = np.hypot(lats[y1]-lats[y0], lons[x1]-lons[x0]) * 111
-
-        dlat = lats[y1] - lats[y0]
-        dlon = lons[x1] - lons[x0]
-        norm = np.hypot(dlat, dlon)
-        if norm == 0:
-            continue
-        dir_lat = dlat / norm
-        dir_lon = dlon / norm
-
-        # 海流投影（限幅）
-        current_proj = 0.0
-        u_cur = float(hycom_u[y0, x0])
-        v_cur = float(hycom_v[y0, x0])
-        if not np.isnan(u_cur) and not np.isnan(v_cur):
-            current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
-        current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
-
-        # 風場投影
-        wind_proj = 0.0
-        if weather and weather.get("wind"):
-            wnd = weather["wind"]
-            wi = np.abs(wnd["lats"] - lats[y0]).argmin()
-            wj = np.abs(wnd["lons"] - lons[x0]).argmin()
-            wind_proj = (float(wnd["u"][wi, wj]) * dir_lon +
-                         float(wnd["v"][wi, wj]) * dir_lat) * 3.6
-
-        # 波浪方向投影 -> 失速/加速倍率
-        wave_slowdown = 1.0
-        if weather and weather.get("wave"):
-            w = weather["wave"]
-            wi = np.abs(w["lats"] - lats[y0]).argmin()
-            wj = np.abs(w["lons"] - lons[x0]).argmin()
-            swh = w["swh_grid"][wi, wj]
-            if not np.isnan(swh) and swh > 0:
-                dirpw_grid = w.get("dirpw_grid")
-                has_dir = dirpw_grid is not None and not np.isnan(dirpw_grid[wi, wj])
-                if has_dir:
-                    wave_dir_rad = np.radians(dirpw_grid[wi, wj] + 180.0)
-                    wave_proj = (np.sin(wave_dir_rad) * dir_lon +
-                                 np.cos(wave_dir_rad) * dir_lat)
-                    wave_slowdown = 1.0 - wave_proj * swh * wave_coef
-                    wave_slowdown = max(0.5, min(wave_slowdown, 1.5))
-                else:
-                    wave_slowdown = 1.0 + swh * wave_coef
-
-        effective_speed = (ship_speed + current_bonus * current_gain +
-                            wind_proj * wind_speed_gain * 0.5) / wave_slowdown
-        effective_speed = max(effective_speed, 2.0)
-
+        seg_dist, seg_time = calc_segment(y0, x0, y1, x1, elapsed)
         dist += seg_dist
-        total_time += seg_dist / effective_speed
+        total_time += seg_time
+        elapsed += seg_time  # 🆕 持續往前推進「船目前預計時刻」
 
     if idx < len(path) - 1:
         y0, x0 = path[idx]
@@ -647,7 +679,8 @@ if weather and weather.get("wind"):
 else:
     w3.metric("風速（中心）", "N/A")
 
-st.caption(f"HYCOM observation time: {obs_time}")
+st.caption(f"HYCOM observation time (t=0 快照): {obs_time} ｜ 已載入 {len(hycom_times_rel)} 個時間切片，涵蓋未來 {HYCOM_FORECAST_HOURS} 小時")
+st.caption(f"離岸安全距離：約 {COAST_SAFE_KM} km（換算約 {COAST_SAFE_CELLS:.1f} 個網格，每格約 {CELL_KM:.1f} km）")
 
 # ===============================
 # Map
@@ -658,7 +691,7 @@ ax.set_extent([118, 124, 21, 26])
 ax.add_feature(cfeature.LAND,       facecolor="#b0b0b0")
 ax.add_feature(cfeature.COASTLINE)
 
-# 海流
+# 海流（顯示「現在」的快照）
 try:
     speed_cur = np.sqrt(hycom_u**2 + hycom_v**2)
     mesh = ax.pcolormesh(lons, lats, speed_cur,
