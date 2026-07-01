@@ -58,7 +58,7 @@ def load_hycom():
     sub = ds.sel(lat=slice(21, 26), lon=slice(118, 124))
     lons = sub.lon.values
     lats = sub.lat.values
-    
+
     # 預先加載最後一個時間步的海流數據，避免尋路時重複讀取網絡
     u_data = sub['ssu'].isel(time=-1).values
     v_data = sub['ssv'].isel(time=-1).values
@@ -125,6 +125,12 @@ def fetch_weather():
         wlats = ds_w["latitude"].values
         wlons = ds_w["longitude"].values
 
+        # 🆕 完整波浪方向 grid（用於方向投影，取代單點 dirpw）
+        try:
+            dirpw_grid = ds_w["dirpw"].values
+        except Exception:
+            dirpw_grid = None
+
         lat_idx = np.abs(wlats - 24.0).argmin()
         lon_idx = np.abs(wlons - 122.0).argmin()
         found = False
@@ -143,11 +149,12 @@ def fetch_weather():
                 break
 
         result["wave"] = {
-            "swh":      float(ds_w["swh"].isel(latitude=lat_idx, longitude=lon_idx).values),
-            "dirpw":    float(ds_w["dirpw"].isel(latitude=lat_idx, longitude=lon_idx).values),
-            "swh_grid": swh_grid,
-            "lats":     wlats,
-            "lons":     wlons,
+            "swh":        float(ds_w["swh"].isel(latitude=lat_idx, longitude=lon_idx).values),
+            "dirpw":      float(ds_w["dirpw"].isel(latitude=lat_idx, longitude=lon_idx).values),
+            "swh_grid":   swh_grid,
+            "dirpw_grid": dirpw_grid,   # 🆕
+            "lats":       wlats,
+            "lons":       wlons,
         }
         ds_w.close()
         os.unlink(tmp_path)
@@ -194,7 +201,7 @@ with st.spinner("載入氣象資料中..."):
     weather = fetch_weather()
 
 # ===============================
-# Sidebar (已移除權重與特徵面板)
+# Sidebar
 # ===============================
 with st.sidebar:
     st.header("Route Settings")
@@ -207,7 +214,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🧬 船型自適應環境優化模式")
-    
+
     # 僅保留專業選項切換，後台自動注入黃金權重
     ship_mode = st.radio(
         "選擇航行船舶類型 (Ship Profile):",
@@ -221,18 +228,44 @@ with st.sidebar:
         w_curr = 0.452
         w_wave = 0.431
         w_wind = 0.117
+        ship_type_key = "CargoTanker"
     elif "Fishing" in ship_mode:
         w_curr = 0.265
         w_wave = 0.513
         w_wind = 0.222
-    else: # Other
+        ship_type_key = "Fishing"
+    else:  # Other
         w_curr = 0.380
         w_wave = 0.410
         w_wind = 0.210
+        ship_type_key = "Other"
 
-    # 設定恆定的基礎物理比對參數
-    wave_threshold = 2.0  # 基礎浪高門檻
-    wave_weight = 2.0     # 基礎波浪懲罰權重
+# ===============================
+# 🆕 船型物理參數（移植自文件1 SHIP_PARAMS）
+# 註：船速本系統由使用者手動輸入(ship_speed)，故不覆寫 speed
+# ===============================
+SHIP_PARAMS = {
+    'CargoTanker': {
+        'distance_factor': 0.3, 'current_gain': 1.0,
+        'wind_gain': 1.0, 'wind_speed_gain': 1.0,
+        'time_weight': 5.0, 'fuel_weight': 0.20,
+        'progress_weight': 0.6, 'wave_coef': 0.08,
+    },
+    'Fishing': {
+        'distance_factor': 0.75, 'current_gain': 0.5,
+        'wind_gain': 0.5, 'wind_speed_gain': 0.5,
+        'time_weight': 3.0, 'fuel_weight': 0.15,
+        'progress_weight': 2.0, 'wave_coef': 0.05,
+    },
+    'Other': {
+        'distance_factor': 0.9, 'current_gain': 0.3,
+        'wind_gain': 0.2, 'wind_speed_gain': 0.2,
+        'time_weight': 2.0, 'fuel_weight': 0.08,
+        'progress_weight': 1.5, 'wave_coef': 0.06,
+    },
+}
+# 波浪嚴重度：貨輪對大浪更敏感（比照文件1 wave_severity 邏輯）
+wave_severity = 3.0 if ship_type_key == 'CargoTanker' else 1.0
 
 # ===============================
 # Helpers
@@ -250,8 +283,9 @@ def coast_penalty(y, x):
     d = dist_to_land[y, x]
     return (2 - d) * 2 if d < 2 else 0
 
-# 🌟 A* 尋路專用的三介面動態代價計算
-def get_environmental_cost(y0, x0, y1, x1):
+# 🆕 綜合成本函數（移植自文件1 get_comprehensive_cost）
+# 涵蓋：實際距離(km)、進度懲罰、海流/風/波浪投影、effective_speed、時間成本、燃油成本
+def get_comprehensive_cost(y0, x0, y1, x1, goal):
     dlat = lats[y1] - lats[y0]
     dlon = lons[x1] - lons[x0]
     norm = np.hypot(dlat, dlon)
@@ -259,43 +293,90 @@ def get_environmental_cost(y0, x0, y1, x1):
         return 0
     dir_lat = dlat / norm
     dir_lon = dlon / norm
+    base_dist = norm * 111  # 度 -> km（近似）
 
-    # 1. 海流代價（使用已記憶體對齊的 hycom_u / hycom_v）
-    current_cost = 0
+    p = SHIP_PARAMS[ship_type_key]
+    distance_factor = p['distance_factor']
+    current_gain    = p['current_gain']
+    wind_gain       = p['wind_gain']
+    wind_speed_gain = p['wind_speed_gain']
+    time_weight     = p['time_weight']
+    fuel_weight     = p['fuel_weight']
+    progress_weight = p['progress_weight']
+    wave_coef       = p['wave_coef']
+
+    # 進度懲罰：避免路徑繞遠離目標點
+    progress_penalty = 0
+    if goal is not None:
+        d_before = np.hypot(lats[y0]-lats[goal[0]], lons[x0]-lons[goal[1]]) * 111
+        d_after  = np.hypot(lats[y1]-lats[goal[0]], lons[x1]-lons[goal[1]]) * 111
+        progress_penalty = max(d_after - d_before, 0) * progress_weight
+
+    # 海流投影
+    current_proj = 0.0
     u_cur = float(hycom_u[y0, x0])
     v_cur = float(hycom_v[y0, x0])
     if not np.isnan(u_cur) and not np.isnan(v_cur):
-        current_proj = (u_cur * dir_lon + v_cur * dir_lat)
-        current_cost = -current_proj * 5.0
+        current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  # m/s -> km/h
+    current_cost = -current_proj * current_gain
 
-    # 2. 波浪代價
-    wave_cost = 0
+    # 風場投影
+    wind_proj = 0.0
+    wind_cost = 0.0
+    if weather and weather.get("wind"):
+        wnd = weather["wind"]
+        wi = np.abs(wnd["lats"] - lats[y0]).argmin()
+        wj = np.abs(wnd["lons"] - lons[x0]).argmin()
+        wind_proj = (float(wnd["u"][wi, wj]) * dir_lon +
+                     float(wnd["v"][wi, wj]) * dir_lat) * 3.6
+        wind_cost = -wind_proj * wind_gain
+
+    # 波浪（含方向投影）
+    wave_cost = 0.0
+    wave_slowdown = 1.0
+    wave_proj = 0.0
     if weather and weather.get("wave"):
         w = weather["wave"]
         wi = np.abs(w["lats"] - lats[y0]).argmin()
         wj = np.abs(w["lons"] - lons[x0]).argmin()
         swh = w["swh_grid"][wi, wj]
-        if not np.isnan(swh) and swh > wave_threshold:
-            wave_cost = ((swh - wave_threshold) ** 2) * wave_weight
+        if not np.isnan(swh) and swh > 0:
+            dirpw_grid = w.get("dirpw_grid")
+            has_dir = dirpw_grid is not None and not np.isnan(dirpw_grid[wi, wj])
+            if has_dir:
+                wave_dir_rad = np.radians(dirpw_grid[wi, wj] + 180.0)
+                wave_dir_lon = np.sin(wave_dir_rad)
+                wave_dir_lat = np.cos(wave_dir_rad)
+                wave_proj = wave_dir_lon * dir_lon + wave_dir_lat * dir_lat
+                wave_slowdown = 1.0 - wave_proj * swh * wave_coef
+                wave_slowdown = max(0.5, min(wave_slowdown, 1.5))
+            else:
+                wave_slowdown = 1.0 + swh * wave_coef
+            wave_cost = swh ** 2 * wave_severity * max(
+                1.0 - wave_proj if has_dir else 1.0, 0)
 
-    # 3. 風場代價
-    wind_cost = 0
-    if weather and weather.get("wind"):
-        wnd = weather["wind"]
-        wi = np.abs(wnd["lats"] - lats[y0]).argmin()
-        wj = np.abs(wnd["lons"] - lons[x0]).argmin()
-        u_wnd = float(wnd["u"][wi, wj])
-        v_wnd = float(wnd["v"][wi, wj])
-        wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat)
-        wind_cost = max(-wind_proj * 0.5, 0)
+    # effective_speed：綜合海流推力／風力／波浪減速
+    effective_speed = (ship_speed + current_proj * current_gain +
+                        wind_proj * wind_speed_gain * 0.5) / wave_slowdown
+    effective_speed = max(effective_speed, 2.0)
 
-    fused_env_cost = (current_cost * w_curr) + (wave_cost * w_wave) + (wind_cost * w_wind)
-    return fused_env_cost
+    time_cost = (base_dist / effective_speed) * time_weight
+    fuel_cost = (40 + 0.5 * effective_speed) * (base_dist / effective_speed) * fuel_weight
+
+    total_cost = (
+        base_dist * distance_factor +
+        current_cost * w_curr +
+        wind_cost * w_wind +
+        wave_cost * w_wave +
+        time_cost + fuel_cost +
+        progress_penalty +
+        coast_penalty(y1, x1)
+    )
+    return max(total_cost, 0.05)
 
 # ===============================
-# A* Pathfinding (🧠 方向修正與負權防禦)
+# A* Pathfinding
 # ===============================
-# 🔧 修正：補上左下角 (-1, -1)，移除重複的 (-1, 1)
 dirs = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
 
 def astar(start, goal):
@@ -311,16 +392,11 @@ def astar(start, goal):
         for d in dirs:
             ni, nj = cur[0]+d[0], cur[1]+d[1]
             if 0 <= ni < rows and 0 <= nj < cols and not land_mask[ni, nj]:
-                base = np.hypot(d[0], d[1])
-                env_penalty = get_environmental_cost(cur[0], cur[1], ni, nj)
-                
-                # 🔧 修正：限制單步總代價最低不可小於 0.05，防止負權重擊穿 A* 機制
-                step_cost = base + offshore_penalty(ni, nj) + coast_penalty(ni, nj) + env_penalty
-                if step_cost < 0.05:
-                    step_cost = 0.05
-                    
+                # 🆕 綜合成本(距離+進度懲罰+海流/風/波浪+時間/燃油) + 離岸風場懲罰
+                step_cost = get_comprehensive_cost(cur[0], cur[1], ni, nj, goal) + offshore_penalty(ni, nj)
+
                 new = cost[cur] + step_cost
-                       
+
                 if (ni, nj) not in cost or new < cost[(ni, nj)]:
                     cost[(ni, nj)] = new
                     came[(ni, nj)] = cur
@@ -376,8 +452,15 @@ current_pos = path[st.session_state.ship_step_idx]
 
 # ===============================
 # Calculations
+# 🆕 改用與 get_comprehensive_cost 一致的 effective_speed / wave_slowdown 邏輯
+#    （波浪方向投影 + current_gain/wind_speed_gain，取代舊的門檻式減速）
 # ===============================
 def calc_remaining(path, idx):
+    p = SHIP_PARAMS[ship_type_key]
+    current_gain    = p['current_gain']
+    wind_speed_gain = p['wind_speed_gain']
+    wave_coef       = p['wave_coef']
+
     dist = 0
     total_time = 0
 
@@ -395,36 +478,45 @@ def calc_remaining(path, idx):
         dir_lat = dlat / norm
         dir_lon = dlon / norm
 
-        effective_speed = ship_speed
-
-        # 海流航速修正
+        # 海流投影
+        current_proj = 0.0
         u_cur = float(hycom_u[y0, x0])
         v_cur = float(hycom_v[y0, x0])
         if not np.isnan(u_cur) and not np.isnan(v_cur):
-            current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  
-            effective_speed += current_proj * w_curr
+            current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
 
-        # 風場航速修正
+        # 風場投影
+        wind_proj = 0.0
         if weather and weather.get("wind"):
             wnd = weather["wind"]
             wi = np.abs(wnd["lats"] - lats[y0]).argmin()
             wj = np.abs(wnd["lons"] - lons[x0]).argmin()
-            u_wnd = float(wnd["u"][wi, wj])
-            v_wnd = float(wnd["v"][wi, wj])
-            wind_proj = (u_wnd * dir_lon + v_wnd * dir_lat) * 3.6  
-            effective_speed += wind_proj * w_wind
+            wind_proj = (float(wnd["u"][wi, wj]) * dir_lon +
+                         float(wnd["v"][wi, wj]) * dir_lat) * 3.6
 
-        # 波浪失速減速（讓時間估算與尋路邏輯同步）
+        # 波浪方向投影 -> 失速/加速倍率
+        wave_slowdown = 1.0
         if weather and weather.get("wave"):
             w = weather["wave"]
             wi = np.abs(w["lats"] - lats[y0]).argmin()
             wj = np.abs(w["lons"] - lons[x0]).argmin()
             swh = w["swh_grid"][wi, wj]
-            if not np.isnan(swh) and swh > wave_threshold:
-                # 浪越高，失速越多
-                effective_speed -= ((swh - wave_threshold) ** 1.5) * wave_weight * w_wave
+            if not np.isnan(swh) and swh > 0:
+                dirpw_grid = w.get("dirpw_grid")
+                has_dir = dirpw_grid is not None and not np.isnan(dirpw_grid[wi, wj])
+                if has_dir:
+                    wave_dir_rad = np.radians(dirpw_grid[wi, wj] + 180.0)
+                    wave_proj = (np.sin(wave_dir_rad) * dir_lon +
+                                 np.cos(wave_dir_rad) * dir_lat)
+                    wave_slowdown = 1.0 - wave_proj * swh * wave_coef
+                    wave_slowdown = max(0.5, min(wave_slowdown, 1.5))
+                else:
+                    wave_slowdown = 1.0 + swh * wave_coef
 
-        effective_speed = max(effective_speed, 2.0) # 修正下限為最低航速 2 km/h，防止除以零
+        effective_speed = (ship_speed + current_proj * current_gain +
+                            wind_proj * wind_speed_gain * 0.5) / wave_slowdown
+        effective_speed = max(effective_speed, 2.0)
+
         dist += seg_dist
         total_time += seg_dist / effective_speed
 
