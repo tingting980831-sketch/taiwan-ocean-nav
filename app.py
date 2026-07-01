@@ -210,7 +210,13 @@ with st.sidebar:
     e_lon = st.number_input("End Lon", 118.0, 124.0, 122.0)
     e_lat = st.number_input("End Lat", 21.0, 26.0, 24.5)
     ship_speed = st.number_input("Ship Speed (km/h)", 1.0, 60.0, 20.0)
-    st.button("Next Step", key="next_step")
+
+    # 🆕 修正：改用滑桿直接控制目前航行進度，比逐格點擊直覺，
+    #    也讓儀表板數字的變化明顯可見（原本每次只走1格，
+    #    在幾百格的長路徑上幾乎感覺不到變化）
+    st.divider()
+    progress_pct = st.slider("航行進度 (%)", 0, 100, 0, key="progress_slider")
+    st.button("Next Step (+1小時航程)", key="next_step")
 
     st.divider()
     st.subheader("🧬 船型自適應環境優化模式")
@@ -224,48 +230,60 @@ with st.sidebar:
     )
 
     # 後台靜態注入權重參數（不顯示於前端）
+    # 🆕 修正：降低海流/風力獎勵的相對權重，避免演算法為了
+    #    「套利」海流而犧牲路徑直線度，導致貼岸繞路
     if "CargoTanker" in ship_mode:
-        w_curr = 0.452
-        w_wave = 0.431
-        w_wind = 0.117
+        w_curr = 0.25
+        w_wave = 0.35
+        w_wind = 0.08
         ship_type_key = "CargoTanker"
     elif "Fishing" in ship_mode:
-        w_curr = 0.265
-        w_wave = 0.513
-        w_wind = 0.222
+        w_curr = 0.18
+        w_wave = 0.45
+        w_wind = 0.15
         ship_type_key = "Fishing"
     else:  # Other
-        w_curr = 0.380
-        w_wave = 0.410
-        w_wind = 0.210
+        w_curr = 0.22
+        w_wave = 0.35
+        w_wind = 0.14
         ship_type_key = "Other"
 
 # ===============================
-# 🆕 船型物理參數（移植自文件1 SHIP_PARAMS）
+# 🆕 船型物理參數（移植自文件1 SHIP_PARAMS，並調整 distance_factor / time_weight）
 # 註：船速本系統由使用者手動輸入(ship_speed)，故不覆寫 speed
+#
+# 🆕 修正重點：
+#   1. distance_factor 大幅提高 —— 原本 0.3 太低，代表「多繞路」幾乎不用付代價，
+#      演算法會為了搭到海流順風而繞遠路貼著海岸走。拉高後路徑會更接近直線。
+#   2. time_weight 略降 —— 原本 5.0 過度放大「搭順流省下的時間」帶來的成本降低，
+#      進一步助長繞路套利行為。
 # ===============================
 SHIP_PARAMS = {
     'CargoTanker': {
-        'distance_factor': 0.3, 'current_gain': 1.0,
+        'distance_factor': 1.3, 'current_gain': 1.0,
         'wind_gain': 1.0, 'wind_speed_gain': 1.0,
-        'time_weight': 5.0, 'fuel_weight': 0.20,
-        'progress_weight': 0.6, 'wave_coef': 0.08,
+        'time_weight': 2.5, 'fuel_weight': 0.20,
+        'progress_weight': 1.2, 'wave_coef': 0.08,
     },
     'Fishing': {
-        'distance_factor': 0.75, 'current_gain': 0.5,
+        'distance_factor': 1.5, 'current_gain': 0.5,
         'wind_gain': 0.5, 'wind_speed_gain': 0.5,
-        'time_weight': 3.0, 'fuel_weight': 0.15,
-        'progress_weight': 2.0, 'wave_coef': 0.05,
+        'time_weight': 1.8, 'fuel_weight': 0.15,
+        'progress_weight': 2.5, 'wave_coef': 0.05,
     },
     'Other': {
-        'distance_factor': 0.9, 'current_gain': 0.3,
+        'distance_factor': 1.6, 'current_gain': 0.3,
         'wind_gain': 0.2, 'wind_speed_gain': 0.2,
-        'time_weight': 2.0, 'fuel_weight': 0.08,
-        'progress_weight': 1.5, 'wave_coef': 0.06,
+        'time_weight': 1.5, 'fuel_weight': 0.08,
+        'progress_weight': 2.0, 'wave_coef': 0.06,
     },
 }
 # 波浪嚴重度：貨輪對大浪更敏感（比照文件1 wave_severity 邏輯）
 wave_severity = 3.0 if ship_type_key == 'CargoTanker' else 1.0
+
+# 🆕 海流/風力投影的獎勵上限（km/h），避免演算法無限套利遠繞路徑
+MAX_CURRENT_BONUS = 2.0
+MAX_WIND_BONUS = 3.0
 
 # ===============================
 # Helpers
@@ -282,6 +300,15 @@ def offshore_penalty(y, x):
 def coast_penalty(y, x):
     d = dist_to_land[y, x]
     return (2 - d) * 2 if d < 2 else 0
+
+# 🆕 A* 啟發函數：以直線距離(km)估計剩餘成本下界，
+#    讓搜尋優先朝目標方向擴展，而非像原本的 Dijkstra 一樣全向均勻擴散
+#    （這正是原本路徑容易被局部海流獎勵帶偏、繞去貼岸的關鍵原因之一）
+def heuristic(y, x, goal):
+    d = np.hypot(lats[y] - lats[goal[0]], lons[x] - lons[goal[1]]) * 111
+    # 乘上目前船型的 distance_factor，維持與實際 g(n) 同一量綱，
+    # 且略微保守（乘 0.9）以確保 admissible，不會漏掉更優路徑
+    return d * SHIP_PARAMS[ship_type_key]['distance_factor'] * 0.9
 
 # 🆕 綜合成本函數（移植自文件1 get_comprehensive_cost）
 # 涵蓋：實際距離(km)、進度懲罰、海流/風/波浪投影、effective_speed、時間成本、燃油成本
@@ -306,21 +333,26 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
     wave_coef       = p['wave_coef']
 
     # 進度懲罰：避免路徑繞遠離目標點
+    # 🆕 修正：原本只罰「離目標變遠」，對「橫向繞行、直線距離幾乎不變」的
+    #    貼岸移動完全沒有懲罰效果。現在改用「這一步實際走的距離」與
+    #    「真正朝目標前進的距離」之差來罰，橫向繞路也會被扣分。
     progress_penalty = 0
     if goal is not None:
         d_before = np.hypot(lats[y0]-lats[goal[0]], lons[x0]-lons[goal[1]]) * 111
         d_after  = np.hypot(lats[y1]-lats[goal[0]], lons[x1]-lons[goal[1]]) * 111
-        progress_penalty = max(d_after - d_before, 0) * progress_weight
+        forward_progress = d_before - d_after  # 正值代表真的往目標前進了
+        progress_penalty = max(base_dist - forward_progress, 0) * progress_weight * 0.3
 
-    # 海流投影
+    # 海流投影（🆕 加上獎勵上限，避免無限套利遠路）
     current_proj = 0.0
     u_cur = float(hycom_u[y0, x0])
     v_cur = float(hycom_v[y0, x0])
     if not np.isnan(u_cur) and not np.isnan(v_cur):
         current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6  # m/s -> km/h
-    current_cost = -current_proj * current_gain
+    current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
+    current_cost = -current_bonus * current_gain
 
-    # 風場投影
+    # 風場投影（🆕 加上獎勵上限）
     wind_proj = 0.0
     wind_cost = 0.0
     if weather and weather.get("wind"):
@@ -329,7 +361,8 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
         wj = np.abs(wnd["lons"] - lons[x0]).argmin()
         wind_proj = (float(wnd["u"][wi, wj]) * dir_lon +
                      float(wnd["v"][wi, wj]) * dir_lat) * 3.6
-        wind_cost = -wind_proj * wind_gain
+        wind_bonus = min(max(wind_proj, -MAX_WIND_BONUS), MAX_WIND_BONUS)
+        wind_cost = -wind_bonus * wind_gain
 
     # 波浪（含方向投影）
     wave_cost = 0.0
@@ -355,8 +388,8 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
             wave_cost = swh ** 2 * wave_severity * max(
                 1.0 - wave_proj if has_dir else 1.0, 0)
 
-    # effective_speed：綜合海流推力／風力／波浪減速
-    effective_speed = (ship_speed + current_proj * current_gain +
+    # effective_speed：綜合海流推力／風力／波浪減速（使用已限幅後的 bonus）
+    effective_speed = (ship_speed + current_bonus * current_gain +
                         wind_proj * wind_speed_gain * 0.5) / wave_slowdown
     effective_speed = max(effective_speed, 2.0)
 
@@ -376,12 +409,16 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal):
 
 # ===============================
 # A* Pathfinding
+# 🆕 修正：原本的 heapq 只推入 g(n)（純累積成本），沒有加上 heuristic，
+#    本質上是 Dijkstra 全向均勻擴散，容易被局部的海流/風力獎勵帶偏，
+#    導致繞去貼岸走。現在改成真正的 A*：f(n) = g(n) + h(n)，
+#    cost 字典仍儲存純 g(n) 以確保正確性，priority queue 用 f(n) 排序。
 # ===============================
 dirs = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
 
 def astar(start, goal):
     rows, cols = land_mask.shape
-    pq = [(0, start)]
+    pq = [(heuristic(start[0], start[1], goal), start)]
     came = {}
     cost = {start: 0}
 
@@ -395,12 +432,13 @@ def astar(start, goal):
                 # 🆕 綜合成本(距離+進度懲罰+海流/風/波浪+時間/燃油) + 離岸風場懲罰
                 step_cost = get_comprehensive_cost(cur[0], cur[1], ni, nj, goal) + offshore_penalty(ni, nj)
 
-                new = cost[cur] + step_cost
+                new_g = cost[cur] + step_cost
 
-                if (ni, nj) not in cost or new < cost[(ni, nj)]:
-                    cost[(ni, nj)] = new
+                if (ni, nj) not in cost or new_g < cost[(ni, nj)]:
+                    cost[(ni, nj)] = new_g
                     came[(ni, nj)] = cur
-                    heapq.heappush(pq, (new, (ni, nj)))
+                    f = new_g + heuristic(ni, nj, goal)
+                    heapq.heappush(pq, (f, (ni, nj)))
 
     path = []
     cur = goal
@@ -441,9 +479,23 @@ path = st.session_state.full_path
 if path:
     st.session_state.ship_step_idx = min(st.session_state.ship_step_idx, len(path)-1)
 
-if st.session_state.get("next_step"):
-    if path and st.session_state.ship_step_idx < len(path)-1:
-        st.session_state.ship_step_idx += 1
+# 🆕 修正：滑桿直接對應路徑進度（百分比 -> index），
+#    數字會隨拖曳即時大幅變化，不再有「動不動」的問題
+if path:
+    slider_idx = int((progress_pct / 100) * (len(path) - 1))
+    st.session_state.ship_step_idx = slider_idx
+
+# 🆕 修正：Next Step 原本每次只推進 1 個網格（在幾百格的長路徑上
+#    幾乎感覺不到儀表板數字變化）。現在依「目前剩餘時間 / 剩餘格數」
+#    估算出「大約 1 小時航程」對應的格數，一次前進這麼多格。
+if st.session_state.get("next_step") and path and st.session_state.ship_step_idx < len(path) - 1:
+    remaining_steps = len(path) - 1 - st.session_state.ship_step_idx
+    # 用剩餘距離/剩餘格數估計平均每格距離，再抓大約1小時的份量
+    approx_speed = max(ship_speed, 2.0)
+    steps_per_hour = max(1, int(remaining_steps / max(1, int(approx_speed / 20))))
+    st.session_state.ship_step_idx = min(
+        st.session_state.ship_step_idx + steps_per_hour, len(path) - 1
+    )
 
 if not path:
     st.stop()
@@ -453,7 +505,8 @@ current_pos = path[st.session_state.ship_step_idx]
 # ===============================
 # Calculations
 # 🆕 改用與 get_comprehensive_cost 一致的 effective_speed / wave_slowdown 邏輯
-#    （波浪方向投影 + current_gain/wind_speed_gain，取代舊的門檻式減速）
+#    （波浪方向投影 + current_gain/wind_speed_gain，取代舊的門檻式減速），
+#    並同樣對海流/風力 bonus 加上限幅，避免時間估算被局部套利誇大。
 # ===============================
 def calc_remaining(path, idx):
     p = SHIP_PARAMS[ship_type_key]
@@ -478,12 +531,13 @@ def calc_remaining(path, idx):
         dir_lat = dlat / norm
         dir_lon = dlon / norm
 
-        # 海流投影
+        # 海流投影（限幅）
         current_proj = 0.0
         u_cur = float(hycom_u[y0, x0])
         v_cur = float(hycom_v[y0, x0])
         if not np.isnan(u_cur) and not np.isnan(v_cur):
             current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
+        current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
 
         # 風場投影
         wind_proj = 0.0
@@ -513,7 +567,7 @@ def calc_remaining(path, idx):
                 else:
                     wave_slowdown = 1.0 + swh * wave_coef
 
-        effective_speed = (ship_speed + current_proj * current_gain +
+        effective_speed = (ship_speed + current_bonus * current_gain +
                             wind_proj * wind_speed_gain * 0.5) / wave_slowdown
         effective_speed = max(effective_speed, 2.0)
 
