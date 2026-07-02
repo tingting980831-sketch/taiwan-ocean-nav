@@ -97,11 +97,39 @@ def _load_hycom_from_archive(bbox, hours_ahead, now_utc):
 
 
 def _load_hycom_from_fmrc(bbox, hours_ahead, now_utc):
-    """備援：從 FMRC 3小時解析度預報聚合端點抓取（涵蓋未來最多8天）。"""
-    lat_min, lat_max, lon_min, lon_max = bbox
-    ds = xr.open_dataset(FMRC_UV3Z_URL)  # FMRC best 端點通常時間已可正常解碼
+    """備援：從 FMRC 3小時解析度預報聚合端點抓取（涵蓋未來最多8天）。
 
-    time_vals = pd.DatetimeIndex(pd.to_datetime(ds['time'].values, utc=True))
+    🆕 FMRC 聚合資料集裡常有像 runtime/time_run 這類輔助座標使用
+    "hours since analysis" 這種非標準時間單位，若用 xr.open_dataset 預設
+    decode_times=True 或事後呼叫 xr.decode_cf()，會因為這些輔助座標解碼失敗
+    而整個炸掉。這裡改用 decode_times=False 打開，只手動解碼真正需要的
+    'time' 座標本身，其餘座標維持原樣不去動它。
+    """
+    lat_min, lat_max, lon_min, lon_max = bbox
+    ds = xr.open_dataset(FMRC_UV3Z_URL, decode_times=False)
+
+    raw_time = ds['time'].values
+    time_units = ds['time'].attrs.get('units', '')
+    calendar = ds['time'].attrs.get('calendar', 'standard')
+
+    try:
+        decoded = xr.coding.times.decode_cf_datetime(raw_time, time_units, calendar=calendar)
+        time_vals = pd.DatetimeIndex(decoded)
+    except ImportError:
+        st.error("缺少 cftime 套件，請先執行 `pip install cftime` 後再重新啟動。")
+        st.stop()
+    except Exception:
+        try:
+            import cftime
+        except ImportError:
+            st.error("缺少 cftime 套件，請先執行 `pip install cftime` 後再重新啟動。")
+            st.stop()
+        decoded = cftime.num2date(raw_time, time_units, calendar=calendar)
+        time_vals = pd.DatetimeIndex([pd.Timestamp(d.isoformat()) for d in decoded])
+
+    if time_vals.tz is None:
+        time_vals = time_vals.tz_localize('UTC')
+
     deltas = (time_vals - now_utc).total_seconds() / 3600.0
     start_idx = int(np.argmin(np.abs(deltas)))
     end_mask = deltas <= hours_ahead
