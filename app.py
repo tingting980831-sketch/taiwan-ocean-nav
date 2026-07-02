@@ -180,7 +180,6 @@ def load_hycom_series(bbox=(21, 26, 118, 124), hours_ahead=HYCOM_FORECAST_HOURS)
     try:
         result = _load_hycom_from_fmrc(bbox, hours_ahead, now_utc)
         if result is not None:
-            st.info("ℹ️ 逐時海流歸檔資料未涵蓋未來時段，已自動切換為 FMRC 3小時預報資料。")
             return result
     except Exception as e:
         st.error(f"無法連接到 HYCOM 數據庫（歸檔與 FMRC 備援皆失敗）: {e}")
@@ -809,36 +808,16 @@ if map_wind:
 else:
     w3.metric("風速（目前位置）", "0.00 m/s")
 
-def _fmt_time(t):
-    if t is None:
-        return "❌ 未連接"
-    ts = pd.Timestamp(t)
-    return f"✅ {ts.strftime('%Y-%m-%d %H:%M UTC')}"
+# ===============================
+# 資料連接狀態：只顯示是否有成功接到資料
+# ===============================
+def _connected(t):
+    return "✅ 已連接" if t is not None else "❌ 未連接"
 
 st.caption(
-    f"資料連接狀態｜HYCOM 海流: {_fmt_time(map_time)} ｜ "
-    f"波浪: {_fmt_time(map_wave_time)} ｜ "
-    f"風場: {_fmt_time(map_wind_time)}"
-)
-
-# 🆕 診斷資訊：直接從實際抓回的時間序列算出「相鄰時間切片間隔幾小時」，
-# 用來判斷資料源實際提供的是逐時還是 3 小時（或其他）解析度，
-# 不用再靠肉眼猜測單一時間戳記的間隔。
-def _resolution_str(times_rel):
-    if times_rel is None or len(times_rel) < 2:
-        return "資料點不足"
-    diffs = np.diff(np.sort(np.array(times_rel)))
-    diffs = diffs[diffs > 0]
-    if len(diffs) == 0:
-        return "資料點不足"
-    med = float(np.median(diffs))
-    return f"約每 {med:.1f} 小時一筆（共 {len(times_rel)} 筆）"
-
-hycom_res = _resolution_str(hycom_times_rel)
-weather_res = _resolution_str(weather_series["times_rel"]) if weather_series else "未連接"
-
-st.caption(
-    f"實際資料解析度｜HYCOM 海流: {hycom_res} ｜ 風/浪: {weather_res}"
+    f"資料連接狀態｜HYCOM 海流: {_connected(map_time)} ｜ "
+    f"波浪: {_connected(map_wave_time)} ｜ "
+    f"風場: {_connected(map_wind_time)}"
 )
 
 # ===============================
