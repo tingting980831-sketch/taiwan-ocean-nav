@@ -153,7 +153,7 @@ def _find_latest_cycle():
 
 def _fetch_wave_step(date_str, cycle, fhr):
     """抓單一預報時效（fhr, 小時）的波浪資料，失敗回傳 None。"""
-    f_str = f"f{fhr:03d}"
+    f_str = f"f{fhr:01d}"
     url = (
         "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl?"
         f"file=gfswave.t{cycle}z.global.0p25.{f_str}.grib2"
@@ -189,7 +189,7 @@ def _fetch_wave_step(date_str, cycle, fhr):
 
 def _fetch_wind_step(date_str, cycle, fhr):
     """抓單一預報時效（fhr, 小時）的風場資料，失敗回傳 None。"""
-    f_str = f"{fhr:03d}"
+    f_str = f"{fhr:01d}"
     url = (
         "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?"
         f"file=gfs.t{cycle}z.pgrb2.0p25.f{f_str}"
