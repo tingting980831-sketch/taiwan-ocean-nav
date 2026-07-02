@@ -301,10 +301,10 @@ def get_wind_at(elapsed_hours):
 with st.sidebar:
     st.header("Route Settings")
     # 起點：台中港 / 終點：蘇澳港
-    s_lon = st.number_input("Start Lon", 118.0, 124.0, 120.4933)  # 台中港
-    s_lat = st.number_input("Start Lat", 21.0, 26.0, 24.2833)     # 台中港
-    e_lon = st.number_input("End Lon", 118.0, 124.0, 121.8617)    # 蘇澳港
-    e_lat = st.number_input("End Lat", 21.0, 26.0, 24.5967)       # 蘇澳港
+    s_lon = st.number_input("Start Lon", 118.0, 124.0, 120.49)  # 台中港
+    s_lat = st.number_input("Start Lat", 21.0, 26.0, 24.28)     # 台中港
+    e_lon = st.number_input("End Lon", 118.0, 124.0, 121.89)    # 蘇澳港
+    e_lat = st.number_input("End Lat", 21.0, 26.0, 24.59)       # 蘇澳港
     ship_speed = st.number_input("Ship Speed (km/h)", 1.0, 60.0, 20.0)
 
     st.divider()
@@ -706,12 +706,6 @@ if map_wind:
 else:
     w3.metric("風速（目前位置）", "N/A")
 
-st.caption(
-    f"HYCOM/GFS 對應時刻（船抵達目前位置時預估）: {map_time} ｜ "
-    f"已載入海流 {len(hycom_times_rel)} 個時間切片（涵蓋未來 {HYCOM_FORECAST_HOURS} 小時）、"
-    f"風浪 {len(weather_series['times_rel']) if weather_series else 0} 個時間切片"
-    f"（每 {WEATHER_STEP_HOURS} 小時一筆，涵蓋未來 {WEATHER_FORECAST_HOURS} 小時）"
-)
 st.caption(f"離岸安全距離：約 {COAST_SAFE_KM} km（換算約 {COAST_SAFE_CELLS:.1f} 個網格，每格約 {CELL_KM:.1f} km）")
 
 # ===============================
@@ -774,5 +768,5 @@ ax.scatter(lons[current_pos[1]], lats[current_pos[0]],
 ax.scatter(s_lon, s_lat, color="#B15BFF", s=80,  edgecolors="black", transform=ccrs.PlateCarree())
 ax.scatter(e_lon, e_lat, color="yellow",  marker="*", s=200, edgecolors="black", transform=ccrs.PlateCarree())
 
-plt.title(f"HELIOS Navigation Map ｜ 對應時刻: {map_time}")
+plt.title("HELIOS Navigation Map")
 st.pyplot(fig)
