@@ -39,24 +39,29 @@ OFFSHORE_COST = 10
 
 # ===============================
 # HYCOM 海流：逐小時時間序列 (time, lat, lon)
+#
+# 🆕 資料來源說明與備援機制：
+# ESPC-D-V02/ice/<year> 是「年度歸檔」資料集，內容是已發生的分析值（nowcast），
+# 雖然本身是逐小時解析度，但最新一筆通常會落後「現在」12~24小時，且這個
+# 歸檔端點本身不包含未來的預報時間點 —— 若只靠這個端點，往未來抓永遠只會抓到
+# 最新那一筆（資料點不足），無法支撐「船幾小時後會遇到什麼海流」的規劃需求。
+#
+# 因此加入備援：先嘗試逐時歸檔資料；若往未來抓不到至少 2 個有效時間點
+# （代表這個端點沒有涵蓋到未來），改抓 FMRC（Forecast Model Run Collection）
+# 的 3 小時解析度預報聚合端點，這個端點會把最近數次模式運算串接成一條
+# 連續往未來延伸最多 8 天的時間軸，確保航程規劃時一定拿得到「未來」的海流資料
+# （代價是解析度從逐時退回 3 小時一筆）。
 # ===============================
 HYCOM_FORECAST_HOURS = 72  # 抓未來72小時的預報，涵蓋大多數航程長度
 
-@st.cache_data(ttl=3600)
-def load_hycom_series(bbox=(21, 26, 118, 124), hours_ahead=HYCOM_FORECAST_HOURS):
-    """
-    回傳從「現在」開始，未來 hours_ahead 小時內的海流時間序列。
-    times_rel: 各時間切片相對於「現在」的小時數
-    u_ts, v_ts: shape = (T, lat, lon)
-    """
-    now_utc = pd.Timestamp(datetime.now(timezone.utc))
+FMRC_UV3Z_URL = "https://tds.hycom.org/thredds/dodsC/FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd"
+
+
+def _load_hycom_from_archive(bbox, hours_ahead, now_utc):
+    """嘗試從逐時歸檔資料集抓取。回傳 None 代表往未來抓不到足夠的時間點。"""
     lat_min, lat_max, lon_min, lon_max = bbox
     url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
-    try:
-        ds = xr.open_dataset(url, decode_times=False)
-    except Exception as e:
-        st.error(f"無法連接到 HYCOM 數據庫: {e}")
-        st.stop()
+    ds = xr.open_dataset(url, decode_times=False)
 
     if 'time_origin' in ds['time'].attrs:
         origin = pd.to_datetime(ds['time'].attrs['time_origin'])
@@ -68,7 +73,35 @@ def load_hycom_series(bbox=(21, 26, 118, 124), hours_ahead=HYCOM_FORECAST_HOURS)
         time_vals = pd.DatetimeIndex(pd.to_datetime(ds_decoded['time'].values, utc=True))
 
     time_vals = pd.DatetimeIndex(time_vals)
+    deltas = (time_vals - now_utc).total_seconds() / 3600.0
+    start_idx = int(np.argmin(np.abs(deltas)))
+    end_mask = deltas <= hours_ahead
+    valid_idx = np.where(end_mask)[0]
+    valid_idx = valid_idx[valid_idx >= start_idx]
 
+    # 往未來抓不到至少 2 個時間點，代表這個歸檔端點沒有未來預報，改用 FMRC 備援
+    if len(valid_idx) < 2:
+        return None
+
+    sub = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
+    lons = sub.lon.values
+    lats = sub.lat.values
+
+    u_ts = sub['ssu'].isel(time=valid_idx).values  # (T, lat, lon)
+    v_ts = sub['ssv'].isel(time=valid_idx).values
+    times_used = time_vals[valid_idx]
+    times_rel = np.array([(t - now_utc).total_seconds() / 3600.0 for t in times_used])
+    land_mask = np.all(np.isnan(u_ts), axis=0)
+
+    return lons, lats, land_mask, times_rel, times_used, u_ts, v_ts
+
+
+def _load_hycom_from_fmrc(bbox, hours_ahead, now_utc):
+    """備援：從 FMRC 3小時解析度預報聚合端點抓取（涵蓋未來最多8天）。"""
+    lat_min, lat_max, lon_min, lon_max = bbox
+    ds = xr.open_dataset(FMRC_UV3Z_URL)  # FMRC best 端點通常時間已可正常解碼
+
+    time_vals = pd.DatetimeIndex(pd.to_datetime(ds['time'].values, utc=True))
     deltas = (time_vals - now_utc).total_seconds() / 3600.0
     start_idx = int(np.argmin(np.abs(deltas)))
     end_mask = deltas <= hours_ahead
@@ -76,20 +109,57 @@ def load_hycom_series(bbox=(21, 26, 118, 124), hours_ahead=HYCOM_FORECAST_HOURS)
     valid_idx = valid_idx[valid_idx >= start_idx]
     if len(valid_idx) == 0:
         valid_idx = np.array([start_idx])
-    idx_slice = valid_idx
 
     sub = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
     lons = sub.lon.values
     lats = sub.lat.values
 
-    u_ts = sub['ssu'].isel(time=idx_slice).values  # (T, lat, lon)
-    v_ts = sub['ssv'].isel(time=idx_slice).values
-    times_used = time_vals[idx_slice]
-    times_rel = np.array([(t - now_utc).total_seconds() / 3600.0 for t in times_used])
+    # uv3z 含深度層，取最接近海表（depth=0）的那一層
+    depth_dim = 'depth' if 'depth' in sub['water_u'].dims else None
+    if depth_dim:
+        d_idx = int(np.abs(sub[depth_dim].values - 0).argmin())
+        u_ts = sub['water_u'].isel(time=valid_idx).isel({depth_dim: d_idx}).values
+        v_ts = sub['water_v'].isel(time=valid_idx).isel({depth_dim: d_idx}).values
+    else:
+        u_ts = sub['water_u'].isel(time=valid_idx).values
+        v_ts = sub['water_v'].isel(time=valid_idx).values
 
+    times_used = time_vals[valid_idx]
+    times_rel = np.array([(t - now_utc).total_seconds() / 3600.0 for t in times_used])
     land_mask = np.all(np.isnan(u_ts), axis=0)
 
     return lons, lats, land_mask, times_rel, times_used, u_ts, v_ts
+
+
+@st.cache_data(ttl=3600)
+def load_hycom_series(bbox=(21, 26, 118, 124), hours_ahead=HYCOM_FORECAST_HOURS):
+    """
+    回傳從「現在」開始，未來 hours_ahead 小時內的海流時間序列。
+    times_rel: 各時間切片相對於「現在」的小時數
+    u_ts, v_ts: shape = (T, lat, lon)
+
+    先試逐時歸檔資料，抓不到足夠未來時間點時自動改用 FMRC 3小時預報備援。
+    """
+    now_utc = pd.Timestamp(datetime.now(timezone.utc))
+
+    try:
+        result = _load_hycom_from_archive(bbox, hours_ahead, now_utc)
+        if result is not None:
+            return result
+    except Exception:
+        pass
+
+    try:
+        result = _load_hycom_from_fmrc(bbox, hours_ahead, now_utc)
+        if result is not None:
+            st.info("ℹ️ 逐時海流歸檔資料未涵蓋未來時段，已自動切換為 FMRC 3小時預報資料。")
+            return result
+    except Exception as e:
+        st.error(f"無法連接到 HYCOM 數據庫（歸檔與 FMRC 備援皆失敗）: {e}")
+        st.stop()
+
+    st.error("無法取得任何 HYCOM 海流資料。")
+    st.stop()
 
 
 with st.spinner("載入 HYCOM 海流時間序列中..."):
