@@ -250,11 +250,13 @@ def fetch_weather_series(forecast_hours=WEATHER_FORECAST_HOURS, step_hours=WEATH
     now_utc = pd.Timestamp(datetime.now(timezone.utc))
     run_offset_hours = (run_start - now_utc).total_seconds() / 3600.0
     times_rel = np.array([run_offset_hours + fhr for fhr in fhrs])
+    times_abs = [run_start + pd.Timedelta(hours=fhr) for fhr in fhrs]
 
     return {
         "date": date_str,
         "cycle": cycle,
         "times_rel": times_rel,
+        "times_abs": times_abs,
         "wave_steps": wave_steps,
         "wind_steps": wind_steps,
     }
@@ -269,30 +271,31 @@ def _nearest_step_idx(times_rel, elapsed_hours):
 
 
 def get_wave_at(elapsed_hours):
-    """依「從現在起算的航行時數」取得對應時間切片的波浪資料（整張網格）。找不到回傳 None。"""
+    """依「從現在起算的航行時數」取得對應時間切片的波浪資料（整張網格）與其對應絕對時刻。
+    找不到回傳 (None, None)。"""
     if weather_series is None:
-        return None
+        return None, None
     idx = _nearest_step_idx(weather_series["times_rel"], elapsed_hours)
-    # 若最接近的那筆抓取失敗，往前後找最近一筆有效資料
     n = len(weather_series["wave_steps"])
     order = sorted(range(n), key=lambda i: abs(i - idx))
     for i in order:
         if weather_series["wave_steps"][i] is not None:
-            return weather_series["wave_steps"][i]
-    return None
+            return weather_series["wave_steps"][i], weather_series["times_abs"][i]
+    return None, None
 
 
 def get_wind_at(elapsed_hours):
-    """依「從現在起算的航行時數」取得對應時間切片的風場資料（整張網格）。找不到回傳 None。"""
+    """依「從現在起算的航行時數」取得對應時間切片的風場資料（整張網格）與其對應絕對時刻。
+    找不到回傳 (None, None)。"""
     if weather_series is None:
-        return None
+        return None, None
     idx = _nearest_step_idx(weather_series["times_rel"], elapsed_hours)
     n = len(weather_series["wind_steps"])
     order = sorted(range(n), key=lambda i: abs(i - idx))
     for i in order:
         if weather_series["wind_steps"][i] is not None:
-            return weather_series["wind_steps"][i]
-    return None
+            return weather_series["wind_steps"][i], weather_series["times_abs"][i]
+    return None, None
 
 
 # ===============================
@@ -438,7 +441,7 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal, elapsed_hours):
     # 🆕 風場：依 elapsed_hours 對應的時間切片
     wind_proj = 0.0
     wind_cost = 0.0
-    wnd = get_wind_at(elapsed_hours)
+    wnd, _ = get_wind_at(elapsed_hours)
     if wnd:
         wi = np.abs(wnd["lats"] - lats[y0]).argmin()
         wj = np.abs(wnd["lons"] - lons[x0]).argmin()
@@ -451,7 +454,7 @@ def get_comprehensive_cost(y0, x0, y1, x1, goal, elapsed_hours):
     wave_cost = 0.0
     wave_slowdown = 1.0
     wave_proj = 0.0
-    w = get_wave_at(elapsed_hours)
+    w, _ = get_wave_at(elapsed_hours)
     if w:
         wi = np.abs(w["lats"] - lats[y0]).argmin()
         wj = np.abs(w["lons"] - lons[x0]).argmin()
@@ -597,7 +600,7 @@ def calc_segment(y0, x0, y1, x1, elapsed_hours):
     current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
 
     wind_proj = 0.0
-    wnd = get_wind_at(elapsed_hours)
+    wnd, _ = get_wind_at(elapsed_hours)
     if wnd:
         wi = np.abs(wnd["lats"] - lats[y0]).argmin()
         wj = np.abs(wnd["lons"] - lons[x0]).argmin()
@@ -605,7 +608,7 @@ def calc_segment(y0, x0, y1, x1, elapsed_hours):
                      float(wnd["v"][wi, wj]) * dir_lat) * 3.6
 
     wave_slowdown = 1.0
-    w = get_wave_at(elapsed_hours)
+    w, _ = get_wave_at(elapsed_hours)
     if w:
         wi = np.abs(w["lats"] - lats[y0]).argmin()
         wj = np.abs(w["lons"] - lons[x0]).argmin()
@@ -669,8 +672,8 @@ remaining_dist, remaining_time, heading, elapsed_at_current = calc_remaining(
 # 而不是永遠顯示「現在」這一份快照。
 # ===============================
 map_u, map_v, map_time, _map_idx = get_current_snapshot(elapsed_at_current)
-map_wave = get_wave_at(elapsed_at_current)
-map_wind = get_wind_at(elapsed_at_current)
+map_wave, map_wave_time = get_wave_at(elapsed_at_current)
+map_wind, map_wind_time = get_wind_at(elapsed_at_current)
 
 # ===============================
 # Dashboard — 第一排
@@ -688,28 +691,37 @@ if map_wave:
     wi = np.abs(map_wave["lats"] - lats[current_pos[0]]).argmin()
     wj = np.abs(map_wave["lons"] - lons[current_pos[1]]).argmin()
     swh_here = map_wave["swh_grid"][wi, wj]
-    w1.metric("顯著波高（目前位置）", f"{swh_here:.2f} m" if not np.isnan(swh_here) else "N/A")
+    swh_here = 0.0 if np.isnan(swh_here) else swh_here
+    w1.metric("顯著波高（目前位置）", f"{swh_here:.2f} m")
     if map_wave.get("dirpw_grid") is not None:
         dirpw_here = map_wave["dirpw_grid"][wi, wj]
-        w2.metric("波浪方向（目前位置）", f"{dirpw_here:.1f}°" if not np.isnan(dirpw_here) else "N/A")
+        dirpw_here = 0.0 if np.isnan(dirpw_here) else dirpw_here
+        w2.metric("波浪方向（目前位置）", f"{dirpw_here:.1f}°")
     else:
-        w2.metric("波浪方向（目前位置）", "N/A")
+        w2.metric("波浪方向（目前位置）", "0.0°")
 else:
-    w1.metric("顯著波高（目前位置）", "N/A")
-    w2.metric("波浪方向（目前位置）", "N/A")
+    w1.metric("顯著波高（目前位置）", "0.00 m")
+    w2.metric("波浪方向（目前位置）", "0.0°")
 
 if map_wind:
     wi = np.abs(map_wind["lats"] - lats[current_pos[0]]).argmin()
     wj = np.abs(map_wind["lons"] - lons[current_pos[1]]).argmin()
     spd_here = float(map_wind["speed"][wi, wj])
+    spd_here = 0.0 if np.isnan(spd_here) else spd_here
     w3.metric("風速（目前位置）", f"{spd_here:.2f} m/s")
 else:
-    w3.metric("風速（目前位置）", "N/A")
+    w3.metric("風速（目前位置）", "0.00 m/s")
+
+def _fmt_time(t):
+    if t is None:
+        return "❌ 未連接"
+    ts = pd.Timestamp(t)
+    return f"✅ {ts.strftime('%Y-%m-%d %H:%M UTC')}"
 
 st.caption(
-    f"資料連接狀態｜HYCOM 海流: {'✅ 已連接' if hycom_u_ts is not None else '❌ 未連接'} ｜ "
-    f"波浪: {'✅ 已連接' if map_wave else '❌ 未連接'} ｜ "
-    f"風場: {'✅ 已連接' if map_wind else '❌ 未連接'}"
+    f"資料連接狀態｜HYCOM 海流: {_fmt_time(map_time)} ｜ "
+    f"波浪: {_fmt_time(map_wave_time)} ｜ "
+    f"風場: {_fmt_time(map_wind_time)}"
 )
 
 # ===============================
