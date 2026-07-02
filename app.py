@@ -679,11 +679,10 @@ map_wind, map_wind_time = get_wind_at(elapsed_at_current)
 # Dashboard — 第一排
 # ===============================
 st.subheader("Navigation Dashboard")
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 c1.metric("Remaining Distance (km)", f"{remaining_dist:.2f}")
 c2.metric("Remaining Time (hr)",     f"{remaining_time:.2f}")
 c3.metric("Heading",                 f"{heading:.1f}°")
-c4.metric("目前預計航行時數",         f"{elapsed_at_current:.2f} hr")
 
 # 第二排 — 氣象資料（依目前位置對應的時刻）
 w1, w2, w3 = st.columns(3)
