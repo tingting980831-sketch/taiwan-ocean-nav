@@ -126,7 +126,7 @@ def get_current_snapshot(elapsed_hours):
 # 組成 (time, lat, lon) 的時間序列，之後依「船預計幾點到達該點」查對應時刻。
 # ===============================
 WEATHER_FORECAST_HOURS = 72          # 涵蓋未來 72 小時預報
-WEATHER_STEP_HOURS = 3               # GFS/GFS-Wave 預報時效間隔（f000, f003, f006, ...）
+WEATHER_STEP_HOURS = 1               # GFS/GFS-Wave 逐小時預報時效（f000, f001, f002, ... f120 內皆支援逐時）
 
 
 def _find_latest_cycle():
