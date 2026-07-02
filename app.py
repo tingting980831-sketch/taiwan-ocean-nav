@@ -723,6 +723,26 @@ st.caption(
     f"風場: {_fmt_time(map_wind_time)}"
 )
 
+# 🆕 診斷資訊：直接從實際抓回的時間序列算出「相鄰時間切片間隔幾小時」，
+# 用來判斷資料源實際提供的是逐時還是 3 小時（或其他）解析度，
+# 不用再靠肉眼猜測單一時間戳記的間隔。
+def _resolution_str(times_rel):
+    if times_rel is None or len(times_rel) < 2:
+        return "資料點不足"
+    diffs = np.diff(np.sort(np.array(times_rel)))
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return "資料點不足"
+    med = float(np.median(diffs))
+    return f"約每 {med:.1f} 小時一筆（共 {len(times_rel)} 筆）"
+
+hycom_res = _resolution_str(hycom_times_rel)
+weather_res = _resolution_str(weather_series["times_rel"]) if weather_series else "未連接"
+
+st.caption(
+    f"實際資料解析度｜HYCOM 海流: {hycom_res} ｜ 風/浪: {weather_res}"
+)
+
 # ===============================
 # Map — 底圖依「船目前預計時刻」對應的風/浪/流資料繪製
 # ===============================
