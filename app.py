@@ -706,7 +706,11 @@ if map_wind:
 else:
     w3.metric("風速（目前位置）", "N/A")
 
-st.caption(f"離岸安全距離：約 {COAST_SAFE_KM} km（換算約 {COAST_SAFE_CELLS:.1f} 個網格，每格約 {CELL_KM:.1f} km）")
+st.caption(
+    f"資料連接狀態｜HYCOM 海流: {'✅ 已連接' if hycom_u_ts is not None else '❌ 未連接'} ｜ "
+    f"波浪: {'✅ 已連接' if map_wave else '❌ 未連接'} ｜ "
+    f"風場: {'✅ 已連接' if map_wind else '❌ 未連接'}"
+)
 
 # ===============================
 # Map — 底圖依「船目前預計時刻」對應的風/浪/流資料繪製
