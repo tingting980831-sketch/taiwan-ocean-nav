@@ -1,884 +1,220 @@
-import streamlit as st
-import xarray as xr
+"""
+app.py -- HELIOS System (Streamlit 介面)
+
+與舊版相同的部分: Streamlit 介面、HYCOM / GFS / GFS-Wave 資料抓取 (data_live.py), 畫面配置。
+改掉的部分:
+  - 尋路核心: 改用 baseline.py + planner.py + fuel_model.py, 與說明書的節能評估是同一套演算法
+  - 船型: 13 類船舶參數庫 (ship_profiles_v2.csv), 並可輸入吃水 (空載 / 半載 / 滿載或自訂)
+  - 成本: 不再用手設的環境權重; 油耗由物理模型 (風、浪、流的阻力與功率) 計算
+
+執行:  streamlit run app.py
+需要同資料夾: ship_profiles_v2.csv、fuel_model.py、baseline.py、planner.py、bathymetry.py、
+              analyze_speed.py、voyages.py、monthly_corr.py、ais_profile.py、env_fields.py、
+              data_live.py、helios_core.py、helios_map.py   (水深限制另需 *MDTM*.tif)
+"""
+import glob
+import os
+import sys
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import heapq
-import requests
-import tempfile
-import os
-from scipy.ndimage import distance_transform_edt
-from matplotlib.path import Path
-from datetime import datetime, timezone, timedelta
+import streamlit as st
 
-# ===============================
-# Page Config
-# ===============================
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import bathymetry as BY          # noqa: E402
+import data_live as DL           # noqa: E402
+import fuel_model as FM          # noqa: E402
+import helios_core as HC         # noqa: E402
+import helios_map as HM          # noqa: E402
+from analyze_speed import build_dist_grid, load_land   # noqa: E402
+from voyages import PORTS        # noqa: E402
+
 st.set_page_config(layout="wide", page_title="HELIOS System")
 st.title("🛰️ HELIOS System")
 
 # ===============================
-# No-Go Zones & Offshore Wind
+# 禁航區與離岸風場 (沿用舊版座標; 現在直接當作不可通行)
 # ===============================
 NO_GO_ZONES = [
     [[22.953536, 120.171678], [22.934628, 120.175472], [22.933136, 120.170942], [22.95781, 120.16078]],
     [[22.943956, 120.172358], [22.939717, 120.173944], [22.928353, 120.157372], [22.936636, 120.153547]],
     [[22.933136, 120.170942], [22.924847, 120.172583], [22.915003, 120.159022], [22.931536, 120.155772]],
 ]
-
 OFFSHORE_WIND = [
     [[24.18, 120.12], [24.22, 120.28], [24.05, 120.35], [24.00, 120.15]],
     [[24.00, 120.10], [24.05, 120.32], [23.90, 120.38], [23.85, 120.15]],
     [[23.88, 120.05], [23.92, 120.18], [23.75, 120.25], [23.70, 120.08]],
     [[23.68, 120.02], [23.72, 120.12], [23.58, 120.15], [23.55, 120.05]],
 ]
+BUFFER_KM = 5.0          # 與評估一致: 基準路徑離岸 >= 5 km
 
-OFFSHORE_COST = 10
 
 # ===============================
-# HYCOM 海流：逐小時時間序列 (time, lat, lon)
-#
-# 🆕 資料來源說明與備援機制：
-# ESPC-D-V02/ice/<year> 是「年度歸檔」資料集，內容是已發生的分析值（nowcast），
-# 雖然本身是逐小時解析度，但最新一筆通常會落後「現在」12~24小時，且這個
-# 歸檔端點本身不包含未來的預報時間點 —— 若只靠這個端點，往未來抓永遠只會抓到
-# 最新那一筆（資料點不足），無法支撐「船幾小時後會遇到什麼海流」的規劃需求。
-#
-# 因此加入備援：先嘗試逐時歸檔資料；若往未來抓不到至少 2 個有效時間點
-# （代表這個端點沒有涵蓋到未來），改抓 FMRC（Forecast Model Run Collection）
-# 的 3 小時解析度預報聚合端點，這個端點會把最近數次模式運算串接成一條
-# 連續往未來延伸最多 8 天的時間軸，確保航程規劃時一定拿得到「未來」的海流資料
-# （代價是解析度從逐時退回 3 小時一筆）。
+# 載入 (有快取)
 # ===============================
-HYCOM_FORECAST_HOURS = 72  # 抓未來72小時的預報，涵蓋大多數航程長度
-
-FMRC_UV3Z_URL = "https://tds.hycom.org/thredds/dodsC/FMRC_ESPC-D-V02_uv3z/FMRC_ESPC-D-V02_uv3z_best.ncd"
-
-
-def _load_hycom_from_archive(bbox, hours_ahead, now_utc):
-    """嘗試從逐時歸檔資料集抓取。回傳 None 代表往未來抓不到足夠的時間點。"""
-    lat_min, lat_max, lon_min, lon_max = bbox
-    url = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/ice/2026"
-    ds = xr.open_dataset(url, decode_times=False)
-
-    if 'time_origin' in ds['time'].attrs:
-        origin = pd.to_datetime(ds['time'].attrs['time_origin'])
-        if origin.tzinfo is None:
-            origin = origin.tz_localize('UTC')
-        time_vals = origin + pd.to_timedelta(ds['time'].values, unit='h')
-    else:
-        ds_decoded = xr.decode_cf(ds)
-        time_vals = pd.DatetimeIndex(pd.to_datetime(ds_decoded['time'].values, utc=True))
-
-    time_vals = pd.DatetimeIndex(time_vals)
-    deltas = (time_vals - now_utc).total_seconds() / 3600.0
-    start_idx = int(np.argmin(np.abs(deltas)))
-    end_mask = deltas <= hours_ahead
-    valid_idx = np.where(end_mask)[0]
-    valid_idx = valid_idx[valid_idx >= start_idx]
-
-    # 往未來抓不到至少 2 個時間點，代表這個歸檔端點沒有未來預報，改用 FMRC 備援
-    if len(valid_idx) < 2:
-        return None
-
-    sub = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
-    lons = sub.lon.values
-    lats = sub.lat.values
-
-    u_ts = sub['ssu'].isel(time=valid_idx).values  # (T, lat, lon)
-    v_ts = sub['ssv'].isel(time=valid_idx).values
-    times_used = time_vals[valid_idx]
-    times_rel = np.array([(t - now_utc).total_seconds() / 3600.0 for t in times_used])
-    land_mask = np.all(np.isnan(u_ts), axis=0)
-
-    return lons, lats, land_mask, times_rel, times_used, u_ts, v_ts
+@st.cache_resource
+def get_dist():
+    return build_dist_grid(load_land(None))
 
 
-def _load_hycom_from_fmrc(bbox, hours_ahead, now_utc):
-    """備援：從 FMRC 3小時解析度預報聚合端點抓取（涵蓋未來最多8天）。
-
-    🆕 FMRC 聚合資料集裡常有像 runtime/time_run 這類輔助座標使用
-    "hours since analysis" 這種非標準時間單位，若用 xr.open_dataset 預設
-    decode_times=True 或事後呼叫 xr.decode_cf()，會因為這些輔助座標解碼失敗
-    而整個炸掉。這裡改用 decode_times=False 打開，只手動解碼真正需要的
-    'time' 座標本身，其餘座標維持原樣不去動它。
-    """
-    lat_min, lat_max, lon_min, lon_max = bbox
-    ds = xr.open_dataset(FMRC_UV3Z_URL, decode_times=False)
-
-    raw_time = ds['time'].values
-    time_units = ds['time'].attrs.get('units', '')
-    calendar = ds['time'].attrs.get('calendar', 'standard')
-
-    try:
-        decoded = xr.coding.times.decode_cf_datetime(raw_time, time_units, calendar=calendar)
-        time_vals = pd.DatetimeIndex(decoded)
-    except ImportError:
-        st.error("缺少 cftime 套件，請先執行 `pip install cftime` 後再重新啟動。")
-        st.stop()
-    except Exception:
-        try:
-            import cftime
-        except ImportError:
-            st.error("缺少 cftime 套件，請先執行 `pip install cftime` 後再重新啟動。")
-            st.stop()
-        decoded = cftime.num2date(raw_time, time_units, calendar=calendar)
-        time_vals = pd.DatetimeIndex([pd.Timestamp(d.isoformat()) for d in decoded])
-
-    if time_vals.tz is None:
-        time_vals = time_vals.tz_localize('UTC')
-
-    deltas = (time_vals - now_utc).total_seconds() / 3600.0
-    start_idx = int(np.argmin(np.abs(deltas)))
-    end_mask = deltas <= hours_ahead
-    valid_idx = np.where(end_mask)[0]
-    valid_idx = valid_idx[valid_idx >= start_idx]
-    if len(valid_idx) == 0:
-        valid_idx = np.array([start_idx])
-
-    sub = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
-    lons = sub.lon.values
-    lats = sub.lat.values
-
-    # uv3z 含深度層，取最接近海表（depth=0）的那一層
-    depth_dim = 'depth' if 'depth' in sub['water_u'].dims else None
-    if depth_dim:
-        d_idx = int(np.abs(sub[depth_dim].values - 0).argmin())
-        u_ts = sub['water_u'].isel(time=valid_idx).isel({depth_dim: d_idx}).values
-        v_ts = sub['water_v'].isel(time=valid_idx).isel({depth_dim: d_idx}).values
-    else:
-        u_ts = sub['water_u'].isel(time=valid_idx).values
-        v_ts = sub['water_v'].isel(time=valid_idx).values
-
-    times_used = time_vals[valid_idx]
-    times_rel = np.array([(t - now_utc).total_seconds() / 3600.0 for t in times_used])
-    land_mask = np.all(np.isnan(u_ts), axis=0)
-
-    return lons, lats, land_mask, times_rel, times_used, u_ts, v_ts
+@st.cache_resource
+def get_router(depth_on, tif_path):
+    lons, lats = HC.grid_axes()
+    blocked = HC.polygons_mask(lons, lats, NO_GO_ZONES + OFFSHORE_WIND)
+    depth = BY.load_depth_grid(tif_path, lons, lats) if (depth_on and tif_path) else None
+    return HC.Router(get_dist(), BUFFER_KM, blocked=blocked, depth=depth)
 
 
-@st.cache_data(ttl=3600)
-def load_hycom_series(bbox=(21, 26, 118, 124), hours_ahead=HYCOM_FORECAST_HOURS):
-    """
-    回傳從「現在」開始，未來 hours_ahead 小時內的海流時間序列。
-    times_rel: 各時間切片相對於「現在」的小時數
-    u_ts, v_ts: shape = (T, lat, lon)
-
-    先試逐時歸檔資料，抓不到足夠未來時間點時自動改用 FMRC 3小時預報備援。
-    """
-    now_utc = pd.Timestamp(datetime.now(timezone.utc))
-
-    try:
-        result = _load_hycom_from_archive(bbox, hours_ahead, now_utc)
-        if result is not None:
-            return result
-    except Exception:
-        pass
-
-    try:
-        result = _load_hycom_from_fmrc(bbox, hours_ahead, now_utc)
-        if result is not None:
-            return result
-    except Exception as e:
-        st.error(f"無法連接到 HYCOM 數據庫（歸檔與 FMRC 備援皆失敗）: {e}")
-        st.stop()
-
-    st.error("無法取得任何 HYCOM 海流資料。")
+profile_path = os.path.join(HERE, "ship_profiles_v2.csv")
+if not os.path.exists(profile_path):
+    st.error("找不到 ship_profiles_v2.csv (船舶參數庫), 請放在 app.py 同一個資料夾。")
     st.stop()
-
+PROFILES = HC.load_profiles(profile_path)
+CLASS_KEYS = [k for k in HC.CLASS_LABELS if k in PROFILES]
+tif_files = glob.glob(os.path.join(HERE, "*MDTM*.tif"))
+TIF = tif_files[0] if tif_files else None
 
 with st.spinner("載入 HYCOM 海流時間序列中..."):
-    lons, lats, land_mask, hycom_times_rel, hycom_times_abs, hycom_u_ts, hycom_v_ts = load_hycom_series()
-
-sea_mask = ~land_mask
-dist_to_land = distance_transform_edt(sea_mask)
-
-_now_idx = int(np.argmin(np.abs(hycom_times_rel)))
-obs_time = hycom_times_abs[_now_idx]
-
-
-def get_current_at(y, x, elapsed_hours):
-    """依「從現在起算的航行時數」取得對應時間切片的海流值。"""
-    idx = int(np.argmin(np.abs(hycom_times_rel - elapsed_hours)))
-    return float(hycom_u_ts[idx, y, x]), float(hycom_v_ts[idx, y, x])
-
-
-def get_current_snapshot(elapsed_hours):
-    """取得離 elapsed_hours 最近的整張海流快照 (u, v, 對應時刻, 索引)。用於底圖顯示。"""
-    idx = int(np.argmin(np.abs(hycom_times_rel - elapsed_hours)))
-    return hycom_u_ts[idx], hycom_v_ts[idx], hycom_times_abs[idx], idx
-
-
-# ===============================
-# 🆕 風場 + 波浪：改成逐小時時間序列
-#
-# 問題背景：原本風、浪只抓 f000（預報起始那一刻）單一時間切片，
-# 全航程都套用同一組資料。跟海流一樣，若航程規劃三小時，
-# 第二、三小時經過海域的風浪早就不是「現在」的樣子。
-#
-# 修正方式：一次抓 GFS/GFS-Wave 未來 WEATHER_FORECAST_HOURS 小時內、
-# 每小時（或每 3 小時，依資料本身解析度）一筆的預報時效（f000, f003, f006...），
-# 組成 (time, lat, lon) 的時間序列，之後依「船預計幾點到達該點」查對應時刻。
-# ===============================
-WEATHER_FORECAST_HOURS = 72          # 涵蓋未來 72 小時預報
-WEATHER_STEP_HOURS = 1               # GFS/GFS-Wave 逐小時預報時效（f000, f001, f002, ... f120 內皆支援逐時）
-
-
-def _find_latest_cycle():
-    """找到目前可用的最新一組 GFS run (date, cycle)。"""
-    for days_back in range(0, 4):
-        check_date = datetime.now(timezone.utc) - timedelta(days=days_back)
-        d = check_date.strftime("%Y%m%d")
-        for c in ["18", "12", "06", "00"]:
-            url = (
-                "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl?"
-                f"file=gfswave.t{c}z.global.0p25.f000.grib2"
-                "&var_HTSGW=on&lev_surface=on&subregion="
-                "&leftlon=118&rightlon=124&toplat=26&bottomlat=21"
-                f"&dir=%2Fgfs.{d}%2F{c}%2Fwave%2Fgridded"
-            )
-            try:
-                r = requests.head(url, timeout=10)
-                if r.status_code == 200:
-                    return d, c
-            except Exception:
-                continue
-    return None, None
-
-
-def _fetch_wave_step(date_str, cycle, fhr):
-    """抓單一預報時效（fhr, 小時）的波浪資料，失敗回傳 None。"""
-    f_str = f"f{fhr:03d}"
-    url = (
-        "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl?"
-        f"file=gfswave.t{cycle}z.global.0p25.{f_str}.grib2"
-        "&var_HTSGW=on&var_PERPW=on&var_DIRPW=on"
-        "&lev_surface=on&subregion="
-        "&leftlon=118&rightlon=124&toplat=26&bottomlat=21"
-        f"&dir=%2Fgfs.{date_str}%2F{cycle}%2Fwave%2Fgridded"
-    )
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code != 200 or len(r.content) < 500:
-            return None
-        with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
-            tmp.write(r.content)
-            tmp_path = tmp.name
-        ds_w = xr.open_dataset(
-            tmp_path, engine="cfgrib",
-            filter_by_keys={"stepRange": str(fhr), "typeOfLevel": "surface"}
-        )
-        swh_grid = ds_w["swh"].values
-        wlats = ds_w["latitude"].values
-        wlons = ds_w["longitude"].values
-        try:
-            dirpw_grid = ds_w["dirpw"].values
-        except Exception:
-            dirpw_grid = None
-        ds_w.close()
-        os.unlink(tmp_path)
-        return {"swh_grid": swh_grid, "dirpw_grid": dirpw_grid, "lats": wlats, "lons": wlons}
-    except Exception:
-        return None
-
-
-def _fetch_wind_step(date_str, cycle, fhr):
-    """抓單一預報時效（fhr, 小時）的風場資料，失敗回傳 None。"""
-    f_str = f"{fhr:03d}"
-    url = (
-        "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?"
-        f"file=gfs.t{cycle}z.pgrb2.0p25.f{f_str}"
-        "&lev_10_m_above_ground=on&var_UGRD=on&var_VGRD=on"
-        "&subregion=&leftlon=118&rightlon=124&toplat=26&bottomlat=21"
-        f"&dir=%2Fgfs.{date_str}%2F{cycle}%2Fatmos"
-    )
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code != 200 or len(r.content) < 500:
-            return None
-        with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
-            tmp.write(r.content)
-            tmp_path = tmp.name
-        ds_f = xr.open_dataset(
-            tmp_path, engine="cfgrib",
-            filter_by_keys={"typeOfLevel": "heightAboveGround", "level": 10}
-        )
-        u = ds_f["u10"].values
-        v = ds_f["v10"].values
-        wlats = ds_f["latitude"].values
-        wlons = ds_f["longitude"].values
-        ds_f.close()
-        os.unlink(tmp_path)
-        return {"u": u, "v": v, "speed": np.sqrt(u**2 + v**2), "lats": wlats, "lons": wlons}
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=3600)
-def fetch_weather_series(forecast_hours=WEATHER_FORECAST_HOURS, step_hours=WEATHER_STEP_HOURS):
-    """
-    回傳風、浪的逐時（每 step_hours 小時一筆）時間序列。
-    結構：
-    {
-      "date": date_str, "cycle": cycle,
-      "times_rel": [0, 3, 6, ...],         # 相對於現在（run 起算）的小時數
-      "wave_steps": [ {swh_grid, dirpw_grid, lats, lons} 或 None, ... ],
-      "wind_steps": [ {u, v, speed, lats, lons} 或 None, ... ],
-    }
-    """
-    date_str, cycle = _find_latest_cycle()
-    if not date_str:
-        return None
-
-    fhrs = list(range(0, forecast_hours + 1, step_hours))
-    wave_steps = []
-    wind_steps = []
-    for fhr in fhrs:
-        wave_steps.append(_fetch_wave_step(date_str, cycle, fhr))
-        wind_steps.append(_fetch_wind_step(date_str, cycle, fhr))
-
-    # run 開始時刻（cycle 那一刻）相對於「現在」的小時差，
-    # 讓 times_rel 對齊到跟海流一樣的「現在 = 0」基準
-    run_start = pd.Timestamp(
-        datetime.strptime(date_str + cycle, "%Y%m%d%H").replace(tzinfo=timezone.utc)
-    )
-    now_utc = pd.Timestamp(datetime.now(timezone.utc))
-    run_offset_hours = (run_start - now_utc).total_seconds() / 3600.0
-    times_rel = np.array([run_offset_hours + fhr for fhr in fhrs])
-    times_abs = [run_start + pd.Timedelta(hours=fhr) for fhr in fhrs]
-
-    return {
-        "date": date_str,
-        "cycle": cycle,
-        "times_rel": times_rel,
-        "times_abs": times_abs,
-        "wave_steps": wave_steps,
-        "wind_steps": wind_steps,
-    }
-
-
+    hycom = DL.load_hycom_series()
 with st.spinner("載入氣象（風/浪）時間序列中..."):
-    weather_series = fetch_weather_series()
-
-
-def _nearest_step_idx(times_rel, elapsed_hours):
-    return int(np.argmin(np.abs(times_rel - elapsed_hours)))
-
-
-def get_wave_at(elapsed_hours):
-    """依「從現在起算的航行時數」取得對應時間切片的波浪資料（整張網格）與其對應絕對時刻。
-    找不到回傳 (None, None)。"""
-    if weather_series is None:
-        return None, None
-    idx = _nearest_step_idx(weather_series["times_rel"], elapsed_hours)
-    n = len(weather_series["wave_steps"])
-    order = sorted(range(n), key=lambda i: abs(i - idx))
-    for i in order:
-        if weather_series["wave_steps"][i] is not None:
-            return weather_series["wave_steps"][i], weather_series["times_abs"][i]
-    return None, None
-
-
-def get_wind_at(elapsed_hours):
-    """依「從現在起算的航行時數」取得對應時間切片的風場資料（整張網格）與其對應絕對時刻。
-    找不到回傳 (None, None)。"""
-    if weather_series is None:
-        return None, None
-    idx = _nearest_step_idx(weather_series["times_rel"], elapsed_hours)
-    n = len(weather_series["wind_steps"])
-    order = sorted(range(n), key=lambda i: abs(i - idx))
-    for i in order:
-        if weather_series["wind_steps"][i] is not None:
-            return weather_series["wind_steps"][i], weather_series["times_abs"][i]
-    return None, None
-
+    weather = DL.fetch_weather_series()
+env = DL.LiveEnv(hycom, weather)
+T0 = env.now                                   # 出發時間 = 資料抓取當下 (UTC)
 
 # ===============================
 # Sidebar
 # ===============================
 with st.sidebar:
     st.header("Route Settings")
-    # 起點：台中港 / 終點：蘇澳港
-    s_lon = st.number_input("Start Lon", 118.0, 124.0, 120.49)  # 台中港
-    s_lat = st.number_input("Start Lat", 21.0, 26.0, 24.28)     # 台中港
-    e_lon = st.number_input("End Lon", 118.0, 124.0, 121.89)    # 蘇澳港
-    e_lat = st.number_input("End Lat", 21.0, 26.0, 24.59)       # 蘇澳港
-    ship_speed = st.number_input("Ship Speed (km/h)", 1.0, 60.0, 20.0)
+    port_names = ["自訂座標"] + list(PORTS)
+    sp = st.selectbox("起點", port_names, index=port_names.index("Taichung"))
+    if sp == "自訂座標":
+        s_lon = st.number_input("Start Lon", 118.0, 124.0, 120.49)
+        s_lat = st.number_input("Start Lat", 21.0, 26.0, 24.28)
+    else:
+        s_lon, s_lat = PORTS[sp][0], PORTS[sp][1]
+    ep = st.selectbox("終點", port_names, index=port_names.index("Suao"))
+    if ep == "自訂座標":
+        e_lon = st.number_input("End Lon", 118.0, 124.0, 121.89)
+        e_lat = st.number_input("End Lat", 21.0, 26.0, 24.59)
+    else:
+        e_lon, e_lat = PORTS[ep][0], PORTS[ep][1]
 
     st.divider()
+    st.subheader("船型與載重")
+    ship_key = st.selectbox("船型 (13 類船舶參數庫)", CLASS_KEYS, format_func=lambda k: HC.CLASS_LABELS[k],
+                            index=CLASS_KEYS.index("cargo_m") if "cargo_m" in CLASS_KEYS else 0)
+    prof = PROFILES[ship_key]
+    st.caption(f"典型船長 {prof['loa']:.0f} m、船寬 {prof['beam']:.1f} m、服務航速 {prof['vs']:.1f} 節")
+    if ship_key in HC.DRAFT_VARIES:
+        load = st.radio("載重狀態 (吃水)", ["空載 (P10)", "半載 (P50)", "滿載 (P90)", "自訂"], index=1, horizontal=True)
+        draft = {"空載 (P10)": prof["d10"], "半載 (P50)": prof["d50"], "滿載 (P90)": prof["d90"]}.get(load)
+        if draft is None:
+            draft = st.number_input("吃水 (m)", 1.0, 25.0, float(prof["d50"]), 0.1)
+        st.caption(f"吃水 {draft:.1f} m (此船型同一艘船的吃水會隨裝載明顯變動)")
+    else:
+        draft = st.number_input("吃水 (m)", 0.5, 25.0, float(prof["d50"]), 0.1)
+        st.caption("此船型的 AIS 吃水多半是預設值、不會隨載重更新, 此欄位僅作估計。")
+    speed_kn = st.number_input("目標航速 (節)", 3.0, 35.0, float(round(prof["vs"], 1)), 0.5,
+                               help="決定要求的到達時間; 實際對水速度由規劃器解出『剛好準時』的速度。")
+
+    st.divider()
+    corridor = st.slider("規劃搜尋範圍 (離基準路徑 km)", 20, 100, 60, 10)
+    depth_on = False
+    if TIF:
+        depth_on = st.checkbox("套用水深限制 (依吃水)", value=False,
+                               help="用海底地形資料排除對這個吃水太淺的海域; 解析度粗, 港口附近不可靠。")
     progress_pct = st.slider("航行進度 (%)", 0, 100, 0, key="progress_slider")
-    st.caption("拖動上方滑桿即可查看船舶航行至該進度時，對應時刻的風/浪/流底圖與剩餘資訊。")
-
-    st.divider()
-    st.subheader("🧬 船型自適應環境優化模式")
-
-    ship_mode = st.radio(
-        "選擇航行船舶類型 (Ship Profile):",
-        options=["大型貨輪/油輪 (CargoTanker)", "小型漁船 (Fishing)", "其他公務/客輪 (Other)"],
-        index=0,
-        help="系統將根據不同船型的流體動力學與環境特徵，自動載入最優化權重矩陣。"
-    )
-
-    if "CargoTanker" in ship_mode:
-        w_curr = 0.25
-        w_wave = 0.35
-        w_wind = 0.08
-        ship_type_key = "CargoTanker"
-    elif "Fishing" in ship_mode:
-        w_curr = 0.18
-        w_wave = 0.45
-        w_wind = 0.15
-        ship_type_key = "Fishing"
-    else:  # Other
-        w_curr = 0.22
-        w_wave = 0.35
-        w_wind = 0.14
-        ship_type_key = "Other"
+    st.caption("拖動滑桿可查看船舶航行至該進度時，對應時刻的風/浪/流底圖與剩餘資訊。")
 
 # ===============================
-# 船型物理參數
+# 規劃 (輸入改變才重算)
 # ===============================
-SHIP_PARAMS = {
-    'CargoTanker': {
-        'distance_factor': 1.3, 'current_gain': 1.0,
-        'wind_gain': 1.0, 'wind_speed_gain': 1.0,
-        'time_weight': 2.5, 'fuel_weight': 0.20,
-        'progress_weight': 1.2, 'wave_coef': 0.08,
-    },
-    'Fishing': {
-        'distance_factor': 1.5, 'current_gain': 0.5,
-        'wind_gain': 0.5, 'wind_speed_gain': 0.5,
-        'time_weight': 1.8, 'fuel_weight': 0.15,
-        'progress_weight': 2.5, 'wave_coef': 0.05,
-    },
-    'Other': {
-        'distance_factor': 1.6, 'current_gain': 0.3,
-        'wind_gain': 0.2, 'wind_speed_gain': 0.2,
-        'time_weight': 1.5, 'fuel_weight': 0.08,
-        'progress_weight': 2.0, 'wave_coef': 0.06,
-    },
-}
-wave_severity = 3.0 if ship_type_key == 'CargoTanker' else 1.0
-
-MAX_CURRENT_BONUS = 2.0
-MAX_WIND_BONUS = 3.0
-
-# ===============================
-# Helpers
-# ===============================
-def nearest_cell(lon, lat):
-    return (np.abs(lats - lat).argmin(), np.abs(lons - lon).argmin())
-
-def offshore_penalty(y, x):
-    for zone in OFFSHORE_WIND:
-        if Path(zone).contains_point([lons[x], lats[y]]):
-            return OFFSHORE_COST
-    return 0
-
-# ===============================
-# 離岸安全距離：用實際公里數校正
-# ===============================
-COAST_SAFE_KM = 18
-_lat_res = float(np.abs(np.diff(lats)).mean()) if len(lats) > 1 else 0.05
-_lon_res = float(np.abs(np.diff(lons)).mean()) if len(lons) > 1 else 0.05
-CELL_KM = ((_lat_res + _lon_res) / 2) * 111.0
-COAST_SAFE_CELLS = max(3.0, COAST_SAFE_KM / max(CELL_KM, 1e-6))
-COAST_PENALTY_WEIGHT = 30
-
-def coast_penalty(y, x):
-    d = dist_to_land[y, x]
-    if d >= COAST_SAFE_CELLS:
-        return 0
-    return ((COAST_SAFE_CELLS - d) ** 3) * COAST_PENALTY_WEIGHT / (COAST_SAFE_CELLS ** 2)
-
-def heuristic(y, x, goal):
-    d = np.hypot(lats[y] - lats[goal[0]], lons[x] - lons[goal[1]]) * 111
-    return d * SHIP_PARAMS[ship_type_key]['distance_factor'] * 0.9
-
-# ===============================
-# 綜合成本函數 — 風、浪、流皆依 elapsed_hours 查對應時間切片
-# ===============================
-def get_comprehensive_cost(y0, x0, y1, x1, goal, elapsed_hours):
-    dlat = lats[y1] - lats[y0]
-    dlon = lons[x1] - lons[x0]
-    norm = np.hypot(dlat, dlon)
-    if norm == 0:
-        return 0, 0.0
-    dir_lat = dlat / norm
-    dir_lon = dlon / norm
-    base_dist = norm * 111
-
-    p = SHIP_PARAMS[ship_type_key]
-    distance_factor = p['distance_factor']
-    current_gain    = p['current_gain']
-    wind_gain       = p['wind_gain']
-    wind_speed_gain = p['wind_speed_gain']
-    time_weight     = p['time_weight']
-    fuel_weight     = p['fuel_weight']
-    progress_weight = p['progress_weight']
-    wave_coef       = p['wave_coef']
-
-    progress_penalty = 0
-    if goal is not None:
-        d_before = np.hypot(lats[y0]-lats[goal[0]], lons[x0]-lons[goal[1]]) * 111
-        d_after  = np.hypot(lats[y1]-lats[goal[0]], lons[x1]-lons[goal[1]]) * 111
-        forward_progress = d_before - d_after
-        progress_penalty = max(base_dist - forward_progress, 0) * progress_weight * 0.3
-
-    # 海流：依 elapsed_hours 對應的時間切片
-    current_proj = 0.0
-    u_cur, v_cur = get_current_at(y0, x0, elapsed_hours)
-    if not np.isnan(u_cur) and not np.isnan(v_cur):
-        current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
-    current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
-    current_cost = -current_bonus * current_gain
-
-    # 🆕 風場：依 elapsed_hours 對應的時間切片
-    wind_proj = 0.0
-    wind_cost = 0.0
-    wnd, _ = get_wind_at(elapsed_hours)
-    if wnd:
-        wi = np.abs(wnd["lats"] - lats[y0]).argmin()
-        wj = np.abs(wnd["lons"] - lons[x0]).argmin()
-        wind_proj = (float(wnd["u"][wi, wj]) * dir_lon +
-                     float(wnd["v"][wi, wj]) * dir_lat) * 3.6
-        wind_bonus = min(max(wind_proj, -MAX_WIND_BONUS), MAX_WIND_BONUS)
-        wind_cost = -wind_bonus * wind_gain
-
-    # 🆕 波浪：依 elapsed_hours 對應的時間切片
-    wave_cost = 0.0
-    wave_slowdown = 1.0
-    wave_proj = 0.0
-    w, _ = get_wave_at(elapsed_hours)
-    if w:
-        wi = np.abs(w["lats"] - lats[y0]).argmin()
-        wj = np.abs(w["lons"] - lons[x0]).argmin()
-        swh = w["swh_grid"][wi, wj]
-        if not np.isnan(swh) and swh > 0:
-            dirpw_grid = w.get("dirpw_grid")
-            has_dir = dirpw_grid is not None and not np.isnan(dirpw_grid[wi, wj])
-            if has_dir:
-                wave_dir_rad = np.radians(dirpw_grid[wi, wj] + 180.0)
-                wave_dir_lon = np.sin(wave_dir_rad)
-                wave_dir_lat = np.cos(wave_dir_rad)
-                wave_proj = wave_dir_lon * dir_lon + wave_dir_lat * dir_lat
-                wave_slowdown = 1.0 - wave_proj * swh * wave_coef
-                wave_slowdown = max(0.5, min(wave_slowdown, 1.5))
-            else:
-                wave_slowdown = 1.0 + swh * wave_coef
-            wave_cost = swh ** 2 * wave_severity * max(
-                1.0 - wave_proj if has_dir else 1.0, 0)
-
-    effective_speed = (ship_speed + current_bonus * current_gain +
-                        wind_proj * wind_speed_gain * 0.5) / wave_slowdown
-    effective_speed = max(effective_speed, 2.0)
-
-    segment_time_hours = base_dist / effective_speed
-    time_cost = segment_time_hours * time_weight
-    fuel_cost = (40 + 0.5 * effective_speed) * segment_time_hours * fuel_weight
-
-    total_cost = (
-        base_dist * distance_factor +
-        current_cost * w_curr +
-        wind_cost * w_wind +
-        wave_cost * w_wave +
-        time_cost + fuel_cost +
-        progress_penalty +
-        coast_penalty(y1, x1)
-    )
-    return max(total_cost, 0.05), segment_time_hours
-
-# ===============================
-# A* Pathfinding — 同步追蹤「累積航行時間」
-# ===============================
-dirs = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (1,-1), (-1,1), (-1,-1)]
-
-def astar(start, goal):
-    rows, cols = land_mask.shape
-    pq = [(heuristic(start[0], start[1], goal), start)]
-    came = {}
-    cost = {start: 0}
-    elapsed_time = {start: 0.0}
-
-    while pq:
-        _, cur = heapq.heappop(pq)
-        if cur == goal:
-            break
-        for d in dirs:
-            ni, nj = cur[0]+d[0], cur[1]+d[1]
-            if 0 <= ni < rows and 0 <= nj < cols and not land_mask[ni, nj]:
-                step_cost, seg_time = get_comprehensive_cost(
-                    cur[0], cur[1], ni, nj, goal, elapsed_time[cur]
-                )
-                step_cost += offshore_penalty(ni, nj)
-
-                new_g = cost[cur] + step_cost
-
-                if (ni, nj) not in cost or new_g < cost[(ni, nj)]:
-                    cost[(ni, nj)] = new_g
-                    elapsed_time[(ni, nj)] = elapsed_time[cur] + seg_time
-                    came[(ni, nj)] = cur
-                    f = new_g + heuristic(ni, nj, goal)
-                    heapq.heappush(pq, (f, (ni, nj)))
-
-    path = []
-    cur = goal
-    while cur in came:
-        path.append(cur)
-        cur = came[cur]
-    if path:
-        path.append(start)
-    return path[::-1]
-
-# ===============================
-# Route Logic
-# ===============================
-if "full_path" not in st.session_state:
-    st.session_state.full_path = []
-if "ship_step_idx" not in st.session_state:
-    st.session_state.ship_step_idx = 0
-if "route_key" not in st.session_state:
-    st.session_state.route_key = None
-
-start = nearest_cell(s_lon, s_lat)
-goal  = nearest_cell(e_lon, e_lat)
-
-route_key = (s_lon, s_lat, e_lon, e_lat, ship_mode)
-
-if st.session_state.route_key != route_key:
-    with st.spinner("HELIOS 尋路引擎正依據船型特徵與逐時風浪流變化進行最優解算..."):
-        new_path = astar(start, goal)
-    if len(new_path) == 0:
-        st.error("❌ 無法在當前海況與船型設定下找到安全航線")
-        st.stop()
-    st.session_state.full_path = new_path
-    st.session_state.ship_step_idx = 0
+ship = HC.make_ship(ship_key, PROFILES, draft, speed_kn)
+router = get_router(depth_on, TIF)
+req_depth = BY.required_depth_m(ship, hs=1.5) if depth_on else None
+route_key = (round(s_lon, 4), round(s_lat, 4), round(e_lon, 4), round(e_lat, 4), ship_key, round(draft, 2),
+             round(speed_kn, 2), corridor, depth_on, str(T0))
+if st.session_state.get("route_key") != route_key:
+    with st.spinner("HELIOS 尋路引擎正依據船型、吃水與預報風浪流進行規劃..."):
+        st.session_state.route = HC.route_plan(router, env, ship, (s_lon, s_lat), (e_lon, e_lat), speed_kn,
+                                               T0, corridor, req_depth=req_depth)
     st.session_state.route_key = route_key
-
-path = st.session_state.full_path
-
-if path:
-    st.session_state.ship_step_idx = min(st.session_state.ship_step_idx, len(path)-1)
-
-if path:
-    slider_idx = int((progress_pct / 100) * (len(path) - 1))
-    st.session_state.ship_step_idx = slider_idx
-
-if not path:
+R = st.session_state.route
+if R["error"]:
+    st.error("❌ " + R["error"])
     st.stop()
 
-current_pos = path[st.session_state.ship_step_idx]
+tl = R["timeline"]
+res = R["chosen"]["res"]
+base_res = R["base"]["res"]
+n = len(tl["lon"])
+idx = int(round(progress_pct / 100 * (n - 1)))
+elapsed_h = float(tl["cum_h"][idx])
+remaining_km = float(tl["cum_km"][-1] - tl["cum_km"][idx])
+remaining_h = float(tl["cum_h"][-1] - tl["cum_h"][idx])
+heading = float(tl["heading"][idx])
+seg_env = tl["seg_env"][min(idx, len(tl["seg_env"]) - 1)]
+t_map = T0 + np.timedelta64(int(round(elapsed_h * 3600)), "s")
 
 # ===============================
-# Calculations — 剩餘距離/時間，逐段依對應時刻查風浪流
-# ===============================
-def calc_segment(y0, x0, y1, x1, elapsed_hours):
-    p = SHIP_PARAMS[ship_type_key]
-    current_gain    = p['current_gain']
-    wind_speed_gain = p['wind_speed_gain']
-    wave_coef       = p['wave_coef']
-
-    seg_dist = np.hypot(lats[y1]-lats[y0], lons[x1]-lons[x0]) * 111
-    dlat = lats[y1] - lats[y0]
-    dlon = lons[x1] - lons[x0]
-    norm = np.hypot(dlat, dlon)
-    if norm == 0:
-        return 0.0, 0.0
-
-    dir_lat = dlat / norm
-    dir_lon = dlon / norm
-
-    current_proj = 0.0
-    u_cur, v_cur = get_current_at(y0, x0, elapsed_hours)
-    if not np.isnan(u_cur) and not np.isnan(v_cur):
-        current_proj = (u_cur * dir_lon + v_cur * dir_lat) * 3.6
-    current_bonus = min(max(current_proj, -MAX_CURRENT_BONUS), MAX_CURRENT_BONUS)
-
-    wind_proj = 0.0
-    wnd, _ = get_wind_at(elapsed_hours)
-    if wnd:
-        wi = np.abs(wnd["lats"] - lats[y0]).argmin()
-        wj = np.abs(wnd["lons"] - lons[x0]).argmin()
-        wind_proj = (float(wnd["u"][wi, wj]) * dir_lon +
-                     float(wnd["v"][wi, wj]) * dir_lat) * 3.6
-
-    wave_slowdown = 1.0
-    w, _ = get_wave_at(elapsed_hours)
-    if w:
-        wi = np.abs(w["lats"] - lats[y0]).argmin()
-        wj = np.abs(w["lons"] - lons[x0]).argmin()
-        swh = w["swh_grid"][wi, wj]
-        if not np.isnan(swh) and swh > 0:
-            dirpw_grid = w.get("dirpw_grid")
-            has_dir = dirpw_grid is not None and not np.isnan(dirpw_grid[wi, wj])
-            if has_dir:
-                wave_dir_rad = np.radians(dirpw_grid[wi, wj] + 180.0)
-                wave_proj = (np.sin(wave_dir_rad) * dir_lon +
-                             np.cos(wave_dir_rad) * dir_lat)
-                wave_slowdown = 1.0 - wave_proj * swh * wave_coef
-                wave_slowdown = max(0.5, min(wave_slowdown, 1.5))
-            else:
-                wave_slowdown = 1.0 + swh * wave_coef
-
-    effective_speed = (ship_speed + current_bonus * current_gain +
-                        wind_proj * wind_speed_gain * 0.5) / wave_slowdown
-    effective_speed = max(effective_speed, 2.0)
-
-    seg_time = seg_dist / effective_speed
-    return seg_dist, seg_time
-
-
-def calc_remaining(path, idx):
-    elapsed = 0.0
-    for i in range(0, idx):
-        y0, x0 = path[i]
-        y1, x1 = path[i + 1]
-        _, seg_time = calc_segment(y0, x0, y1, x1, elapsed)
-        elapsed += seg_time
-
-    elapsed_at_current = elapsed  # 🆕 船抵達目前位置時，從現在算起已經過的小時數
-
-    dist = 0.0
-    total_time = 0.0
-    for i in range(idx, len(path) - 1):
-        y0, x0 = path[i]
-        y1, x1 = path[i + 1]
-        seg_dist, seg_time = calc_segment(y0, x0, y1, x1, elapsed)
-        dist += seg_dist
-        total_time += seg_time
-        elapsed += seg_time
-
-    if idx < len(path) - 1:
-        y0, x0 = path[idx]
-        y1, x1 = path[idx + 1]
-        heading = np.degrees(np.arctan2(lats[y1]-lats[y0], lons[x1]-lons[x0]))
-    else:
-        heading = 0
-
-    return dist, total_time, heading, elapsed_at_current
-
-remaining_dist, remaining_time, heading, elapsed_at_current = calc_remaining(
-    path, st.session_state.ship_step_idx
-)
-
-# ===============================
-# 🆕 依「船目前預計時刻」取得對應的風/浪/流底圖資料
-# 這樣拖動「航行進度」滑桿時，底圖會跟著切換到船屆時對應的風浪流狀況，
-# 而不是永遠顯示「現在」這一份快照。
-# ===============================
-map_u, map_v, map_time, _map_idx = get_current_snapshot(elapsed_at_current)
-map_wave, map_wave_time = get_wave_at(elapsed_at_current)
-map_wind, map_wind_time = get_wind_at(elapsed_at_current)
-
-# ===============================
-# Dashboard — 第一排
+# Dashboard
 # ===============================
 st.subheader("Navigation Dashboard")
-c1, c2, c3 = st.columns(3)
-c1.metric("Remaining Distance (km)", f"{remaining_dist:.2f}")
-c2.metric("Remaining Time (hr)",     f"{remaining_time:.2f}")
-c3.metric("Heading",                 f"{heading:.1f}°")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Remaining Distance (km)", f"{remaining_km:.1f}")
+c2.metric("Remaining Time (hr)", f"{remaining_h:.2f}")
+c3.metric("Heading", f"{heading:.0f}°")
+c4.metric("對水速度 (節)", f"{res['V_kn']:.1f}")
 
-# 第二排 — 氣象資料（依目前位置對應的時刻）
+f1, f2, f3, f4 = st.columns(4)
+f1.metric("預估燃油 (噸)", f"{res['fuel_t']:.2f}")
+f2.metric("基準路徑燃油 (噸)", f"{base_res['fuel_t']:.2f}")
+f3.metric("相對基準節省", f"{R['saving_pct']:.1f} %")
+f4.metric("總航程 (km)", f"{res['dist_km']:.0f}")
+if not R["used_plan"]:
+    st.info("在目前的預報海況下，規劃路徑沒有比基準路徑省油，因此沿用基準路徑。")
+if R["stretched"] > 1.0:
+    st.warning(f"目標航速在預報海況下趕不上，已把要求的航行時間放寬 {100 * (R['stretched'] - 1):.0f}%。")
+
 w1, w2, w3 = st.columns(3)
-if map_wave:
-    wi = np.abs(map_wave["lats"] - lats[current_pos[0]]).argmin()
-    wj = np.abs(map_wave["lons"] - lons[current_pos[1]]).argmin()
-    swh_here = map_wave["swh_grid"][wi, wj]
-    swh_here = 0.0 if np.isnan(swh_here) else swh_here
-    w1.metric("顯著波高（目前位置）", f"{swh_here:.2f} m")
-    if map_wave.get("dirpw_grid") is not None:
-        dirpw_here = map_wave["dirpw_grid"][wi, wj]
-        dirpw_here = 0.0 if np.isnan(dirpw_here) else dirpw_here
-        w2.metric("波浪方向（目前位置）", f"{dirpw_here:.1f}°")
-    else:
-        w2.metric("波浪方向（目前位置）", "0.0°")
-else:
-    w1.metric("顯著波高（目前位置）", "0.00 m")
-    w2.metric("波浪方向（目前位置）", "0.0°")
+swh = seg_env.get("swh", np.nan)
+w1.metric("顯著波高（目前位置）", "—" if not np.isfinite(swh) else f"{swh:.2f} m")
+wsp = float(np.hypot(seg_env.get("u10", np.nan), seg_env.get("v10", np.nan)))
+w2.metric("風速（目前位置）", "—" if not np.isfinite(wsp) else f"{wsp:.1f} m/s")
+csp = float(np.hypot(seg_env.get("u_cur", np.nan), seg_env.get("v_cur", np.nan)))
+w3.metric("海流（目前位置）", "—" if not np.isfinite(csp) else f"{csp:.2f} m/s")
 
-if map_wind:
-    wi = np.abs(map_wind["lats"] - lats[current_pos[0]]).argmin()
-    wj = np.abs(map_wind["lons"] - lons[current_pos[1]]).argmin()
-    spd_here = float(map_wind["speed"][wi, wj])
-    spd_here = 0.0 if np.isnan(spd_here) else spd_here
-    w3.metric("風速（目前位置）", f"{spd_here:.2f} m/s")
-else:
-    w3.metric("風速（目前位置）", "0.00 m/s")
+
+def _ok(x):
+    return "✅ 已連接" if x else "❌ 未連接"
+
+
+st.caption(f"資料連接狀態｜HYCOM 海流: {_ok(True)} ｜ 波浪: {_ok(env.wave is not None)} ｜ 風場: {_ok(env.wind is not None)}"
+           f"　｜　出發時間 (UTC) {str(T0)[:16]}　｜　底圖時刻 {str(t_map)[:16]}")
 
 # ===============================
-# 資料連接狀態：只顯示是否有成功接到資料
+# Map
 # ===============================
-def _connected(t):
-    return "✅ 已連接" if t is not None else "❌ 未連接"
-
-st.caption(
-    f"資料連接狀態｜HYCOM 海流: {_connected(map_time)} ｜ "
-    f"波浪: {_connected(map_wave_time)} ｜ "
-    f"風場: {_connected(map_wind_time)}"
-)
-
-# ===============================
-# Map — 底圖依「船目前預計時刻」對應的風/浪/流資料繪製
-# ===============================
-fig = plt.figure(figsize=(10, 8))
-ax  = plt.axes(projection=ccrs.PlateCarree())
-ax.set_extent([118, 124, 21, 26])
-ax.add_feature(cfeature.LAND,       facecolor="#b0b0b0")
-ax.add_feature(cfeature.COASTLINE)
-
-# 海流（顯示「船目前預計時刻」對應的快照）
-try:
-    speed_cur = np.sqrt(map_u**2 + map_v**2)
-    mesh = ax.pcolormesh(lons, lats, speed_cur,
-                         cmap="Blues", shading="auto", vmin=0, vmax=1.6,
-                         transform=ccrs.PlateCarree())
-    fig.colorbar(mesh, ax=ax, label="Current Speed (m/s)")
-except Exception:
-    st.warning("Could not overlay current data.")
-
-# 波浪等高線（同一對應時刻）
-if map_wave:
-    wlon_grid, wlat_grid = np.meshgrid(map_wave["lons"], map_wave["lats"])
-    contour = ax.contour(
-        wlon_grid, wlat_grid, map_wave["swh_grid"],
-        levels=[1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-        cmap="cool", linewidths=1.2,
-        transform=ccrs.PlateCarree()
-    )
-    ax.clabel(contour, fmt="%.1fm", fontsize=7, inline=True)
-
-# 風場箭頭（同一對應時刻）
-if map_wind:
-    wlon_g, wlat_g = np.meshgrid(map_wind["lons"], map_wind["lats"])
-    ax.quiver(wlon_g[::2, ::2], wlat_g[::2, ::2],
-              map_wind["u"][::2, ::2], map_wind["v"][::2, ::2],
-              scale=200, color="white", alpha=0.5,
-              transform=ccrs.PlateCarree())
-
-# 禁航區
-for zone in NO_GO_ZONES:
-    poly = np.array(zone)
-    ax.fill(poly[:,1], poly[:,0], color="red",    alpha=0.4, transform=ccrs.PlateCarree())
-for zone in OFFSHORE_WIND:
-    poly = np.array(zone)
-    ax.fill(poly[:,1], poly[:,0], color="yellow", alpha=0.4, transform=ccrs.PlateCarree())
-
-# 路徑
-full_lons = [lons[p[1]] for p in path]
-full_lats = [lats[p[0]] for p in path]
-ax.plot(full_lons, full_lats, color="pink",  linewidth=2, transform=ccrs.PlateCarree())
-
-done_lons = full_lons[:st.session_state.ship_step_idx+1]
-done_lats = full_lats[:st.session_state.ship_step_idx+1]
-ax.plot(done_lons, done_lats, color="red", linewidth=2, transform=ccrs.PlateCarree())
-
-ax.scatter(lons[current_pos[1]], lats[current_pos[0]],
-           color="gray", marker="^", s=150, zorder=5, transform=ccrs.PlateCarree())
-ax.scatter(s_lon, s_lat, color="#B15BFF", s=80,  edgecolors="black", transform=ccrs.PlateCarree())
-ax.scatter(e_lon, e_lat, color="yellow",  marker="*", s=200, edgecolors="black", transform=ccrs.PlateCarree())
-
-plt.title("HELIOS Navigation Map")
+snap = env.snapshot(t_map)
+fig = HM.draw_map(
+    snap,
+    ((R["base"]["lon"], R["base"]["lat"]), (tl["lon"], tl["lat"])),
+    [("red", NO_GO_ZONES), ("yellow", OFFSHORE_WIND)],
+    (tl["lon"][idx], tl["lat"][idx]), idx, (s_lon, s_lat), (e_lon, e_lat))
 st.pyplot(fig)
+
+with st.expander("這條航線怎麼算的 / 限制"):
+    st.markdown(
+        f"""
+- **基準路徑**：離岸 ≥ {BUFFER_KM:g} km 的海上最短路徑 (避開禁航區與離岸風場{'，並依吃水排除過淺海域' if depth_on else ''})。
+- **規劃**：在基準路徑兩側 {corridor} km 內，依預報的海流、風、浪計算每一段的油耗，找出「油耗 + λ × 時間」最小的路線。
+- **公平比較**：基準與規劃路徑在**同樣的出發與到達時間**下各自解出剛好準時的對水速度，再比燃油。
+- **船**：{HC.CLASS_LABELS[ship_key]}，船長 {ship.loa:.0f} m、船寬 {ship.beam:.1f} m、吃水 {ship.draft:.1f} m、
+  排水量約 {ship.disp_t:,.0f} t、服務功率約 {ship.ps_kw:,.0f} kW。
+- **限制**：全程固定對水速度；海況取名目時間；風 0.25°、浪 0.5° 解析度在規劃範圍內變化很小，效益主要來自海流；
+  預報有誤差；阻力模型係數 (k_aw、cx、受風面積、主機功率上限) 是假設值，未用文獻校準。
+"""
+    )
