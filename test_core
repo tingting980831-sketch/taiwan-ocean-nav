@@ -1,1 +1,79 @@
+import sys, types
+for _m in ("streamlit", "xarray"):                       # 測試環境沒有裝時, 用空殼代替 (只測核心, 不測抓資料)
+    try:
+        __import__(_m)
+    except ImportError:
+        sys.modules[_m] = types.ModuleType(_m)
+if not hasattr(sys.modules["streamlit"], "cache_data"):
+    sys.modules["streamlit"].cache_data = lambda *a, **k: (lambda f: f)
+"""test_core.py -- 用假資料測試系統核心 (不需要網路、streamlit、cartopy)。  python test_core.py"""
+import numpy as np, pandas as pd
+from scipy.ndimage import distance_transform_edt
+import helios_core as HC, data_live as DL, fuel_model as FM
+
+ok = True
+def check(name, cond, extra=""):
+    global ok; ok &= bool(cond); print(f"  [{'通過' if cond else '失敗'}] {name} {extra}")
+
+lons, lats = HC.grid_axes()
+LON, LAT = np.meshgrid(lons, lats)
+land = (LON > 120.45) & (LON < 121.9) & (LAT > 22.0) & (LAT < 25.3)          # 假的島 (測試用)
+dist = distance_transform_edt(~land, sampling=(1.112, 1.112 * np.cos(np.radians(23.5))))
+router = HC.Router(dist, 5.0)
+
+# 假的海況: 西側 (120.2E) 有一條向北的強流帶
+now = pd.Timestamp("2026-11-02 00:00", tz="UTC")
+la = np.linspace(21, 26, 101); lo = np.linspace(118, 124, 121)
+T = 6; t_rel = np.arange(T) * 12.0
+LOa, LAa = np.meshgrid(lo, la)
+u = np.zeros((T, 101, 121)); v = np.where(np.abs(LOa - 120.25) < 0.08, 1.2, 0.0)[None].repeat(T, 0)
+t_abs = pd.DatetimeIndex([now + pd.Timedelta(hours=h) for h in t_rel])
+hy = (lo, la, np.zeros((101, 121), bool), t_rel, t_abs, u, v)
+ws = dict(times_rel=np.arange(0, 73, 6.0), times_abs=[now + pd.Timedelta(hours=float(h)) for h in np.arange(0, 73, 6.0)],
+          wave_steps=[dict(swh_grid=np.full((101, 121), 1.0)[::-1], dirpw_grid=np.full((101, 121), 30.0)[::-1], lats=la[::-1], lons=lo) for _ in range(13)],
+          wind_steps=[dict(u=np.full((101, 121), 2.0)[::-1], v=np.full((101, 121), -3.0)[::-1], lats=la[::-1], lons=lo) for _ in range(13)])
+env = DL.LiveEnv(hy, ws)
+t0 = np.datetime64("2026-11-02T00:00:00")
+
+print("1. LiveEnv 介面與單位")
+e = env.at(np.array([t0, t0 + np.timedelta64(30, 'h')]), [24.0, 24.0], [120.25, 119.0])
+check("海流: 流帶內 1.2 m/s、帶外 0", abs(e["v_cur"][0] - 1.2) < 1e-6 and abs(e["v_cur"][1]) < 1e-6)
+check("風 (u,v) 與浪高", abs(e["u10"][0] - 2) < 1e-6 and abs(e["v10"][0] + 3) < 1e-6 and abs(e["swh"][0] - 1) < 1e-6)
+check("浪向 (從 30 度來)", abs(e["mwd"][0] - 30.0) < 1e-3, f"({e['mwd'][0]:.2f})")
+check("緯度反向的 GFS 格網已轉正", abs(env.at(t0, [23.0], [121.0])["swh"][0] - 1.0) < 1e-6)
+
+print("2. 基準路徑與規劃")
+prof = {"cargo_m": dict(loa=150, beam=25, d10=6.5, d50=8.0, d90=9.5, vs=12.0, cb=0.72)}
+start, end = (119.9, 22.6), (119.9, 24.9)        # 西側海域, 由南往北, 基準路徑離島 5 km 以上
+for dr in (6.5, 8.0, 9.5):
+    sh = HC.make_ship("cargo_m", prof, dr, 12.0)
+    r = HC.route_plan(router, env, sh, start, end, 12.0, t0, 60.0)
+    check(f"吃水 {dr} m 可算出", r["error"] is None, "" if r["error"] is None else r["error"])
+    if r["error"] is None:
+        print(f"      基準 {r['base']['res']['fuel_t']:.2f} t / 規劃 {r['chosen']['res']['fuel_t']:.2f} t, 省 {r['saving_pct']:.1f}%, "
+              f"V={r['chosen']['res']['V_kn']:.2f} 節, 距離 {r['chosen']['res']['dist_km']:.0f} km, 用規劃={r['used_plan']}")
+        if dr == 8.0:
+            r8 = r
+check("順流帶使規劃路徑省油", r8["saving_pct"] > 1.0, f"({r8['saving_pct']:.1f}%)")
+check("規劃路徑不比基準差", r8["chosen"]["res"]["fuel_t"] <= r8["base"]["res"]["fuel_t"] + 1e-9)
+tl = r8["timeline"]
+check("時間表: 終點累積時間 ≈ 要求的航行時間", abs(tl["cum_h"][-1] - r8["T_h"]) / r8["T_h"] < 0.03, f"({tl['cum_h'][-1]:.2f} vs {r8['T_h']:.2f} h)")
+check("路徑起訖點 = 使用者輸入", np.allclose([r8['chosen']['lon'][0], r8['chosen']['lat'][0]], start) and np.allclose([r8['chosen']['lon'][-1], r8['chosen']['lat'][-1]], end))
+rr = np.rint((r8["chosen"]["lat"][1:-1] - lats[0]) / 0.01).astype(int); cc = np.rint((r8["chosen"]["lon"][1:-1] - lons[0]) / 0.01).astype(int)
+check("路徑不穿陸地", not land[rr, cc].any())
+
+print("3. 吃水影響 (載重越大, 同樣條件油耗越高)")
+f = []
+for dr in (6.5, 8.0, 9.5):
+    sh = HC.make_ship("cargo_m", prof, dr, 12.0)
+    f.append(HC.route_plan(router, env, sh, start, end, 12.0, t0, 60.0)["chosen"]["res"]["fuel_t"])
+check("油耗隨吃水增加", f[0] < f[1] < f[2], f"({f[0]:.2f} < {f[1]:.2f} < {f[2]:.2f} t)")
+
+print("4. 禁航區")
+blk = HC.polygons_mask(lons, lats, [[[23.4, 119.6], [23.4, 120.1], [23.7, 120.1], [23.7, 119.6]]])
+r2 = HC.Router(dist, 5.0, blocked=blk)
+rb = r2.baseline(start, end)
+rr = np.rint((rb["lat"] - lats[0]) / 0.01).astype(int); cc = np.rint((rb["lon"] - lons[0]) / 0.01).astype(int)
+check("基準路徑繞開禁航區", not blk[rr, cc].any())
+print("\n全部通過" if ok else "\n有項目失敗")
 
