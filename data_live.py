@@ -425,4 +425,3 @@ class LiveEnv:
         if self.wave is not None:
             out["wave"] = (self.wave.lons, self.wave.lats, _grid_at(self.wave, "swh", h))
         return out
-
