@@ -190,4 +190,3 @@ def route_plan(router, env, ship, start, end, V_target_kn, t0, corridor_km=60.0,
         base=dict(lon=blon, lat=blat, res=rb), plan=plan, chosen=chosen, timeline=tl,
         saving_pct=100.0 * (1 - chosen["res"]["fuel_t"] / rb["fuel_t"]), gate_km=base["gate_km"],
     )
-
