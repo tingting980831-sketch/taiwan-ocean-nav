@@ -109,16 +109,22 @@ with st.sidebar:
     prof = PROFILES[ship_key]
     st.caption(f"典型船長 {prof['loa']:.0f} m、船寬 {prof['beam']:.1f} m、服務航速 {prof['vs']:.1f} 節")
     if ship_key in HC.DRAFT_VARIES:
-        load = st.radio("載重狀態 (吃水)", ["空載 (P10)", "半載 (P50)", "滿載 (P90)", "自訂"], index=1, horizontal=True)
-        draft = {"空載 (P10)": prof["d10"], "半載 (P50)": prof["d50"], "滿載 (P90)": prof["d90"]}.get(load)
-        if draft is None:
+        mode = st.radio("載重輸入方式", ["裝載率 (%)", "自訂吃水"], index=0, horizontal=True)
+        if mode == "裝載率 (%)":
+            load_pct = st.slider("裝載率 (%)", 0, 100, 50, 5,
+                                 help="0% = 該船型吃水申報的第 10 百分位 (偏空載), 100% = 第 90 百分位 (偏滿載), 中間以線性內插。")
+            draft = prof["d10"] + load_pct / 100.0 * (prof["d90"] - prof["d10"])
+        else:
             draft = st.number_input("吃水 (m)", 1.0, 25.0, float(prof["d50"]), 0.1)
-        st.caption(f"吃水 {draft:.1f} m (此船型同一艘船的吃水會隨裝載明顯變動)")
+        disp_est = prof["loa"] * prof["beam"] * draft * prof["cb"] * 1.025
+        st.caption(f"吃水 {draft:.1f} m (空載 {prof['d10']:.1f} m 至滿載 {prof['d90']:.1f} m), "
+                   f"估計排水量約 {disp_est:,.0f} t。此船型同一艘船的吃水會隨裝載明顯變動; "
+                   "裝載率為由吃水分布線性內插的近似, 不是實際載貨噸數。")
     else:
         draft = st.number_input("吃水 (m)", 0.5, 25.0, float(prof["d50"]), 0.1)
         st.caption("此船型的 AIS 吃水多半是預設值、不會隨載重更新, 此欄位僅作估計。")
     speed_kn = st.number_input("目標航速 (節)", 3.0, 35.0, float(round(prof["vs"], 1)), 0.5,
-                               help="決定要求的到達時間; 實際對水速度由規劃器解出『剛好準時』的速度。")
+                               help="決定要求的到達時間; 實際對水速度由規劃模型解出『剛好準時』的速度。")
 
     st.divider()
     corridor = st.slider("規劃搜尋範圍 (離基準路徑 km)", 20, 100, 60, 10)
